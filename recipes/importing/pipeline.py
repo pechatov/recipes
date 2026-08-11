@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from urllib.parse import urljoin
 
 import httpx
@@ -16,7 +16,7 @@ from django.utils import timezone
 from recipes.categories import CATEGORY_TAXONOMY
 from recipes.models import Category, ImportJob, Recipe, RecipeIngredient, RecipeStep
 
-from .exceptions import ImportPipelineError
+from .exceptions import AIResponseError, ImportPipelineError
 from .extractors import (
     MAX_REDIRECTS,
     USER_AGENT,
@@ -32,15 +32,60 @@ from .structured import adapt_structured_recipe
 
 logger = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 40 * 1024 * 1024
+MAX_IMPORTED_IMAGES = 25
+MAX_IMAGE_WIDTH = 8_000
+MAX_IMAGE_HEIGHT = 8_000
+MAX_IMAGE_PIXELS = 32_000_000
 
 
 @dataclass(frozen=True)
 class DownloadedImage:
     name: str
     content: bytes
+    width: int = 1_000
+    height: int = 1_000
 
 
-def _download_image(url: str, *, cover: bool) -> DownloadedImage | None:
+def _valid_image_dimensions(image: DownloadedImage, *, cover: bool) -> bool:
+    if (
+        image.width > MAX_IMAGE_WIDTH
+        or image.height > MAX_IMAGE_HEIGHT
+        or image.width * image.height > MAX_IMAGE_PIXELS
+    ):
+        return False
+    min_area = 150_000 if cover else 40_000
+    min_side = 300 if cover else 160
+    return image.width * image.height >= min_area and min(image.width, image.height) >= min_side
+
+
+@dataclass
+class ImageImportBudget:
+    cache: dict[str, DownloadedImage | None] = field(default_factory=dict)
+    total_bytes: int = 0
+    assignments: int = 0
+
+    def select(self, urls: list[str], *, cover: bool) -> DownloadedImage | None:
+        if self.assignments >= MAX_IMPORTED_IMAGES:
+            return None
+        for url in dict.fromkeys(urls):
+            if url not in self.cache:
+                if len(self.cache) >= MAX_IMPORTED_IMAGES:
+                    continue
+                image = _download_image(url)
+                if image and self.total_bytes + len(image.content) <= MAX_IMAGE_TOTAL_BYTES:
+                    self.total_bytes += len(image.content)
+                    self.cache[url] = image
+                else:
+                    self.cache[url] = None
+            image = self.cache[url]
+            if image and _valid_image_dimensions(image, cover=cover):
+                self.assignments += 1
+                return image
+        return None
+
+
+def _download_image(url: str) -> DownloadedImage | None:
     """Fetch and validate a public source image without making image import fatal."""
     current_url = url
     headers = {"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,image/webp"}
@@ -77,12 +122,15 @@ def _download_image(url: str, *, cover: bool) -> DownloadedImage | None:
                         chunks.append(chunk)
                     content = b"".join(chunks)
                     with Image.open(io.BytesIO(content)) as image:
-                        image.verify()
-                    with Image.open(io.BytesIO(content)) as image:
                         width, height = image.size
-                    min_area = 150_000 if cover else 40_000
-                    min_side = 300 if cover else 160
-                    if width * height < min_area or min(width, height) < min_side:
+                        if (
+                            width > MAX_IMAGE_WIDTH
+                            or height > MAX_IMAGE_HEIGHT
+                            or width * height > MAX_IMAGE_PIXELS
+                        ):
+                            return None
+                        image.verify()
+                    if width < 1 or height < 1:
                         return None
                     extension = {
                         "image/jpeg": ".jpg",
@@ -90,7 +138,12 @@ def _download_image(url: str, *, cover: bool) -> DownloadedImage | None:
                         "image/webp": ".webp",
                     }[content_type]
                     digest = hashlib.sha256(current_url.encode()).hexdigest()[:16]
-                    return DownloadedImage(f"import-{digest}{extension}", content)
+                    return DownloadedImage(
+                        f"import-{digest}{extension}",
+                        content,
+                        width,
+                        height,
+                    )
     except (
         httpx.HTTPError,
         OSError,
@@ -102,20 +155,13 @@ def _download_image(url: str, *, cover: bool) -> DownloadedImage | None:
     return None
 
 
-def _first_downloadable_image(urls: list[str], *, cover: bool) -> DownloadedImage | None:
-    for url in dict.fromkeys(urls):
-        image = _download_image(url, cover=cover)
-        if image:
-            return image
-    return None
-
-
 def _prepare_images(
     document: SourceDocument | None,
     recipes: list[dict],
 ) -> list[tuple[DownloadedImage | None, list[DownloadedImage | None]]]:
     if not document:
         return [(None, [None] * len(data["steps"])) for data in recipes]
+    budget = ImageImportBudget()
     allowed_cover = set(document.cover_image_urls)
     allowed_steps = set(document.step_image_urls)
     structured_cover_urls = {
@@ -146,7 +192,7 @@ def _prepare_images(
         )
         cover_urls.extend(fallback_covers[recipe_index:])
         cover_urls.extend(fallback_covers[:recipe_index])
-        cover_image = _first_downloadable_image(cover_urls, cover=True)
+        cover_image = budget.select(cover_urls, cover=True)
 
         step_images: list[DownloadedImage | None] = []
         fallback_index = 0
@@ -175,7 +221,7 @@ def _prepare_images(
                     candidates.append(fallback_step_urls[fallback_index])
                     fallback_index += 1
             used_step_urls.update(candidates)
-            step_images.append(_first_downloadable_image(candidates, cover=False))
+            step_images.append(budget.select(candidates, cover=False))
         prepared.append((cover_image, step_images))
     return prepared
 
@@ -207,6 +253,37 @@ def _set_categories(recipe: Recipe, slugs: list[str]) -> None:
     recipe.categories.set(
         [category_by_slug[slug] for slug in slugs if slug in category_by_slug]
     )
+
+
+def _adapt_structured_recipes(
+    document: SourceDocument,
+) -> tuple[list[dict], SourceDocument]:
+    adapted = []
+    valid_indices = []
+    structured_recipes = document.all_structured_recipes
+    for index, recipe in enumerate(structured_recipes):
+        try:
+            adapted.append(adapt_structured_recipe(recipe))
+            valid_indices.append(index)
+        except (AIResponseError, TypeError, ValueError, ZeroDivisionError):
+            logger.info("Skipping incomplete JSON-LD Recipe at index %s", index)
+    if not adapted:
+        raise ImportPipelineError(
+            "На странице найдена только неполная Recipe-разметка: в ней нет "
+            "названия, ингредиентов или шагов приготовления."
+        )
+
+    def matching_slots(values: tuple[tuple[str, ...], ...]) -> tuple[tuple[str, ...], ...]:
+        return tuple(values[index] for index in valid_indices if index < len(values))
+
+    filtered_document = replace(
+        document,
+        structured_recipe=None,
+        structured_recipes=tuple(structured_recipes[index] for index in valid_indices),
+        recipe_cover_image_urls=matching_slots(document.recipe_cover_image_urls),
+        recipe_step_image_urls=matching_slots(document.recipe_step_image_urls),
+    )
+    return adapted, filtered_document
 
 
 def save_draft(
@@ -298,7 +375,7 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
     if settings.RECIPE_AI_BASE_URL and settings.RECIPE_AI_MODEL:
         data = adapt_with_ai(document, custom_prompt=job.custom_prompt)
     elif document.all_structured_recipes:
-        data = [adapt_structured_recipe(recipe) for recipe in document.all_structured_recipes]
+        data, document = _adapt_structured_recipes(document)
     else:
         raise ImportPipelineError(
             "Для этого источника нужен AI-сервис. Страница без Recipe-разметки или YouTube "

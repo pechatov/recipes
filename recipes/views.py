@@ -1,4 +1,6 @@
 import mimetypes
+import re
+import unicodedata
 from pathlib import Path
 
 from django.conf import settings
@@ -33,6 +35,37 @@ def login_view(request):
     return auth_views.LoginView.as_view(template_name="registration/login.html")(request)
 
 
+def _normalize_recipe_search(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value.casefold().replace("ё", "е"))
+    return " ".join(re.findall(r"[^\W_]+", value, re.UNICODE))
+
+
+def _is_search_subsequence(needle: str, haystack: str) -> bool:
+    iterator = iter(haystack)
+    return all(character in iterator for character in needle)
+
+
+def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
+    author = recipe.created_by
+    search_text = _normalize_recipe_search(
+        " ".join(
+            (
+                recipe.title,
+                recipe.description,
+                author.get_full_name() if author else "",
+                author.username if author else "",
+                *(category.name for category in recipe.categories.all()),
+                *(ingredient.name for ingredient in recipe.ingredients.all()),
+            )
+        )
+    )
+    return all(
+        token in search_text
+        or (len(token) > 2 and _is_search_subsequence(token, search_text))
+        for token in _normalize_recipe_search(query).split()
+    )
+
+
 @require_http_methods(["GET", "POST"])
 def setup_owner(request):
     if get_user_model().objects.exists():
@@ -65,6 +98,27 @@ def recipe_list(request):
         recipes = recipes.filter(categories__slug=selected_category)
     if selected_author.isdigit():
         recipes = recipes.filter(created_by_id=selected_author)
+    if query:
+        exact_recipes = recipes
+        for token in _normalize_recipe_search(query).split():
+            exact_recipes = exact_recipes.filter(
+                Q(title__icontains=token)
+                | Q(description__icontains=token)
+                | Q(ingredients__name__icontains=token)
+                | Q(categories__name__icontains=token)
+                | Q(created_by__username__icontains=token)
+                | Q(created_by__first_name__icontains=token)
+                | Q(created_by__last_name__icontains=token)
+            )
+        exact_recipes = exact_recipes.distinct()
+        if exact_recipes.exists():
+            recipes = exact_recipes
+        else:
+            recipes = [
+                recipe
+                for recipe in recipes
+                if _recipe_matches_fuzzy_query(recipe, query)
+            ]
     return render(
         request,
         "recipes/recipe_list.html",

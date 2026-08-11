@@ -15,70 +15,6 @@ def link_existing_import_recipes(apps, schema_editor):
     through.objects.bulk_create(links, ignore_conflicts=True)
 
 
-def remove_plain_water_ingredients(apps, schema_editor):
-    RecipeIngredient = apps.get_model("recipes", "RecipeIngredient")
-    water_words = {
-        "вода",
-        "воды",
-        "воду",
-        "water",
-        "кипяток",
-        "кипятка",
-        "лед",
-        "льда",
-        "ice",
-    }
-    qualifiers = {
-        "горячая",
-        "горячей",
-        "горячую",
-        "холодная",
-        "холодной",
-        "холодную",
-        "теплая",
-        "теплой",
-        "теплую",
-        "питьевая",
-        "питьевой",
-        "питьевую",
-        "фильтрованная",
-        "фильтрованной",
-        "фильтрованную",
-        "кипяченая",
-        "кипяченой",
-        "кипяченую",
-        "ледяная",
-        "ледяной",
-        "ледяную",
-        "газированная",
-        "газированной",
-        "газированную",
-        "минеральная",
-        "минеральной",
-        "минеральную",
-        "комнатная",
-        "комнатной",
-        "комнатную",
-        "температура",
-        "температуры",
-        "кубик",
-        "кубики",
-        "кубиках",
-        "колотый",
-        "колотого",
-        "в",
-        "из",
-    }
-    ids = []
-    for ingredient in RecipeIngredient.objects.only("pk", "name").iterator():
-        words = set(
-            re.findall(r"[a-zа-я]+", (ingredient.name or "").lower().replace("ё", "е"))
-        )
-        if words & water_words and words <= water_words | qualifiers:
-            ids.append(ingredient.pk)
-    RecipeIngredient.objects.filter(pk__in=ids).delete()
-
-
 def classify_existing_pantry_ingredients(apps, schema_editor):
     RecipeIngredient = apps.get_model("recipes", "RecipeIngredient")
     pattern = re.compile(
@@ -201,5 +137,4 @@ class Migration(migrations.Migration):
             classify_existing_pantry_ingredients,
             migrations.RunPython.noop,
         ),
-        migrations.RunPython(remove_plain_water_ingredients, migrations.RunPython.noop),
     ]

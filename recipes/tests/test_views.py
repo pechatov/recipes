@@ -94,6 +94,35 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(response, "Семейная паста")
 
+    def test_server_search_excludes_unrelated_recipes_without_javascript(self):
+        other = Recipe.objects.create(title="Яблочный пирог", created_by=self.user)
+        RecipeIngredient.objects.create(
+            recipe=other,
+            name="Яблоки",
+            quantity=3,
+            unit="шт.",
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "сливки"})
+
+        self.assertContains(response, "Семейная паста")
+        self.assertNotContains(response, "Яблочный пирог")
+
+    def test_water_is_hidden_without_deleting_historical_quantity(self):
+        water = RecipeIngredient.objects.create(
+            recipe=self.recipe,
+            name="Горячая вода",
+            quantity=500,
+            unit="мл",
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertNotContains(response, "Горячая вода")
+        self.assertTrue(RecipeIngredient.objects.filter(pk=water.pk).exists())
+
     def test_recipe_list_filters_by_category(self):
         soup_category = Category.objects.get(slug="soup")
         salad_category = Category.objects.get(slug="salad")

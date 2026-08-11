@@ -15,6 +15,7 @@ from recipes.importing.llm import _parse_json
 from recipes.importing.normalizer import normalize_recipe, normalize_recipes
 from recipes.importing.pipeline import (
     DownloadedImage,
+    MAX_IMPORTED_IMAGES,
     _prepare_images,
     process_import_job,
     save_draft,
@@ -282,6 +283,37 @@ class PipelineTests(TestCase):
         self.assertEqual(job.status, ImportJob.Status.COMPLETED)
         self.assertEqual(job.recipe, recipe)
         self.assertEqual(list(job.recipes.all()), [recipe])
+
+    @override_settings(RECIPE_AI_BASE_URL="", RECIPE_AI_MODEL="")
+    @patch("recipes.importing.pipeline.extract_source")
+    def test_incomplete_json_ld_does_not_block_valid_recipe(self, extract_source):
+        incomplete = {
+            "@type": "Recipe",
+            "name": "Ссылка на рецепт без содержимого",
+        }
+        valid = {
+            "@type": "Recipe",
+            "name": "Запечённый картофель",
+            "recipeIngredient": ["500 г картофель"],
+            "recipeInstructions": [{"text": "Запечь картофель."}],
+        }
+        extract_source.return_value = SourceDocument(
+            "website",
+            "Картофель",
+            "Подробный рецепт приготовления картофеля в духовке.",
+            structured_recipes=(incomplete, valid),
+            recipe_cover_image_urls=((), ()),
+            recipe_step_image_urls=((), ("",)),
+        )
+        job = ImportJob.objects.create(
+            source_url="https://example.com/mixed-schema",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=get_user_model().objects.create_user("schema-importer"),
+        )
+
+        recipes = process_import_job(job)
+
+        self.assertEqual([recipe.title for recipe in recipes], ["Запечённый картофель"])
 
     @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
     @patch("recipes.importing.pipeline.adapt_with_ai")
@@ -563,6 +595,78 @@ class PipelineTests(TestCase):
         )
         self.assertIsNone(single[0][1][0])
         self.assertEqual(single[0][1][1].name, "only-second-step.jpg")
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_image_budget_caches_repeated_urls_and_limits_assignments(self, download_image):
+        url = "https://cdn.example/repeated-step.jpg"
+        download_image.return_value = DownloadedImage("step.jpg", b"image")
+        document = SourceDocument(
+            "website",
+            "Рецепт",
+            "Описание приготовления",
+            step_image_urls=(url,),
+        )
+        data = [
+            {
+                "cover_image_url": "",
+                "steps": [{"image_url": url} for _ in range(MAX_IMPORTED_IMAGES + 10)],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertEqual(download_image.call_count, 1)
+        self.assertEqual(
+            sum(image is not None for image in prepared[0][1]),
+            MAX_IMPORTED_IMAGES,
+        )
+
+    @patch("recipes.importing.pipeline.MAX_IMAGE_TOTAL_BYTES", 15)
+    @patch("recipes.importing.pipeline._download_image")
+    def test_image_budget_limits_total_compressed_bytes(self, download_image):
+        urls = tuple(f"https://cdn.example/{index}.jpg" for index in range(3))
+        download_image.side_effect = [
+            DownloadedImage(f"{index}.jpg", b"x" * 10) for index in range(3)
+        ]
+        document = SourceDocument(
+            "website",
+            "Рецепт",
+            "Описание приготовления",
+            step_image_urls=urls,
+        )
+        data = [
+            {
+                "cover_image_url": "",
+                "steps": [{"image_url": url} for url in urls],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertEqual(sum(image is not None for image in prepared[0][1]), 1)
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_image_budget_rejects_excessive_pixel_dimensions(self, download_image):
+        url = "https://cdn.example/oversized.jpg"
+        download_image.return_value = DownloadedImage(
+            "oversized.jpg",
+            b"small-compressed-image",
+            width=9_000,
+            height=4_000,
+        )
+        document = SourceDocument(
+            "website",
+            "Рецепт",
+            "Описание приготовления",
+            step_image_urls=(url,),
+        )
+
+        prepared = _prepare_images(
+            document,
+            [{"cover_image_url": "", "steps": [{"image_url": url}]}],
+        )
+
+        self.assertIsNone(prepared[0][1][0])
 
     @override_settings(RECIPE_AI_BASE_URL="", RECIPE_AI_MODEL="")
     @patch("recipes.importing.pipeline._download_image")
