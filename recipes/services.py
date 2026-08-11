@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import quote_plus
 
-from .models import RecipeIngredient, StorePreference
+from .models import RecipeIngredient, StorePreference, is_water_ingredient_name
 
 
 LAVKA_SEARCH_URL = "https://lavka.yandex.ru/search?text={query}"
@@ -30,6 +30,8 @@ def build_shopping_items(recipe, servings: int) -> list[ShoppingItem]:
     multiplier = Decimal(servings) / Decimal(recipe.servings)
     items = []
     for ingredient in recipe.ingredients.all():
+        if is_water_ingredient_name(ingredient.name):
+            continue
         quantity = ingredient.quantity * multiplier if ingredient.quantity is not None else None
         items.append(
             ShoppingItem(

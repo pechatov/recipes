@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from html import unescape
 from typing import Any
 
@@ -67,13 +68,15 @@ def _ingredient(value: Any) -> dict[str, Any]:
     }
 
 
-def _steps(value: Any) -> list[dict[str, str]]:
+def _steps(value: Any, section: str = "") -> list[dict[str, str]]:
     if not isinstance(value, list):
         value = [value]
     result = []
     for item in value:
         if isinstance(item, dict) and str(item.get("@type", "")).lower() == "howtosection":
-            result.extend(_steps(item.get("itemListElement", [])))
+            result.extend(
+                _steps(item.get("itemListElement", []), _plain(item.get("name")) or section)
+            )
             continue
         if isinstance(item, dict):
             instruction = _plain(item.get("text") or item.get("name"))
@@ -82,8 +85,27 @@ def _steps(value: Any) -> list[dict[str, str]]:
             instruction = _plain(item)
             title = ""
         if instruction:
-            result.append({"title": title, "instruction": instruction})
+            result.append({"section": section, "title": title, "instruction": instruction})
     return result
+
+
+def _nutrition_calories(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    text = _plain(value.get("calories")).casefold().replace("ё", "е")
+    match = re.fullmatch(
+        r"\s*(\d+(?:[.,]\d+)?)\s*(kcal|calories?|ккал|калорий|калория|калории|kj|кдж)\.?\s*",
+        text,
+    )
+    if not match:
+        return None
+    try:
+        calories = Decimal(match.group(1).replace(",", "."))
+    except InvalidOperation:
+        return None
+    if match.group(2) in {"kj", "кдж"}:
+        calories /= Decimal("4.184")
+    return str(calories.quantize(Decimal("0.1")))
 
 
 def adapt_structured_recipe(value: dict[str, Any]) -> dict[str, Any]:
@@ -96,6 +118,7 @@ def adapt_structured_recipe(value: dict[str, Any]) -> dict[str, Any]:
         "servings": _servings(value.get("recipeYield")),
         "prep_minutes": _duration_minutes(value.get("prepTime")),
         "cook_minutes": _duration_minutes(value.get("cookTime") or value.get("totalTime")),
+        "calories_per_serving": _nutrition_calories(value.get("nutrition")),
         "categories": infer_category_slugs(f"{title} {description}"),
         "ingredients": ingredients,
         "steps": _steps(value.get("recipeInstructions", [])),

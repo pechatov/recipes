@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Текущие задачи · Домашние рецепты{% endblock %}
+{% block content %}
+  {% if active_task_count %}<meta http-equiv="refresh" content="5">{% endif %}
+  <header class="page-heading split-heading">
+    <div>
+      <p class="eyebrow">Фоновые процессы</p>
+      <h1>Текущие задачи</h1>
+      <p class="lead">Здесь можно вернуться к импорту рецепта или сборке корзины и проверить результат.</p>
+    </div>
+    <a class="button" href="{% url 'import-create' %}">Новый импорт</a>
+  </header>
+
+  <div class="task-columns">
+    <section class="task-section">
+      <div class="task-section-heading">
+        <h2>Импорт рецептов</h2>
+        <span>{{ import_jobs|length }}</span>
+      </div>
+      {% if import_jobs %}
+        <div class="task-list">
+          {% for job in import_jobs %}
+            <a class="task-item" href="{% url 'import-detail' job.pk %}">
+              <span class="task-status status-{{ job.status }}" aria-hidden="true"></span>
+              <span class="task-copy">
+                <strong>{{ job.source_title|default:job.source_url|truncatechars:64 }}</strong>
+                <small>{{ job.created_at|date:"d.m.Y H:i" }} · {{ job.get_status_display }}</small>
+              </span>
+              <span class="task-arrow">→</span>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="task-empty">Импортов пока нет.</p>
+      {% endif %}
+    </section>
+
+    <section class="task-section">
+      <div class="task-section-heading">
+        <h2>Сборка корзин</h2>
+        <span>{{ cart_runs|length }}</span>
+      </div>
+      {% if cart_runs %}
+        <div class="task-list">
+          {% for run in cart_runs %}
+            <a class="task-item" href="{% url 'cart-detail' run.pk %}">
+              <span class="task-status status-{{ run.status }}" aria-hidden="true"></span>
+              <span class="task-copy">
+                <strong>{{ run.recipe.title }}</strong>
+                <small>{{ run.created_at|date:"d.m.Y H:i" }} · {{ run.get_status_display }}</small>
+              </span>
+              <span class="task-arrow">→</span>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="task-empty">Корзины ещё не собирались.</p>
+      {% endif %}
+    </section>
+  </div>
+{% endblock %}

@@ -6,6 +6,10 @@ class SourceError(ImportPipelineError):
     pass
 
 
+class UnsafeSourceError(ImportPipelineError):
+    """The source is unrelated to cooking or contains hostile instructions."""
+
+
 class AIConfigurationError(ImportPipelineError):
     pass
 

@@ -1,16 +1,16 @@
 services:
   app:
-    image: ${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}
+    image: __RECIPES_IMAGE__
     restart: unless-stopped
     env_file:
-      - /mnt/main-pool/config/recipes/.env
+      - __RECIPES_APP_ROOT__/.env
     environment:
       DATABASE_HOST: db
       DATABASE_PORT: "5432"
     ports:
-      - "192.168.31.2:30111:8000"
+      - "__RECIPES_BIND_ADDRESS__:__RECIPES_PORT__:8000"
     volumes:
-      - /mnt/main-pool/config/recipes/data:/app/data
+      - __RECIPES_APP_ROOT__/data:/app/data
     depends_on:
       db:
         condition: service_healthy
@@ -22,31 +22,31 @@ services:
       start_period: 30s
 
   worker:
-    image: ${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}
+    image: __RECIPES_IMAGE__
     restart: unless-stopped
     command: ["python", "manage.py", "run_import_worker"]
     env_file:
-      - /mnt/main-pool/config/recipes/.env
+      - __RECIPES_APP_ROOT__/.env
     environment:
       DATABASE_HOST: db
       DATABASE_PORT: "5432"
     volumes:
-      - /mnt/main-pool/config/recipes/data:/app/data
+      - __RECIPES_APP_ROOT__/data:/app/data
     depends_on:
       app:
         condition: service_healthy
 
   cart-worker:
-    image: ${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}
+    image: __RECIPES_IMAGE__
     restart: unless-stopped
     command: ["python", "manage.py", "run_cart_worker"]
     env_file:
-      - /mnt/main-pool/config/recipes/.env
+      - __RECIPES_APP_ROOT__/.env
     environment:
       DATABASE_HOST: db
       DATABASE_PORT: "5432"
     volumes:
-      - /mnt/main-pool/config/recipes/data:/app/data
+      - __RECIPES_APP_ROOT__/data:/app/data
     depends_on:
       app:
         condition: service_healthy
@@ -55,12 +55,12 @@ services:
     image: postgres:17-alpine
     restart: unless-stopped
     env_file:
-      - /mnt/main-pool/config/recipes/.env
+      - __RECIPES_APP_ROOT__/.env
     environment:
       POSTGRES_DB: recipes
       POSTGRES_USER: recipes
     volumes:
-      - /mnt/main-pool/config/recipes/postgres:/var/lib/postgresql/data
+      - __RECIPES_APP_ROOT__/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U recipes -d recipes"]
       interval: 10s

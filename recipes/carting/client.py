@@ -110,11 +110,16 @@ def _chat_url(base_url: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
-def cart_browser_session_key(user_id: int) -> str:
+def cart_browser_session_key(user_id: int, shard: int | None = None) -> str:
     """Return the stable, non-PII browser scope for a recipe-site user."""
     if not isinstance(user_id, int) or user_id < 1:
         raise ValueError("user_id must be a positive integer")
-    return f"recipes-cart-user-{user_id}"
+    key = f"recipes-cart-user-{user_id}"
+    if shard is None:
+        return key
+    if not isinstance(shard, int) or not 1 <= shard <= 5:
+        raise ValueError("shard must be an integer between 1 and 5")
+    return f"{key}-shard-{shard}"
 
 
 def _extract_json(content: Any) -> dict[str, Any]:
@@ -156,19 +161,18 @@ def run_store_cart_task(
         "recipe": run.recipe.title,
         "servings": run.servings,
     }
+    if operation not in {"assemble", "cleanup"}:
+        raise CartAgentError("Неизвестная операция браузерного агента.")
     if operation == "cleanup":
         task.update({"cart_url": cart_url, "added_items": added_items or []})
         system_prompt = CLEANUP_PROMPT
         instruction = "Удали только добавления из следующего журнала."
     else:
-        task.update(
-            {
-                "ingredients": run.ingredient_snapshot,
-                "cleanup_missing_threshold": max(
-                    2,
-                    math.ceil(len(run.ingredient_snapshot) * 0.25),
-                ),
-            }
+        ingredient_snapshot = run.ingredient_snapshot
+        task["ingredients"] = ingredient_snapshot
+        task["cleanup_missing_threshold"] = max(
+            2,
+            math.ceil(len(ingredient_snapshot) * 0.25),
         )
         system_prompt = ASSEMBLE_PROMPT
         instruction = (
@@ -223,6 +227,16 @@ def run_store_cart_task(
 
 
 def assemble_store_cart(run, store: str) -> dict[str, Any]:
+    ingredients = run.ingredient_snapshot
+    if not isinstance(ingredients, list) or not ingredients:
+        return {
+            "status": "incomplete",
+            "cart_url": "",
+            "summary": "Для сборки не выбраны ингредиенты.",
+            "cart_cleared": True,
+            "items": [],
+        }
+
     return run_store_cart_task(run, store, "assemble")
 
 

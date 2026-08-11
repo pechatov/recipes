@@ -11,8 +11,9 @@
     <form method="post" class="form-section stack-form import-card">
       {% csrf_token %}
       {% include "recipes/_form_field.html" with field=form.source_url %}
+      {% include "recipes/_form_field.html" with field=form.custom_prompt %}
       <button class="button" type="submit">Создать черновик</button>
-      <p class="fine-print">Для YouTube нужны доступные субтитры. Автоматический результат всегда стоит проверить перед публикацией.</p>
+      <p class="fine-print">В подсказке можно указать важные детали: например, нужное число порций или какие блюда считать частями одного рецепта. Для YouTube нужны доступные субтитры.</p>
     </form>
   </section>
 {% endblock %}
