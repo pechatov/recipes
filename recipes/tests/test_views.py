@@ -165,6 +165,33 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(self.recipe.calories_per_100g), "888.0")
         self.assertFalse(self.recipe.calories_estimated)
 
+    def test_detail_fills_missing_macros_around_historical_manual_calories(self):
+        self.recipe.calories_per_serving = 999
+        self.recipe.calories_per_100g = 888
+        self.recipe.calories_estimated = False
+        self.recipe.nutrition_manual_fields = [
+            "calories_per_serving",
+            "calories_per_100g",
+        ]
+        self.recipe.save(
+            update_fields=[
+                "calories_per_serving",
+                "calories_per_100g",
+                "calories_estimated",
+                "nutrition_manual_fields",
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        displayed = response.context["recipe"]
+        self.assertEqual(str(displayed.calories_per_serving), "999.0")
+        self.assertEqual(str(displayed.calories_per_100g), "888.0")
+        self.assertEqual(str(displayed.proteins_per_serving), "2.8")
+        self.assertEqual(str(displayed.fats_per_100g), "20.0")
+        self.assertTrue(displayed.calories_estimated)
+
     def test_edit_form_has_clipboard_zones_for_cover_and_step_images(self):
         self.client.force_login(self.user)
         response = self.client.get(reverse("recipe-update", args=[self.recipe.slug]))

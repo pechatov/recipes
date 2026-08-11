@@ -343,10 +343,11 @@ def recipe_detail(request, slug):
             return redirect(alias.recipe.get_absolute_url(), permanent=True)
         raise Http404
     all_ingredients = list(recipe.ingredients.all())
-    if recipe.calories_estimated or (
-        recipe.calories_per_serving is None and recipe.calories_per_100g is None
-    ):
+    if any(getattr(recipe, field) is None for field in NUTRITION_FIELDS):
         _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
+        recipe.calories_estimated = _nutrition_has_estimated_values(
+            recipe, set(recipe.nutrition_manual_fields or [])
+        )
     ingredients = [ingredient for ingredient in all_ingredients if not ingredient.is_water]
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
