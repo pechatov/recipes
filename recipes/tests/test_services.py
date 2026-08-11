@@ -4,7 +4,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from recipes.models import Recipe, RecipeIngredient
-from recipes.services import build_lavka_search_url, build_shopping_items
+from recipes.services import build_lavka_search_url, build_shopping_items, build_store_search_url
 
 
 class ShoppingServiceTests(TestCase):
@@ -17,6 +17,12 @@ class ShoppingServiceTests(TestCase):
         self.assertEqual(
             url,
             "https://lavka.yandex.ru/search?text=%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
+        )
+
+    def test_priority_store_url_uses_encoded_search_query(self):
+        self.assertEqual(
+            build_store_search_url("auchan", "сливки 20%"),
+            "https://www.auchan.ru/catalog/?q=%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
         )
 
     def test_shopping_items_scale_quantities(self):

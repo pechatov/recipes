@@ -108,17 +108,39 @@ def _nutrition_calories(value: Any) -> str | None:
     return str(calories.quantize(Decimal("0.1")))
 
 
+def _nutrition_grams(value: Any, field: str) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    match = re.fullmatch(
+        r"\s*(\d+(?:[.,]\d+)?)\s*(?:g|г|grams?|грамм(?:а|ов)?)\.?\s*",
+        _plain(value.get(field)).casefold(),
+    )
+    if not match:
+        return None
+    try:
+        amount = Decimal(match.group(1).replace(",", "."))
+    except InvalidOperation:
+        return None
+    return str(amount.quantize(Decimal("0.1")))
+
+
 def adapt_structured_recipe(value: dict[str, Any]) -> dict[str, Any]:
     ingredients = [_ingredient(item) for item in value.get("recipeIngredient", [])]
     title = _plain(value.get("name"))
     description = _plain(value.get("description"))
+    nutrition = value.get("nutrition")
     data = {
         "title": title,
         "description": description,
         "servings": _servings(value.get("recipeYield")),
         "prep_minutes": _duration_minutes(value.get("prepTime")),
         "cook_minutes": _duration_minutes(value.get("cookTime") or value.get("totalTime")),
-        "calories_per_serving": _nutrition_calories(value.get("nutrition")),
+        "calories_per_serving": _nutrition_calories(nutrition),
+        "proteins_per_serving": _nutrition_grams(nutrition, "proteinContent"),
+        "fats_per_serving": _nutrition_grams(nutrition, "fatContent"),
+        "carbohydrates_per_serving": _nutrition_grams(
+            nutrition, "carbohydrateContent"
+        ),
         "categories": infer_category_slugs(f"{title} {description}"),
         "ingredients": ingredients,
         "steps": _steps(value.get("recipeInstructions", [])),

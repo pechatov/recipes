@@ -233,6 +233,12 @@ def _recipe_values(job: ImportJob, data: dict) -> dict:
         "cook_minutes": data["cook_minutes"],
         "calories_per_serving": data.get("calories_per_serving"),
         "calories_per_100g": data.get("calories_per_100g"),
+        "proteins_per_serving": data.get("proteins_per_serving"),
+        "fats_per_serving": data.get("fats_per_serving"),
+        "carbohydrates_per_serving": data.get("carbohydrates_per_serving"),
+        "proteins_per_100g": data.get("proteins_per_100g"),
+        "fats_per_100g": data.get("fats_per_100g"),
+        "carbohydrates_per_100g": data.get("carbohydrates_per_100g"),
         "calories_estimated": True,
         "source_url": job.source_url,
     }

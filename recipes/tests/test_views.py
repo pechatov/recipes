@@ -50,6 +50,20 @@ class RecipeViewTests(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("login"), response.url)
 
+    def test_recipe_card_has_a_full_area_link_and_separate_shopping_action(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"))
+
+        self.assertContains(
+            response,
+            f'<a href="{self.recipe.get_absolute_url()}" class="recipe-card-link"',
+        )
+        self.assertContains(
+            response,
+            f'href="{reverse("shopping-list", args=[self.recipe.slug])}"',
+        )
+
     def test_authenticated_user_can_view_recipe(self):
         self.client.force_login(self.user)
         response = self.client.get(self.recipe.get_absolute_url())
@@ -57,6 +71,12 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "Прогреть сливки")
         self.assertEqual(str(response.context["recipe"].calories_per_serving), "205.0")
         self.assertEqual(str(response.context["recipe"].calories_per_100g), "205.0")
+        self.assertEqual(str(response.context["recipe"].proteins_per_serving), "2.8")
+        self.assertEqual(str(response.context["recipe"].fats_per_100g), "20.0")
+
+    def test_recipe_slug_transliterates_russian_title(self):
+        self.assertEqual(self.recipe.slug, "semeynaya-pasta")
+        self.assertTrue(self.recipe.slug.isascii())
 
     def test_estimated_calories_can_be_recalculated_after_ingredient_changes(self):
         _fill_missing_recipe_calories(self.recipe, save=True)
@@ -139,6 +159,9 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "400 мл")
         self.assertContains(response, "https://lavka.yandex.ru/search?text=")
         self.assertContains(response, "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25")
+        self.assertContains(response, "Приоритет магазинов")
+        self.assertContains(response, "Найти в Ашан")
+        self.assertContains(response, "data-store-dialog")
 
     def test_search_finds_recipe_by_ingredient(self):
         self.client.force_login(self.user)
@@ -151,6 +174,15 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("recipe-list"), {"q": "слвк"})
 
         self.assertContains(response, "Семейная паста")
+
+    def test_fuzzy_search_handles_transposed_and_replaced_letters(self):
+        self.client.force_login(self.user)
+
+        for query in ("слвики", "слифки"):
+            with self.subTest(query=query):
+                response = self.client.get(reverse("recipe-list"), {"q": query})
+
+                self.assertContains(response, "Семейная паста")
 
     def test_fuzzy_search_keeps_matches_alongside_exact_match(self):
         exact = Recipe.objects.create(title="СЛВК — семейная заметка", created_by=self.user)

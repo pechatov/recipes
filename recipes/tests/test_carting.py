@@ -123,6 +123,52 @@ class CartViewTests(TestCase):
         )
         self.assertEqual(enabled, ["lavka"])
 
+    def test_inline_store_preferences_follow_dragged_order_and_return(self):
+        get_store_preferences(self.user)
+        return_url = reverse("shopping-list", args=[self.recipe.slug])
+        response = self.client.post(
+            reverse("store-preferences"),
+            {
+                "store_order": ["magnit", "auchan", "lavka", "perekrestok", "pyaterochka"],
+                "enabled_magnit": "on",
+                "enabled_auchan": "on",
+                "next": return_url,
+            },
+        )
+        self.assertRedirects(response, return_url)
+        preferences = get_store_preferences(self.user)
+        self.assertEqual([item.store for item in preferences[:2]], ["magnit", "auchan"])
+
+    def test_cart_detail_shows_per_item_status_instead_of_checked_stores(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.REVIEW,
+            store_priority=["auchan"],
+            ingredient_snapshot=[
+                {"name": "Картофель", "quantity": "400", "unit": "г"},
+                {"name": "Соль", "quantity": "5", "unit": "г"},
+            ],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run, store="auchan", status=CartAttempt.Status.SUBSTITUTIONS
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+        CartItemMatch.objects.create(
+            attempt=attempt,
+            ingredient_name="Картофель",
+            product_name="Картофель молодой",
+            quality=CartItemMatch.MatchQuality.SUBSTITUTE,
+        )
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Найдена альтернатива")
+        self.assertContains(response, "В очереди")
+        self.assertNotContains(response, "Проверенные магазины")
+
     def test_retry_of_old_captcha_failure_resumes_blocked_store(self):
         run = CartRun.objects.create(
             recipe=self.recipe,

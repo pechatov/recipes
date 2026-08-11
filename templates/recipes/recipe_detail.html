@@ -16,8 +16,8 @@
           <span><strong>{{ recipe.servings }}</strong> порций</span>
           {% if recipe.prep_minutes %}<span><strong>{{ recipe.prep_minutes }}</strong> мин. подготовка</span>{% endif %}
           {% if recipe.cook_minutes %}<span><strong>{{ recipe.cook_minutes }}</strong> мин. готовка</span>{% endif %}
-          {% if recipe.calories_per_serving %}<span><strong>≈ {{ recipe.calories_per_serving|floatformat:"0" }}</strong> ккал/порция</span>{% endif %}
-          {% if recipe.calories_per_100g %}<span><strong>≈ {{ recipe.calories_per_100g|floatformat:"0" }}</strong> ккал/100 г</span>{% endif %}
+          {% if recipe.calories_per_serving %}<span><strong>На порцию:</strong> ≈ {{ recipe.calories_per_serving|floatformat:"0" }} ккал · Б {{ recipe.proteins_per_serving|floatformat:"1" }} · Ж {{ recipe.fats_per_serving|floatformat:"1" }} · У {{ recipe.carbohydrates_per_serving|floatformat:"1" }} г</span>{% endif %}
+          {% if recipe.calories_per_100g %}<span><strong>На 100 г:</strong> ≈ {{ recipe.calories_per_100g|floatformat:"0" }} ккал · Б {{ recipe.proteins_per_100g|floatformat:"1" }} · Ж {{ recipe.fats_per_100g|floatformat:"1" }} · У {{ recipe.carbohydrates_per_100g|floatformat:"1" }} г</span>{% endif %}
         </div>
         <div class="action-row">
           {% if recipe.is_draft %}

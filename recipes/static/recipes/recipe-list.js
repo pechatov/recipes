@@ -23,8 +23,49 @@
     }
     return needle.length === 0;
   };
+  const editDistance = (left, right) => {
+    if (left === right) return 0;
+    let previousPrevious = null;
+    let previous = Array.from({length: right.length + 1}, (_, index) => index);
+    for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+      const current = [leftIndex];
+      for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+        current.push(Math.min(
+          current[current.length - 1] + 1,
+          previous[rightIndex] + 1,
+          previous[rightIndex - 1] + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1)
+        ));
+        if (
+          previousPrevious
+          && leftIndex > 1
+          && rightIndex > 1
+          && left[leftIndex - 1] === right[rightIndex - 2]
+          && left[leftIndex - 2] === right[rightIndex - 1]
+        ) {
+          current[current.length - 1] = Math.min(
+            current[current.length - 1],
+            previousPrevious[rightIndex - 2] + 1
+          );
+        }
+      }
+      previousPrevious = previous;
+      previous = current;
+    }
+    return previous[previous.length - 1];
+  };
+  const tokenMatches = (token, text) => {
+    if (text.includes(token)) return true;
+    if (token.length <= 2) return false;
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.some(word => isSubsequence(token, word))) return true;
+    const maximumDistance = token.length <= 5 ? 1 : token.length <= 8 ? 2 : 3;
+    return words.some(word =>
+      Math.abs(token.length - word.length) <= maximumDistance
+      && editDistance(token, word) <= maximumDistance
+    );
+  };
   const matches = (query, text) => normalize(query).split(/\s+/).filter(Boolean).every(token =>
-    text.includes(token) || (token.length > 2 && isSubsequence(token, text))
+    tokenMatches(token, text)
   );
   const filterCards = () => {
     const query = input.value;
