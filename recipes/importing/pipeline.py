@@ -240,6 +240,7 @@ def _recipe_values(job: ImportJob, data: dict) -> dict:
         "fats_per_100g": data.get("fats_per_100g"),
         "carbohydrates_per_100g": data.get("carbohydrates_per_100g"),
         "calories_estimated": True,
+        "nutrition_manual_fields": [],
         "source_url": job.source_url,
     }
 

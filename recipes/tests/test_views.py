@@ -5,7 +5,14 @@ from django.test import TestCase
 from django.urls import reverse
 
 from recipes.forms import IngredientForm
-from recipes.models import Category, ImportJob, Recipe, RecipeIngredient, RecipeStep
+from recipes.models import (
+    Category,
+    ImportJob,
+    Recipe,
+    RecipeIngredient,
+    RecipeSlugAlias,
+    RecipeStep,
+)
 from recipes.views import _fill_missing_recipe_calories
 
 
@@ -77,6 +84,19 @@ class RecipeViewTests(TestCase):
     def test_recipe_slug_transliterates_russian_title(self):
         self.assertEqual(self.recipe.slug, "semeynaya-pasta")
         self.assertTrue(self.recipe.slug.isascii())
+
+    def test_legacy_unicode_slug_permanently_redirects_to_ascii_url(self):
+        RecipeSlugAlias.objects.create(recipe=self.recipe, slug="семейная-паста")
+        self.client.force_login(self.user)
+
+        response = self.client.get("/recipes/семейная-паста/")
+
+        self.assertRedirects(
+            response,
+            self.recipe.get_absolute_url(),
+            status_code=301,
+            fetch_redirect_response=False,
+        )
 
     def test_estimated_calories_can_be_recalculated_after_ingredient_changes(self):
         _fill_missing_recipe_calories(self.recipe, save=True)
@@ -355,7 +375,7 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(created.calories_per_serving), "96.2")
         self.assertEqual(str(created.calories_per_100g), "77.0")
 
-    def test_create_recipe_does_not_mix_manual_and_estimated_calories(self):
+    def test_create_recipe_tracks_manual_and_estimated_nutrition(self):
         self.client.force_login(self.user)
         response = self.client.post(
             reverse("recipe-create"),
@@ -385,10 +405,11 @@ class RecipeViewTests(TestCase):
         created = Recipe.objects.get(title="Суп с ручной калорийностью")
         self.assertRedirects(response, created.get_absolute_url())
         self.assertEqual(str(created.calories_per_serving), "123.0")
-        self.assertIsNone(created.calories_per_100g)
-        self.assertFalse(created.calories_estimated)
+        self.assertEqual(str(created.calories_per_100g), "77.0")
+        self.assertTrue(created.calories_estimated)
+        self.assertEqual(created.nutrition_manual_fields, ["calories_per_serving"])
         detail = self.client.get(created.get_absolute_url())
-        self.assertIsNone(detail.context["recipe"].calories_per_100g)
+        self.assertEqual(str(detail.context["recipe"].calories_per_100g), "77.0")
 
     def test_manual_nutrition_edit_preserves_unchanged_values(self):
         _fill_missing_recipe_calories(self.recipe, save=True)
@@ -432,7 +453,10 @@ class RecipeViewTests(TestCase):
         self.recipe.refresh_from_db()
         self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
         self.assertEqual(str(self.recipe.calories_per_100g), original_per_100g)
-        self.assertFalse(self.recipe.calories_estimated)
+        self.assertTrue(self.recipe.calories_estimated)
+        self.assertEqual(
+            self.recipe.nutrition_manual_fields, ["calories_per_serving"]
+        )
 
     def test_detail_renders_partial_nutrition_without_empty_labels(self):
         ingredient = self.recipe.ingredients.get()

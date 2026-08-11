@@ -161,6 +161,7 @@ class Recipe(models.Model):
         default=False,
         editable=False,
     )
+    nutrition_manual_fields = models.JSONField(default=list, editable=False)
     cover = models.ImageField(
         "фотография блюда",
         upload_to="recipes/covers/%Y/%m/",
@@ -233,6 +234,16 @@ class Recipe(models.Model):
     @property
     def is_draft(self):
         return self.status == self.Status.DRAFT
+
+
+class RecipeSlugAlias(models.Model):
+    recipe = models.ForeignKey(
+        Recipe, on_delete=models.CASCADE, related_name="slug_aliases"
+    )
+    slug = models.SlugField(max_length=220, unique=True, allow_unicode=True)
+
+    def __str__(self):
+        return self.slug
 
 
 class RecipeIngredient(models.Model):

@@ -24,25 +24,58 @@ def ascii_slug(title):
     return (slugify(value) or "recipe")[:210].rstrip("-")
 
 
-def transliterate_existing_slugs(apps, schema_editor):
+ALL_NUTRITION_FIELDS = (
+    "calories_per_serving",
+    "proteins_per_serving",
+    "fats_per_serving",
+    "carbohydrates_per_serving",
+    "calories_per_100g",
+    "proteins_per_100g",
+    "fats_per_100g",
+    "carbohydrates_per_100g",
+)
+
+
+def prepare_existing_recipes(apps, schema_editor):
     Recipe = apps.get_model("recipes", "Recipe")
+    RecipeSlugAlias = apps.get_model("recipes", "RecipeSlugAlias")
     reserved = {
         slug
         for slug in Recipe.objects.values_list("slug", flat=True)
         if slug and slug.isascii()
     }
     for recipe in Recipe.objects.order_by("pk"):
+        if not recipe.calories_estimated:
+            recipe.nutrition_manual_fields = [
+                field
+                for field in ALL_NUTRITION_FIELDS
+                if getattr(recipe, field) is not None
+            ]
+            recipe.save(update_fields=["nutrition_manual_fields"])
         if recipe.slug and recipe.slug.isascii():
             continue
+        old_slug = recipe.slug
         base = ascii_slug(recipe.title)
         candidate = base
         suffix = 2
         while candidate in reserved:
             candidate = f"{base[: 219 - len(str(suffix))]}-{suffix}"
             suffix += 1
+        if old_slug:
+            RecipeSlugAlias.objects.create(recipe=recipe, slug=old_slug)
         recipe.slug = candidate
         recipe.save(update_fields=["slug"])
         reserved.add(candidate)
+
+
+def restore_existing_slugs(apps, schema_editor):
+    Recipe = apps.get_model("recipes", "Recipe")
+    RecipeSlugAlias = apps.get_model("recipes", "RecipeSlugAlias")
+    for recipe in Recipe.objects.order_by("pk"):
+        alias = RecipeSlugAlias.objects.filter(recipe=recipe).order_by("pk").first()
+        if alias and not Recipe.objects.exclude(pk=recipe.pk).filter(slug=alias.slug).exists():
+            recipe.slug = alias.slug
+            recipe.save(update_fields=["slug"])
 
 
 NUTRIENT_FIELDS = (
@@ -74,8 +107,41 @@ class Migration(migrations.Migration):
             )
             for name, label in NUTRIENT_FIELDS
         ],
+        migrations.AddField(
+            model_name="recipe",
+            name="nutrition_manual_fields",
+            field=models.JSONField(default=list, editable=False),
+        ),
+        migrations.CreateModel(
+            name="RecipeSlugAlias",
+            fields=[
+                (
+                    "id",
+                    models.BigAutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "slug",
+                    models.SlugField(
+                        allow_unicode=True, max_length=220, unique=True
+                    ),
+                ),
+                (
+                    "recipe",
+                    models.ForeignKey(
+                        on_delete=models.CASCADE,
+                        related_name="slug_aliases",
+                        to="recipes.recipe",
+                    ),
+                ),
+            ],
+        ),
         migrations.RunPython(
-            transliterate_existing_slugs, migrations.RunPython.noop
+            prepare_existing_recipes, restore_existing_slugs
         ),
         migrations.AlterField(
             model_name="recipe",

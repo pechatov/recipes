@@ -9,6 +9,7 @@ from .models import (
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeSlugAlias,
     RecipeStep,
     StorePreference,
 )
@@ -55,6 +56,12 @@ class RecipeAdmin(admin.ModelAdmin):
     search_fields = ("title", "description", "ingredients__name")
     readonly_fields = ("created_at", "updated_at")
     inlines = (IngredientInline, StepInline)
+
+
+@admin.register(RecipeSlugAlias)
+class RecipeSlugAliasAdmin(admin.ModelAdmin):
+    list_display = ("slug", "recipe")
+    search_fields = ("slug", "recipe__title")
 
 
 @admin.register(ImportJob)

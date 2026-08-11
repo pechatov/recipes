@@ -70,7 +70,9 @@ class CartViewTests(TestCase):
         self.assertEqual(run.store_priority[0], StorePreference.Store.AUCHAN)
         self.assertEqual(run.ingredient_snapshot[0]["name"], "Картофель")
         self.assertEqual(run.ingredient_snapshot[0]["quantity"], "800")
-        self.assertNotContains(self.client.get(reverse("cart-detail", args=[run.pk])), "Соль")
+        detail = self.client.get(reverse("cart-detail", args=[run.pk]))
+        self.assertNotContains(detail, "Соль")
+        self.assertContains(detail, "В очереди")
 
     def test_cart_run_is_private_to_requesting_user(self):
         run = CartRun.objects.create(
@@ -166,7 +168,8 @@ class CartViewTests(TestCase):
         response = self.client.get(reverse("cart-detail", args=[run.pk]))
 
         self.assertContains(response, "Найдена альтернатива")
-        self.assertContains(response, "В очереди")
+        self.assertContains(response, "Ничего не найдено")
+        self.assertNotContains(response, "В очереди")
         self.assertNotContains(response, "Проверенные магазины")
 
     def test_retry_of_old_captcha_failure_resumes_blocked_store(self):

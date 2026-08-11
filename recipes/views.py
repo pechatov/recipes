@@ -24,7 +24,15 @@ from .carting.pipeline import attempt_needs_cleanup
 from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
 from .importing.extractors import detect_source_type
 from .importing.normalizer import estimate_nutrition
-from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePreference
+from .models import (
+    CartAttempt,
+    CartRun,
+    Category,
+    ImportJob,
+    Recipe,
+    RecipeSlugAlias,
+    StorePreference,
+)
 from .services import build_shopping_items, get_store_preferences
 
 
@@ -295,12 +303,15 @@ def draft_list(request):
 
 @login_required
 def recipe_detail(request, slug):
-    recipe = get_object_or_404(
-        Recipe.objects.select_related("created_by").prefetch_related(
-            "ingredients", "steps", "import_jobs"
-        ),
-        slug=slug,
+    recipes = Recipe.objects.select_related("created_by").prefetch_related(
+        "ingredients", "steps", "import_jobs"
     )
+    recipe = recipes.filter(slug=slug).first()
+    if recipe is None:
+        alias = RecipeSlugAlias.objects.select_related("recipe").filter(slug=slug).first()
+        if alias:
+            return redirect(alias.recipe.get_absolute_url(), permanent=True)
+        raise Http404
     all_ingredients = list(recipe.ingredients.all())
     if recipe.calories_estimated or (
         recipe.calories_per_serving is None and recipe.calories_per_100g is None
@@ -361,6 +372,13 @@ def _fill_missing_recipe_calories(
         recipe.save(update_fields=changed + ["updated_at"])
 
 
+def _nutrition_has_estimated_values(recipe, manual_fields: set[str]) -> bool:
+    return any(
+        field not in manual_fields and getattr(recipe, field) is not None
+        for field in NUTRITION_FIELDS
+    )
+
+
 def _recipe_form_context(request, instance=None):
     recipe = instance or Recipe()
     form = RecipeForm(request.POST or None, request.FILES or None, instance=recipe)
@@ -393,14 +411,25 @@ def recipe_create(request):
             ingredient_formset.save()
             step_formset.instance = recipe
             step_formset.save()
-            manual_calories = any(
-                form.cleaned_data[field] is not None
+            manual_fields = {
+                field
                 for field in NUTRITION_FIELDS
+                if form.cleaned_data[field] is not None
+            }
+            _fill_missing_recipe_calories(
+                recipe, save=True, preserve_fields=manual_fields
             )
-            if not manual_calories:
-                _fill_missing_recipe_calories(recipe, save=True)
-            recipe.calories_estimated = not manual_calories
-            recipe.save(update_fields=["calories_estimated", "updated_at"])
+            recipe.nutrition_manual_fields = sorted(manual_fields)
+            recipe.calories_estimated = _nutrition_has_estimated_values(
+                recipe, manual_fields
+            )
+            recipe.save(
+                update_fields=[
+                    "nutrition_manual_fields",
+                    "calories_estimated",
+                    "updated_at",
+                ]
+            )
         messages.success(request, "Рецепт добавлен.")
         return redirect(recipe)
 
@@ -421,7 +450,7 @@ def recipe_create(request):
 @require_http_methods(["GET", "POST"])
 def recipe_update(request, slug):
     instance = get_object_or_404(Recipe, slug=slug)
-    calories_were_estimated = instance.calories_estimated
+    manual_fields = set(instance.nutrition_manual_fields or [])
     recipe, form, ingredient_formset, step_formset = _recipe_form_context(request, instance)
     if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
         with transaction.atomic():
@@ -437,17 +466,29 @@ def recipe_update(request, slug):
             )
             recalculate = "servings" in form.changed_data or ingredients_changed
             if manual_calorie_change:
-                recipe.calories_estimated = False
-                recipe.save(update_fields=["calories_estimated", "updated_at"])
-            elif recalculate and (
-                calories_were_estimated
-                or (
-                    all(getattr(recipe, field) is None for field in NUTRITION_FIELDS)
+                for field in calorie_fields.intersection(form.changed_data):
+                    if form.cleaned_data[field] is None:
+                        manual_fields.discard(field)
+                    else:
+                        manual_fields.add(field)
+            if manual_calorie_change or recalculate:
+                _fill_missing_recipe_calories(
+                    recipe,
+                    save=True,
+                    overwrite=True,
+                    preserve_fields=manual_fields,
                 )
-            ):
-                _fill_missing_recipe_calories(recipe, save=True, overwrite=True)
-                recipe.calories_estimated = True
-                recipe.save(update_fields=["calories_estimated", "updated_at"])
+                recipe.nutrition_manual_fields = sorted(manual_fields)
+                recipe.calories_estimated = _nutrition_has_estimated_values(
+                    recipe, manual_fields
+                )
+                recipe.save(
+                    update_fields=[
+                        "nutrition_manual_fields",
+                        "calories_estimated",
+                        "updated_at",
+                    ]
+                )
         messages.success(request, "Изменения сохранены.")
         return redirect(recipe)
 
@@ -741,10 +782,11 @@ def cart_detail(request, pk):
         "missing": "Ничего не найдено",
     }
     item_statuses = []
+    is_waiting = run.status in {CartRun.Status.PENDING, CartRun.Status.PROCESSING}
     for item in run.ingredient_snapshot:
         name = str(item.get("name", "")).strip()
         match = matches.get(name.casefold())
-        quality = match.quality if match else "queued"
+        quality = match.quality if match else ("queued" if is_waiting else "missing")
         item_statuses.append(
             {
                 "name": name,
