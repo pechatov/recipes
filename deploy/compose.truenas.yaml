@@ -1,6 +1,6 @@
 services:
   app:
-    image: recipes:local
+    image: ${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}
     restart: unless-stopped
     env_file:
       - /mnt/main-pool/config/recipes/.env
@@ -22,7 +22,7 @@ services:
       start_period: 30s
 
   worker:
-    image: recipes:local
+    image: ${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}
     restart: unless-stopped
     command: ["python", "manage.py", "run_import_worker"]
     env_file:
@@ -37,7 +37,7 @@ services:
         condition: service_healthy
 
   cart-worker:
-    image: recipes:local
+    image: ${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}
     restart: unless-stopped
     command: ["python", "manage.py", "run_cart_worker"]
     env_file:

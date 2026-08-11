@@ -12,8 +12,10 @@ from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils._os import safe_join
+from django.utils import timezone
 from django.views.decorators.http import require_http_methods, require_POST
 
+from .carting.pipeline import attempt_needs_cleanup
 from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
 from .importing.extractors import detect_source_type
 from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePreference
@@ -309,7 +311,16 @@ def cart_start(request, slug):
 
     active = CartRun.objects.filter(
         requested_by=request.user,
-        status__in=[CartRun.Status.PENDING, CartRun.Status.PROCESSING],
+    ).filter(
+        Q(
+            status__in=[
+                CartRun.Status.PENDING,
+                CartRun.Status.PROCESSING,
+                CartRun.Status.CLEANUP_PENDING,
+                CartRun.Status.CLEANING,
+            ]
+        )
+        | Q(cleanup_requested_at__isnull=False, cleaned_at__isnull=True)
     ).first()
     if active:
         messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
@@ -360,9 +371,30 @@ def cart_continue(request, pk):
     run = get_object_or_404(CartRun, pk=pk, requested_by=request.user)
     if run.is_active:
         return redirect("cart-detail", pk=run.pk)
+    if run.status not in {CartRun.Status.COMPLETED, CartRun.Status.REVIEW}:
+        messages.info(request, "Эту корзину нельзя продолжить.")
+        return redirect("cart-detail", pk=run.pk)
     if run.next_store_index >= len(run.store_priority):
         messages.info(request, "Все включённые магазины уже проверены.")
         return redirect("cart-detail", pk=run.pk)
+    now = timezone.now()
+    if attempt_needs_cleanup(run.selected_attempt):
+        run.status = CartRun.Status.CLEANUP_PENDING
+        run.cleanup_requested_at = now
+        run.confirmation_deadline = None
+        run.save(
+            update_fields=[
+                "status",
+                "cleanup_requested_at",
+                "confirmation_deadline",
+            ]
+        )
+    else:
+        run.status = CartRun.Status.CANCELLED
+        run.cleaned_at = now
+        run.confirmation_deadline = None
+        run.save(update_fields=["status", "cleaned_at", "confirmation_deadline"])
+
     next_run = CartRun.objects.create(
         recipe=run.recipe,
         requested_by=run.requested_by,
@@ -371,8 +403,59 @@ def cart_continue(request, pk):
         ingredient_snapshot=run.ingredient_snapshot,
         next_store_index=run.next_store_index,
     )
-    messages.success(request, "Продолжаем со следующего магазина.")
+    messages.success(
+        request,
+        "Текущие добавления будут очищены, затем проверим следующий магазин.",
+    )
     return redirect("cart-detail", pk=next_run.pk)
+
+
+@login_required
+@require_POST
+def cart_confirm(request, pk):
+    run = get_object_or_404(
+        CartRun,
+        pk=pk,
+        requested_by=request.user,
+        status__in=[CartRun.Status.COMPLETED, CartRun.Status.REVIEW],
+    )
+    if not run.selected_attempt or not run.selected_attempt.cart_url:
+        messages.error(request, "Нет сохранённой корзины для подтверждения.")
+        return redirect("cart-detail", pk=run.pk)
+    run.status = CartRun.Status.CONFIRMED
+    run.confirmed_at = timezone.now()
+    run.confirmation_deadline = None
+    run.error = ""
+    run.save(
+        update_fields=["status", "confirmed_at", "confirmation_deadline", "error"]
+    )
+    messages.success(request, "Корзина подтверждена и не будет очищена автоматически.")
+    return redirect("cart-detail", pk=run.pk)
+
+
+@login_required
+@require_POST
+def cart_cancel(request, pk):
+    run = get_object_or_404(
+        CartRun,
+        pk=pk,
+        requested_by=request.user,
+        status__in=[CartRun.Status.COMPLETED, CartRun.Status.REVIEW],
+    )
+    now = timezone.now()
+    run.confirmation_deadline = None
+    if attempt_needs_cleanup(run.selected_attempt):
+        run.status = CartRun.Status.CLEANUP_PENDING
+        run.cleanup_requested_at = now
+        fields = ["status", "cleanup_requested_at", "confirmation_deadline"]
+        messages.info(request, "Добавленные этой попыткой товары поставлены на очистку.")
+    else:
+        run.status = CartRun.Status.CANCELLED
+        run.cleaned_at = now
+        fields = ["status", "cleaned_at", "confirmation_deadline"]
+        messages.info(request, "Сборка отменена; очищать корзину не потребовалось.")
+    run.save(update_fields=fields)
+    return redirect("cart-detail", pk=run.pk)
 
 
 @login_required
@@ -384,6 +467,13 @@ def cart_retry(request, pk):
         requested_by=request.user,
         status__in=[CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED],
     )
+    if run.cleanup_requested_at and not run.cleaned_at:
+        run.status = CartRun.Status.CLEANUP_PENDING
+        run.finished_at = None
+        run.error = ""
+        run.save(update_fields=["status", "finished_at", "error"])
+        messages.success(request, "Очистка снова поставлена в очередь.")
+        return redirect("cart-detail", pk=run.pk)
     if run.status == CartRun.Status.FAILED:
         blocked_stores = set(
             run.attempts.filter(status=CartAttempt.Status.BLOCKED).values_list(

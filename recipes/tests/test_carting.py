@@ -1,10 +1,17 @@
 from unittest.mock import patch
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
-from recipes.carting.pipeline import process_cart_run
+from recipes.carting.pipeline import (
+    claim_cart_run,
+    expire_unconfirmed_cart_runs,
+    process_cart_cleanup,
+    process_cart_run,
+)
 from recipes.carting.client import STORE_INSTRUCTIONS, cart_browser_session_key
 from recipes.models import (
     CartAttempt,
@@ -133,6 +140,62 @@ class CartViewTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.PENDING)
         self.assertEqual(run.next_store_index, 0)
 
+    def test_confirm_keeps_user_cart(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.COMPLETED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+            confirmation_deadline=timezone.now() + timedelta(hours=3),
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            cart_url="https://eda.yandex.ru/cart",
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        response = self.client.post(reverse("cart-confirm", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CONFIRMED)
+        self.assertIsNotNone(run.confirmed_at)
+        self.assertIsNone(run.confirmation_deadline)
+
+    def test_cancel_queues_cleanup_only_for_recorded_additions(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.COMPLETED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            result={
+                "cart_cleared": False,
+                "added_items": [
+                    {"product_name": "Картофель", "package_count": 1}
+                ],
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        self.client.post(reverse("cart-cancel", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CLEANUP_PENDING)
+        self.assertIsNotNone(run.cleanup_requested_at)
+
 
 class CartPipelineTests(TestCase):
     def setUp(self):
@@ -176,25 +239,31 @@ class CartPipelineTests(TestCase):
         )
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
-    @patch("recipes.carting.pipeline.inspect_store_cart")
-    def test_exact_cart_completes_run(self, inspect, assemble):
+    def test_exact_cart_is_built_in_one_agent_call(self, assemble):
         result = {
             "status": "exact",
-            "cart_url": "https://kuper.ru/cart",
+            "cart_url": "https://eda.yandex.ru/cart",
             "summary": "Всё найдено",
+            "cart_cleared": False,
+            "added_items": [
+                {
+                    "product_name": "Спагетти 450 г",
+                    "product_url": "https://eda.yandex.ru/product/1",
+                    "package_count": 1,
+                }
+            ],
             "items": [
                 {
                     "ingredient_name": "Спагетти",
                     "requested_quantity": "400 г",
                     "product_name": "Спагетти 450 г",
-                    "product_url": "https://kuper.ru/product/1",
+                    "product_url": "https://eda.yandex.ru/product/1",
                     "package_count": 1,
                     "quality": "exact",
                     "warning": "",
                 }
             ],
         }
-        inspect.return_value = result
         assemble.return_value = result
         run = self.make_run()
 
@@ -202,47 +271,33 @@ class CartPipelineTests(TestCase):
 
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.COMPLETED)
+        self.assertIsNotNone(run.confirmation_deadline)
         self.assertEqual(run.selected_attempt.status, CartAttempt.Status.EXACT)
         self.assertEqual(run.selected_attempt.matches.get().quality, CartItemMatch.MatchQuality.EXACT)
+        assemble.assert_called_once_with(run, "auchan")
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
-    @patch("recipes.carting.pipeline.inspect_store_cart")
-    def test_false_exact_is_downgraded_and_next_store_is_tried(self, inspect, assemble):
+    def test_false_exact_with_substitute_stops_for_review(self, assemble):
         substitute_result = {
             "status": "exact",
-            "cart_url": "https://kuper.ru/cart",
+            "cart_url": "https://eda.yandex.ru/cart",
             "summary": "Ошибочный exact",
+            "cart_cleared": False,
+            "added_items": [
+                {"product_name": "Лапша рисовая", "package_count": 1}
+            ],
             "items": [
                 {
                     "ingredient_name": "Спагетти",
                     "requested_quantity": "400 г",
                     "product_name": "Лапша рисовая",
-                    "product_url": "https://kuper.ru/product/2",
+                    "product_url": "https://eda.yandex.ru/product/2",
                     "package_count": 1,
                     "quality": "substitute",
                     "warning": "Другой вид лапши, может не подойти для рецепта.",
                 }
             ],
         }
-        inspect.side_effect = [
-            substitute_result,
-            {
-                "status": "incomplete",
-                "cart_url": "",
-                "summary": "Не найдено",
-                "items": [
-                    {
-                        "ingredient_name": "Спагетти",
-                        "requested_quantity": "400 г",
-                        "product_name": "",
-                        "product_url": "",
-                        "package_count": 0,
-                        "quality": "missing",
-                        "warning": "Нет подходящего товара.",
-                    }
-                ],
-            },
-        ]
         assemble.return_value = substitute_result
         run = self.make_run(["auchan", "perekrestok"])
 
@@ -250,14 +305,14 @@ class CartPipelineTests(TestCase):
 
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.REVIEW)
-        self.assertEqual(run.attempts.count(), 2)
+        self.assertEqual(run.attempts.count(), 1)
         first = run.attempts.get(store="auchan")
         self.assertEqual(first.status, CartAttempt.Status.SUBSTITUTIONS)
         self.assertEqual(run.selected_attempt, first)
 
-    @patch("recipes.carting.pipeline.inspect_store_cart")
-    def test_login_required_pauses_without_advancing_store(self, inspect):
-        inspect.return_value = {
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_login_required_pauses_without_advancing_store(self, assemble):
+        assemble.return_value = {
             "status": "login_required",
             "summary": "Войдите в аккаунт",
             "items": [],
@@ -270,9 +325,9 @@ class CartPipelineTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
         self.assertEqual(run.next_store_index, 0)
 
-    @patch("recipes.carting.pipeline.inspect_store_cart")
-    def test_captcha_pauses_same_store_for_manual_verification(self, inspect):
-        inspect.return_value = {
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_captcha_pauses_same_store_for_manual_verification(self, assemble):
+        assemble.return_value = {
             "status": "blocked",
             "summary": "Показана CAPTCHA",
             "items": [],
@@ -285,3 +340,149 @@ class CartPipelineTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
         self.assertEqual(run.next_store_index, 0)
         self.assertEqual(list(run.attempts.values_list("store", flat=True)), ["auchan"])
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_agent_cleared_incomplete_attempt_then_tries_next_store(self, assemble):
+        run = self.make_run(["auchan", "perekrestok"])
+        run.ingredient_snapshot = [
+            {"name": name, "quantity": "1", "unit": "шт."}
+            for name in ["Первый", "Второй", "Третий", "Четвёртый"]
+        ]
+        run.save(update_fields=["ingredient_snapshot"])
+        incomplete = {
+            "status": "incomplete",
+            "summary": "Много позиций отсутствует, добавления удалены",
+            "cart_cleared": True,
+            "added_items": [{"product_name": "Первый товар", "package_count": 1}],
+            "items": [
+                {
+                    "ingredient_name": name,
+                    "requested_quantity": "1 шт.",
+                    "product_name": "Первый товар" if index == 0 else "",
+                    "package_count": 1 if index == 0 else 0,
+                    "quality": "exact" if index == 0 else "missing",
+                    "warning": "" if index == 0 else "Нет товара",
+                }
+                for index, name in enumerate(["Первый", "Второй", "Третий", "Четвёртый"])
+            ],
+        }
+        exact = {
+            "status": "exact",
+            "cart_url": "https://eda.yandex.ru/cart",
+            "cart_cleared": False,
+            "added_items": [
+                {"product_name": f"{name} товар", "package_count": 1}
+                for name in ["Первый", "Второй", "Третий", "Четвёртый"]
+            ],
+            "items": [
+                {
+                    "ingredient_name": name,
+                    "requested_quantity": "1 шт.",
+                    "product_name": f"{name} товар",
+                    "package_count": 1,
+                    "quality": "exact",
+                    "warning": "",
+                }
+                for name in ["Первый", "Второй", "Третий", "Четвёртый"]
+            ],
+        }
+        assemble.side_effect = [incomplete, exact]
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.COMPLETED)
+        self.assertEqual(run.selected_attempt.store, "perekrestok")
+        self.assertEqual(assemble.call_count, 2)
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_pipeline_falls_back_to_cleanup_when_agent_did_not(self, assemble, cleanup):
+        run = self.make_run(["auchan"])
+        run.ingredient_snapshot = [
+            {"name": name, "quantity": "1", "unit": "шт."}
+            for name in ["Первый", "Второй", "Третий", "Четвёртый"]
+        ]
+        run.save(update_fields=["ingredient_snapshot"])
+        assemble.return_value = {
+            "status": "incomplete",
+            "cart_url": "https://eda.yandex.ru/cart",
+            "cart_cleared": False,
+            "added_items": [{"product_name": "Первый товар", "package_count": 1}],
+            "items": [
+                {
+                    "ingredient_name": name,
+                    "package_count": 1 if index < 2 else 0,
+                    "product_name": f"{name} товар" if index < 2 else "",
+                    "quality": "exact" if index < 2 else "missing",
+                    "warning": "" if index < 2 else "Нет товара",
+                }
+                for index, name in enumerate(["Первый", "Второй", "Третий", "Четвёртый"])
+            ],
+        }
+        cleanup.return_value = {"status": "cleared", "summary": "Очищено"}
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        attempt = run.attempts.get()
+        self.assertEqual(run.status, CartRun.Status.REVIEW)
+        self.assertTrue(attempt.result["cart_cleared"])
+        self.assertFalse(attempt.cart_url)
+        cleanup.assert_called_once()
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    def test_expired_cart_is_cleaned_from_recorded_journal(self, cleanup):
+        run = self.make_run()
+        run.status = CartRun.Status.COMPLETED
+        run.confirmation_deadline = timezone.now() - timedelta(minutes=1)
+        run.save(update_fields=["status", "confirmation_deadline"])
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            cart_url="https://eda.yandex.ru/cart",
+            result={
+                "cart_cleared": False,
+                "added_items": [
+                    {"product_name": "Спагетти", "package_count": 2}
+                ],
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+        cleanup.return_value = {"status": "cleared", "summary": "Удалено 2 упаковки"}
+
+        self.assertEqual(expire_unconfirmed_cart_runs(), 1)
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CLEANUP_PENDING)
+        run.status = CartRun.Status.CLEANING
+        run.save(update_fields=["status"])
+        process_cart_cleanup(run)
+
+        run.refresh_from_db()
+        attempt.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertTrue(attempt.result["cart_cleared"])
+        cleanup.assert_called_once_with(
+            run,
+            "auchan",
+            [{"product_name": "Спагетти", "package_count": 2}],
+            "https://eda.yandex.ru/cart",
+        )
+
+    def test_new_assembly_waits_for_unfinished_cleanup(self):
+        old_run = self.make_run()
+        old_run.status = CartRun.Status.LOGIN_REQUIRED
+        old_run.cleanup_requested_at = timezone.now()
+        old_run.save(update_fields=["status", "cleanup_requested_at"])
+        CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["perekrestok"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        self.assertIsNone(claim_cart_run())
