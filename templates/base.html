@@ -1,21 +1,36 @@
 {% load static %}
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f4efe5">
+  <meta name="theme-color" content="#191512" data-theme-color>
   <title>{% block title %}Домашние рецепты{% endblock %}</title>
+  <link rel="icon" href="{% static 'recipes/icon.svg' %}" type="image/svg+xml">
+  <link rel="icon" href="{% static 'recipes/favicon.ico' %}" sizes="32x32">
+  <link rel="apple-touch-icon" href="{% static 'recipes/apple-touch-icon.png' %}">
+  <link rel="manifest" href="{% static 'recipes/site.webmanifest' %}">
+  <link rel="preload" href="{% static 'recipes/fonts/inter-cyrillic.woff2' %}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{% static 'recipes/fonts/literata-cyrillic.woff2' %}" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="{% static 'recipes/app.css' %}">
+  <script>
+    // До первой отрисовки, иначе тёмная тема моргнёт светлой.
+    (() => {
+      const saved = localStorage.getItem("theme");
+      const theme = saved === "light" || saved === "dark" ? saved : "dark";
+      document.documentElement.dataset.theme = theme;
+      document.querySelector("[data-theme-color]").content = theme === "light" ? "#fbf7f0" : "#191512";
+    })();
+  </script>
 </head>
 <body>
   <header class="site-header">
     <a class="brand" href="{% url 'recipe-list' %}" aria-label="Домой">
-      <span class="brand-mark">Р</span>
+      <img class="brand-mark" src="{% static 'recipes/icon.svg' %}" alt="" width="36" height="36">
       <span>Домашние рецепты</span>
     </a>
-    {% if user.is_authenticated %}
-      <nav class="site-nav" aria-label="Основная навигация">
+    <nav class="site-nav" aria-label="Основная навигация">
+      {% if user.is_authenticated %}
         <a href="{% url 'draft-list' %}" class="nav-link">Черновики</a>
         <a href="{% url 'import-create' %}" class="button button-small">Импортировать</a>
         <a href="{% url 'recipe-create' %}" class="nav-link">Добавить вручную</a>
@@ -23,8 +38,17 @@
           {% csrf_token %}
           <button type="submit" class="link-button">Выйти</button>
         </form>
-      </nav>
-    {% endif %}
+      {% endif %}
+      <button type="button" class="theme-toggle" data-theme-toggle aria-label="Переключить тему">
+        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6"/>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20.5 14.3A8.6 8.6 0 0 1 9.7 3.5a8.6 8.6 0 1 0 10.8 10.8z"/>
+        </svg>
+      </button>
+    </nav>
   </header>
 
   <main class="page-shell">
@@ -35,6 +59,7 @@
     {% endif %}
     {% block content %}{% endblock %}
   </main>
+  <script src="{% static 'recipes/theme.js' %}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
