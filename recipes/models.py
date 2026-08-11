@@ -249,6 +249,11 @@ class CartRun(models.Model):
         PROCESSING = "processing", "Собирается"
         COMPLETED = "completed", "Корзина готова"
         REVIEW = "review", "Нужна проверка"
+        CONFIRMED = "confirmed", "Подтверждена"
+        CLEANUP_PENDING = "cleanup_pending", "Ожидает очистки"
+        CLEANING = "cleaning", "Очищается"
+        MANUAL_CHECK = "manual_check", "Нужна ручная проверка"
+        CANCELLED = "cancelled", "Отменена"
         LOGIN_REQUIRED = "login_required", "Нужен вход"
         FAILED = "failed", "Ошибка"
 
@@ -280,6 +285,10 @@ class CartRun(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    confirmation_deadline = models.DateTimeField(null=True, blank=True, db_index=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    cleanup_requested_at = models.DateTimeField(null=True, blank=True)
+    cleaned_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -291,7 +300,13 @@ class CartRun(models.Model):
 
     @property
     def is_active(self):
-        return self.status in {self.Status.PENDING, self.Status.PROCESSING}
+        return self.status in {
+            self.Status.PENDING,
+            self.Status.PROCESSING,
+            self.Status.CLEANUP_PENDING,
+            self.Status.CLEANING,
+            self.Status.MANUAL_CHECK,
+        }
 
 
 class CartAttempt(models.Model):

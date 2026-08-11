@@ -15,11 +15,31 @@
     {% elif run.status == 'completed' %}
       <div class="status-orb is-done">✓</div>
       <h2>Все ингредиенты найдены</h2>
-      <p>Проверьте количество упаковок перед оформлением. Заказ не размещён.</p>
+      <p>Проверьте количество упаковок и подтвердите корзину. Заказ не размещён.</p>
     {% elif run.status == 'review' %}
       <div class="status-orb is-error">!</div>
       <h2>Есть замены или пропуски</h2>
-      <p>Ни один проверенный магазин не дал полностью точную корзину. Ниже выбран лучший результат.</p>
+      {% if run.selected_attempt.cart_url %}
+        <p>Проверьте результат и подтвердите корзину либо попробуйте следующий магазин.</p>
+      {% else %}
+        <p>Подходящую корзину собрать не удалось; временные добавления уже удалены.</p>
+      {% endif %}
+    {% elif run.status == 'confirmed' %}
+      <div class="status-orb is-done">✓</div>
+      <h2>Корзина подтверждена</h2>
+      <p>Автоматическая очистка отключена. Можно перейти в Яндекс Еду и оформить заказ вручную.</p>
+    {% elif run.status == 'cleanup_pending' or run.status == 'cleaning' %}
+      <div class="status-orb is-working">…</div>
+      <h2>Очищаем корзину</h2>
+      <p>Удаляем только товары и количества, добавленные этой попыткой.</p>
+    {% elif run.status == 'manual_check' %}
+      <div class="status-orb is-error">!</div>
+      <h2>Нужно вручную проверить корзину</h2>
+      <p>Связь с браузером оборвалась во время изменения корзины, поэтому безопасно повторить операцию автоматически нельзя. Откройте Яндекс Еду, удалите возможные добавления этой попытки и только затем подтвердите проверку.</p>
+    {% elif run.status == 'cancelled' %}
+      <div class="status-orb is-done">✓</div>
+      <h2>Сборка отменена</h2>
+      <p>Добавленные этой попыткой товары удалены из корзины.</p>
     {% elif run.status == 'login_required' %}
       <div class="status-orb is-error">↗</div>
       <h2>Нужно подтвердить браузер</h2>
@@ -33,9 +53,25 @@
       {% if run.error %}<p>{{ run.error }}</p>{% endif %}
     {% endif %}
 
+    {% if run.confirmation_deadline and run.status != 'confirmed' %}
+      <p><small>Если не подтвердить корзину до {{ run.confirmation_deadline|date:"d.m.Y H:i" }}, добавленные этой попыткой товары будут удалены автоматически.</small></p>
+    {% endif %}
+
     <div class="action-row centered-actions">
-      {% if run.selected_attempt.cart_url %}
+      {% if run.selected_attempt.cart_url and run.status != 'cleanup_pending' and run.status != 'cleaning' and run.status != 'cancelled' %}
         <a class="button" href="{{ run.selected_attempt.cart_url }}" target="_blank" rel="noopener noreferrer">Открыть корзину ↗</a>
+      {% endif %}
+      {% if run.selected_attempt.cart_url %}
+        {% if run.status == 'completed' or run.status == 'review' %}
+        <form method="post" action="{% url 'cart-confirm' run.pk %}">
+          {% csrf_token %}
+          <button class="button" type="submit">Подтвердить корзину</button>
+        </form>
+        <form method="post" action="{% url 'cart-cancel' run.pk %}">
+          {% csrf_token %}
+          <button class="button button-secondary" type="submit">Отменить и очистить</button>
+        </form>
+        {% endif %}
       {% endif %}
       {% if run.status == 'login_required' or run.status == 'failed' %}
         <form method="post" action="{% url 'cart-retry' run.pk %}">
@@ -43,11 +79,20 @@
           <button class="button" type="submit">Проверка пройдена — продолжить</button>
         </form>
       {% endif %}
-      {% if run.status == 'completed' and run.next_store_index < run.store_priority|length %}
+      {% if run.status == 'manual_check' %}
+        <a class="button" href="https://eda.yandex.ru/retail" target="_blank" rel="noopener noreferrer">Открыть корзину Яндекс Еды ↗</a>
+        <form method="post" action="{% url 'cart-manual-resolved' run.pk %}">
+          {% csrf_token %}
+          <button class="button button-secondary" type="submit">Я проверил и удалил добавления</button>
+        </form>
+      {% endif %}
+      {% if run.status == 'completed' or run.status == 'review' %}
+        {% if run.next_store_index < run.store_priority|length %}
         <form method="post" action="{% url 'cart-continue' run.pk %}">
           {% csrf_token %}
           <button class="button button-secondary" type="submit">Найти в другом магазине</button>
         </form>
+        {% endif %}
       {% endif %}
     </div>
   </section>

@@ -53,7 +53,9 @@ RECIPE_AI_MODEL=recipes-importer
 
 ### Автосборка корзины
 
-Корзины собирает другой изолированный профиль Hermes: он имеет только браузерные инструменты, отдельный API-токен и постоянный браузерный профиль. АШАН, Перекрёсток, Пятёрочка, Магнит и Лавка выбираются в едином разделе «Магазины» Яндекс Еды с учётом сохранённого адреса. Недоступная по адресу сеть пропускается. Агент добавляет товары, но ему запрещено переходить к оформлению, подтверждать заказ или оплату.
+Корзины собирает другой изолированный профиль Hermes: он имеет только браузерные инструменты, отдельный API-токен и постоянный браузерный профиль. АШАН, Перекрёсток, Пятёрочка, Магнит и Лавка выбираются в едином разделе «Магазины» Яндекс Еды с учётом сохранённого адреса. Недоступная по адресу сеть пропускается. Агент за один проход ищет товар, рассчитывает число упаковок и сразу добавляет их, но ему запрещено переходить к оформлению, подтверждать заказ или оплату.
+
+Каждая попытка хранит журнал только реально добавленных упаковок. Если недоступно не менее 25% списка (минимум две позиции), эти добавления удаляются сразу. Готовая корзина ждёт подтверждения пользователя 180 минут (`CART_CONFIRMATION_MINUTES`), после чего worker удаляет только товары текущей попытки. Прежнее содержимое корзины не уменьшается.
 
 Настроить профиль на Raspberry Pi и передать его токен в TrueNAS:
 
@@ -98,6 +100,20 @@ Camofox и noVNC слушают только loopback-интерфейс Pi. Н�
 
 Контейнер `worker` обрабатывает очередь импорта, а `cart-worker` — по одной браузерной сборке за раз. Если AI-провайдер находится на другом хосте, TrueNAS должен иметь к нему сетевой доступ.
 
+### Автоматический деплой из GitHub
+
+Workflow `.github/workflows/deploy.yml` проверяет каждый PR. После merge в `main` он собирает amd64-образ, публикует две метки в GHCR (`sha-<commit>` и `main`) и с Raspberry Pi обновляет TrueNAS Custom App на неизменяемую sha-метку. Runtime-секреты остаются только в `/mnt/main-pool/config/recipes/.env`; GitHub их не получает.
+
+Однократная настройка runner и repository variables:
+
+```bash
+./scripts/setup-actions-runner-pi.sh
+gh variable set DEPLOY_SSH_TARGET --repo pechatov/recipes --body nas
+gh variable set RECIPES_APP_ROOT --repo pechatov/recipes --body /mnt/main-pool/config/recipes
+```
+
+Runner регистрируется только для `pechatov/recipes` и получает отдельную метку `recipes-truenas-deploy`. Deploy job запускается на нём только для `main`; проверки pull request выполняются на GitHub-hosted runner. На TrueNAS workflow передаёт стандартный короткоживущий `GITHUB_TOKEN` только в `docker login --password-stdin`, использует отдельный временный Docker config и удаляет его сразу после pull.
+
 ### Добавление второго пользователя
 
 Владелец открывает `/admin/auth/user/add/`, создаёт пользователя и сообщает ему пароль безопасным способом. Обычному семейному пользователю права персонала не нужны.
@@ -120,11 +136,20 @@ Camofox и noVNC слушают только loopback-интерфейс Pi. Н�
 
 ### Reverse proxy и HTTPS
 
-Первое развёртывание доступно только в локальной сети по HTTP. Перед публикацией через Nginx Proxy Manager нужно:
+Приложение публикуется через существующий Nginx Proxy Manager по двум адресам:
 
-1. добавить доменное имя в `ALLOWED_HOSTS`;
-2. добавить `https://домен` в `CSRF_TRUSTED_ORIGINS`;
-3. установить `COOKIE_SECURE=true`;
-4. установить `SECURE_SSL_REDIRECT=true`;
-5. после проверки HTTPS включить HSTS через `SECURE_HSTS_SECONDS`;
-6. перезапустить приложение.
+- `https://recipes.pechatov.com`;
+- `https://gotovka.pechatov.com`.
+
+Runtime-файл `/mnt/main-pool/config/recipes/.env` должен содержать оба имени в `ALLOWED_HOSTS`, оба HTTPS origin в `CSRF_TRUSTED_ORIGINS` и `COOKIE_SECURE=true`. `SECURE_SSL_REDIRECT` остаётся выключенным: редирект и HSTS выполняет Nginx Proxy Manager, а локальный `/healthz/` остаётся доступен приложению по HTTP.
+
+Идемпотентная настройка proxy host использует существующий wildcard-сертификат `*.pechatov.com` и сохраняет резервную копию базы NPM перед изменением:
+
+```bash
+ssh truenas "sudo env \
+  NPM_DATA_DIR=/mnt/main-pool/config/nginx/data \
+  RECIPES_CERTIFICATE_ID=2 \
+  bash -s" < scripts/deploy/configure-npm-proxy.sh
+```
+
+По умолчанию оба домена проксируются на `192.168.31.2:30111`, HTTP принудительно перенаправляется на HTTPS, а конфигурация Nginx проверяется перед reload.
