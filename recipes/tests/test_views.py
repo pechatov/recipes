@@ -6,6 +6,7 @@ from django.urls import reverse
 
 from recipes.forms import IngredientForm
 from recipes.models import (
+    CartRun,
     Category,
     ImportJob,
     Recipe,
@@ -97,6 +98,45 @@ class RecipeViewTests(TestCase):
             status_code=301,
             fetch_redirect_response=False,
         )
+
+    def test_legacy_shopping_and_update_urls_redirect_to_canonical_slug(self):
+        RecipeSlugAlias.objects.create(recipe=self.recipe, slug="семейная-паста")
+        self.client.force_login(self.user)
+
+        shopping = self.client.get(
+            "/recipes/семейная-паста/shopping/?servings=4"
+        )
+        update = self.client.get("/recipes/семейная-паста/edit/")
+
+        self.assertRedirects(
+            shopping,
+            f'{reverse("shopping-list", args=[self.recipe.slug])}?servings=4',
+            status_code=301,
+            fetch_redirect_response=False,
+        )
+        self.assertRedirects(
+            update,
+            reverse("recipe-update", args=[self.recipe.slug]),
+            status_code=301,
+            fetch_redirect_response=False,
+        )
+
+    def test_legacy_cart_start_post_uses_canonical_recipe(self):
+        RecipeSlugAlias.objects.create(recipe=self.recipe, slug="семейная-паста")
+        ingredient = self.recipe.ingredients.get()
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            "/recipes/семейная-паста/shopping/start/",
+            {
+                "servings": 2,
+                "ingredients": [str(ingredient.pk)],
+            },
+        )
+
+        run = CartRun.objects.get()
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        self.assertEqual(run.recipe, self.recipe)
 
     def test_estimated_calories_can_be_recalculated_after_ingredient_changes(self):
         _fill_missing_recipe_calories(self.recipe, save=True)

@@ -250,6 +250,32 @@ def _ranked_fuzzy_candidates(recipes, query: str):
     ).order_by("-search_similarity", "-updated_at")[:SEARCH_CANDIDATE_LIMIT]
 
 
+def _resolve_recipe_slug(slug: str, queryset=None) -> tuple[Recipe, bool]:
+    queryset = queryset if queryset is not None else Recipe.objects.all()
+    recipe = queryset.filter(slug=slug).first()
+    if recipe is not None:
+        return recipe, False
+    recipe_id = (
+        RecipeSlugAlias.objects.filter(slug=slug)
+        .values_list("recipe_id", flat=True)
+        .first()
+    )
+    if recipe_id is None:
+        raise Http404
+    recipe = queryset.filter(pk=recipe_id).first()
+    if recipe is None:
+        raise Http404
+    return recipe, True
+
+
+def _canonical_recipe_redirect(request, recipe: Recipe, view_name: str):
+    url = reverse(view_name, args=[recipe.slug])
+    query_string = request.META.get("QUERY_STRING", "")
+    if query_string:
+        url = f"{url}?{query_string}"
+    return redirect(url, permanent=True)
+
+
 @require_http_methods(["GET", "POST"])
 def setup_owner(request):
     if get_user_model().objects.exists():
@@ -336,12 +362,9 @@ def recipe_detail(request, slug):
     recipes = Recipe.objects.select_related("created_by").prefetch_related(
         "ingredients", "steps", "import_jobs"
     )
-    recipe = recipes.filter(slug=slug).first()
-    if recipe is None:
-        alias = RecipeSlugAlias.objects.select_related("recipe").filter(slug=slug).first()
-        if alias:
-            return redirect(alias.recipe.get_absolute_url(), permanent=True)
-        raise Http404
+    recipe, used_alias = _resolve_recipe_slug(slug, recipes)
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, recipe, "recipe-detail")
     all_ingredients = list(recipe.ingredients.all())
     if any(getattr(recipe, field) is None for field in NUTRITION_FIELDS):
         _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
@@ -483,7 +506,9 @@ def recipe_create(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_update(request, slug):
-    instance = get_object_or_404(Recipe, slug=slug)
+    instance, used_alias = _resolve_recipe_slug(slug)
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, instance, "recipe-update")
     manual_fields = set(instance.nutrition_manual_fields or [])
     recipe, form, ingredient_formset, step_formset = _recipe_form_context(request, instance)
     if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
@@ -542,7 +567,9 @@ def recipe_update(request, slug):
 @login_required
 @require_POST
 def recipe_publish(request, slug):
-    recipe = get_object_or_404(Recipe, slug=slug, status=Recipe.Status.DRAFT)
+    recipe, _ = _resolve_recipe_slug(
+        slug, Recipe.objects.filter(status=Recipe.Status.DRAFT)
+    )
     recipe.status = Recipe.Status.PUBLISHED
     recipe.save(update_fields=["status", "updated_at"])
     messages.success(request, "Рецепт опубликован и появился в общей книге.")
@@ -645,7 +672,9 @@ def task_list(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_delete(request, slug):
-    recipe = get_object_or_404(Recipe, slug=slug)
+    recipe, used_alias = _resolve_recipe_slug(slug)
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, recipe, "recipe-delete")
     if request.method == "POST":
         recipe.delete()
         messages.success(request, "Рецепт удалён.")
@@ -655,7 +684,11 @@ def recipe_delete(request, slug):
 
 @login_required
 def shopping_list(request, slug):
-    recipe = get_object_or_404(Recipe.objects.prefetch_related("ingredients"), slug=slug)
+    recipe, used_alias = _resolve_recipe_slug(
+        slug, Recipe.objects.prefetch_related("ingredients")
+    )
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, recipe, "shopping-list")
     try:
         servings = int(request.GET.get("servings", recipe.servings))
     except (TypeError, ValueError):
@@ -731,7 +764,9 @@ def store_preferences(request):
 @login_required
 @require_POST
 def cart_start(request, slug):
-    recipe = get_object_or_404(Recipe.objects.prefetch_related("ingredients"), slug=slug)
+    recipe, _ = _resolve_recipe_slug(
+        slug, Recipe.objects.prefetch_related("ingredients")
+    )
     try:
         servings = max(1, min(int(request.POST.get("servings", recipe.servings)), 100))
     except (TypeError, ValueError):
