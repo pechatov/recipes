@@ -1,0 +1,13 @@
+{
+  "name": "Домашние рецепты",
+  "short_name": "Рецепты",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#191512",
+  "theme_color": "#191512",
+  "icons": [
+    { "src": "icon.svg", "type": "image/svg+xml", "sizes": "any" },
+    { "src": "icon-192.png", "type": "image/png", "sizes": "192x192" },
+    { "src": "icon-512.png", "type": "image/png", "sizes": "512x512" }
+  ]
+}
