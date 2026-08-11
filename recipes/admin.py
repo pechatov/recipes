@@ -1,5 +1,6 @@
 from django.contrib import admin
 
+from .forms import IngredientForm, RecipeForm, StepForm
 from .models import (
     CartAttempt,
     CartItemMatch,
@@ -13,6 +14,21 @@ from .models import (
 )
 
 
+class AdminRecipeForm(RecipeForm):
+    class Meta(RecipeForm.Meta):
+        fields = "__all__"
+
+
+class AdminIngredientForm(IngredientForm):
+    class Meta(IngredientForm.Meta):
+        fields = "__all__"
+
+
+class AdminStepForm(StepForm):
+    class Meta(StepForm.Meta):
+        fields = "__all__"
+
+
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
     list_display = ("name", "slug", "order")
@@ -21,16 +37,19 @@ class CategoryAdmin(admin.ModelAdmin):
 
 class IngredientInline(admin.TabularInline):
     model = RecipeIngredient
+    form = AdminIngredientForm
     extra = 1
 
 
 class StepInline(admin.StackedInline):
     model = RecipeStep
+    form = AdminStepForm
     extra = 1
 
 
 @admin.register(Recipe)
 class RecipeAdmin(admin.ModelAdmin):
+    form = AdminRecipeForm
     list_display = ("title", "status", "created_by", "servings", "updated_at")
     list_filter = ("status", "categories")
     search_fields = ("title", "description", "ingredients__name")
