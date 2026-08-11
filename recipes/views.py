@@ -28,7 +28,6 @@ from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePref
 from .services import build_shopping_items, get_store_preferences
 
 
-SEARCH_CANDIDATE_LIMIT = 500
 MAX_SEARCH_QUERY_LENGTH = 120
 MAX_SEARCH_TOKENS = 8
 SEARCH_FIELDS = (
@@ -142,9 +141,14 @@ def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
 def _search_candidate_filter(query: str) -> Q:
     candidate_filter = Q()
     for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
-        fragments = {token} if len(token) < 3 else {
-            token[index:index + 2] for index in range(len(token) - 1)
-        }
+        # Character fallbacks keep the candidate set complete for supported
+        # substitutions/transpositions; bigrams still make common queries
+        # more selective when the database can use them.
+        fragments = set(token)
+        if len(token) >= 3:
+            fragments.update(
+                token[index:index + 2] for index in range(len(token) - 1)
+            )
         token_filter = Q()
         for fragment in fragments:
             # SQLite's LIKE does not case-fold non-ASCII text. These variants
@@ -169,16 +173,17 @@ def _exact_search_filter(query: str) -> Q:
 
 
 def _ranked_fuzzy_candidates(recipes, query: str):
+    candidates = recipes.filter(_search_candidate_filter(query)).distinct()
     if connection.vendor != "postgresql":
-        return recipes.order_by("-updated_at")[:SEARCH_CANDIDATE_LIMIT]
+        return candidates.order_by("-updated_at")
     zero = Value(0.0, output_field=FloatField())
     similarities = [
         Coalesce(Max(TrigramSimilarity(field, query)), zero)
         for field in SEARCH_FIELDS
     ]
-    return recipes.annotate(
+    return candidates.annotate(
         search_similarity=Greatest(*similarities)
-    ).distinct().order_by("-search_similarity", "-updated_at")[:SEARCH_CANDIDATE_LIMIT]
+    ).order_by("-search_similarity", "-updated_at")
 
 
 @require_http_methods(["GET", "POST"])
@@ -401,17 +406,8 @@ def recipe_update(request, slug):
             )
             recalculate = "servings" in form.changed_data or ingredients_changed
             if manual_calorie_change:
-                changed_calorie_fields = calorie_fields.intersection(form.changed_data)
-                cleared_fields = []
-                if calories_were_estimated:
-                    for unchanged_field in calorie_fields - changed_calorie_fields:
-                        setattr(recipe, unchanged_field, None)
-                        cleared_fields.append(unchanged_field)
                 recipe.calories_estimated = False
-                recipe.save(
-                    update_fields=cleared_fields
-                    + ["calories_estimated", "updated_at"]
-                )
+                recipe.save(update_fields=["calories_estimated", "updated_at"])
             elif recalculate and (
                 calories_were_estimated
                 or (

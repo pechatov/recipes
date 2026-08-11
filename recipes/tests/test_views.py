@@ -184,6 +184,23 @@ class RecipeViewTests(TestCase):
 
                 self.assertContains(response, "Семейная паста")
 
+    def test_fuzzy_search_does_not_drop_an_old_match_after_many_candidates(self):
+        Recipe.objects.bulk_create(
+            [
+                Recipe(
+                    title=f"Случайный семейный рецепт {index}",
+                    slug=f"random-family-recipe-{index}",
+                    created_by=self.user,
+                )
+                for index in range(510)
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "слвики"})
+
+        self.assertContains(response, "Семейная паста")
+
     def test_fuzzy_search_keeps_matches_alongside_exact_match(self):
         exact = Recipe.objects.create(title="СЛВК — семейная заметка", created_by=self.user)
         self.client.force_login(self.user)
@@ -369,8 +386,9 @@ class RecipeViewTests(TestCase):
         detail = self.client.get(created.get_absolute_url())
         self.assertIsNone(detail.context["recipe"].calories_per_100g)
 
-    def test_manual_calorie_edit_clears_unchanged_estimated_pair(self):
+    def test_manual_nutrition_edit_preserves_unchanged_values(self):
         _fill_missing_recipe_calories(self.recipe, save=True)
+        original_per_100g = str(self.recipe.calories_per_100g)
         self.recipe.calories_estimated = True
         self.recipe.save(update_fields=["calories_estimated", "updated_at"])
         ingredient = self.recipe.ingredients.get()
@@ -409,8 +427,30 @@ class RecipeViewTests(TestCase):
         self.assertRedirects(response, self.recipe.get_absolute_url())
         self.recipe.refresh_from_db()
         self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
-        self.assertIsNone(self.recipe.calories_per_100g)
+        self.assertEqual(str(self.recipe.calories_per_100g), original_per_100g)
         self.assertFalse(self.recipe.calories_estimated)
+
+    def test_detail_renders_partial_nutrition_without_empty_labels(self):
+        ingredient = self.recipe.ingredients.get()
+        ingredient.name = "Ксантановая камедь"
+        ingredient.save(update_fields=["name"])
+        self.recipe.calories_per_serving = None
+        self.recipe.calories_per_100g = None
+        self.recipe.proteins_per_serving = 7
+        self.recipe.save(
+            update_fields=[
+                "calories_per_serving",
+                "calories_per_100g",
+                "proteins_per_serving",
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertContains(response, "Б 7,0 г")
+        self.assertNotContains(response, "К  ккал")
+        self.assertNotContains(response, "Ж  г")
 
     def test_draft_is_hidden_until_published(self):
         draft = Recipe.objects.create(
