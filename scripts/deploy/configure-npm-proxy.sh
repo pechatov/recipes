@@ -73,9 +73,40 @@ sqlite3 "$db_path" ".backup '$database_backup'"
 domain_names="[\"$RECIPES_PRIMARY_DOMAIN\",\"$RECIPES_ALIAS_DOMAIN\"]"
 if (( ${#existing_ids[@]} == 1 )); then
   proxy_id="${existing_ids[0]}"
-  if [[ -f "$proxy_dir/$proxy_id.conf" ]]; then
-    cp -a "$proxy_dir/$proxy_id.conf" "$backup_dir/proxy-host-$proxy_id.conf.before-recipes-$timestamp"
+else
+  proxy_id="$(sqlite3 "$db_path" 'select coalesce(max(id), 0) + 1 from proxy_host;')"
+fi
+if [[ ! "$proxy_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid proxy host ID returned by NPM." >&2
+  exit 1
+fi
+
+config_path="$proxy_dir/$proxy_id.conf"
+config_backup="$backup_dir/proxy-host-$proxy_id.conf.before-recipes-$timestamp"
+config_preexisting=0
+if [[ -f "$config_path" ]]; then
+  cp -a "$config_path" "$config_backup"
+  config_preexisting=1
+fi
+
+rollback_required=1
+rollback() {
+  local exit_code="$?"
+  trap - ERR
+  if (( rollback_required )); then
+    echo "Proxy update failed; restoring NPM database and configuration." >&2
+    sqlite3 "$database_backup" ".backup '$db_path'" || true
+    if (( config_preexisting )); then
+      cp -a "$config_backup" "$config_path" || true
+    else
+      rm -f -- "$config_path"
+    fi
   fi
+  exit "$exit_code"
+}
+trap rollback ERR
+
+if (( ${#existing_ids[@]} == 1 )); then
   sqlite3 "$db_path" <<SQL
 update proxy_host
 set modified_on = datetime('now'),
@@ -98,7 +129,6 @@ set modified_on = datetime('now'),
 where id = $proxy_id;
 SQL
 else
-  proxy_id="$(sqlite3 "$db_path" 'select coalesce(max(id), 0) + 1 from proxy_host;')"
   sqlite3 "$db_path" <<SQL
 insert into proxy_host (
   id, created_on, modified_on, owner_user_id, is_deleted, domain_names,
@@ -115,7 +145,7 @@ insert into proxy_host (
 SQL
 fi
 
-cat >"$proxy_dir/$proxy_id.conf" <<CONF
+cat >"$config_path" <<CONF
 # ------------------------------------------------------------
 # $RECIPES_PRIMARY_DOMAIN, $RECIPES_ALIAS_DOMAIN
 # ------------------------------------------------------------
@@ -170,6 +200,8 @@ CONF
 
 docker exec "$NPM_CONTAINER" nginx -t
 docker exec "$NPM_CONTAINER" nginx -s reload
+rollback_required=0
+trap - ERR
 
 echo "Configured Nginx Proxy Manager host $proxy_id for $domain_names."
 echo "Database backup: $database_backup"
