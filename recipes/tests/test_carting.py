@@ -200,6 +200,59 @@ class CartViewTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.CLEANUP_PENDING)
         self.assertIsNotNone(run.cleanup_requested_at)
 
+    def test_manual_check_resolution_requeues_unknown_assembly(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.FAILED,
+            result={"mutation_unknown": True},
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        response = self.client.post(reverse("cart-manual-resolved", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        attempt.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertIsNone(run.selected_attempt)
+        self.assertFalse(attempt.result["mutation_unknown"])
+        self.assertTrue(attempt.result["cart_cleared"])
+
+    def test_manual_check_resolution_finishes_uncertain_cleanup(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+            cleanup_requested_at=timezone.now(),
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            result={"mutation_unknown": True},
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        self.client.post(reverse("cart-manual-resolved", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNotNone(run.cleaned_at)
+
 
 class CartPipelineTests(TestCase):
     def setUp(self):
@@ -381,6 +434,23 @@ class CartPipelineTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
         self.assertEqual(run.next_store_index, 0)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_unknown_mutation_requires_manual_check_before_retry(self, assemble):
+        assemble.side_effect = CartAgentError(
+            "Соединение оборвалось",
+            mutation_possible=True,
+        )
+        run = self.make_run(["auchan", "perekrestok"])
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        attempt = run.attempts.get()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertEqual(run.next_store_index, 0)
+        self.assertEqual(run.selected_attempt, attempt)
+        self.assertTrue(attempt.result["mutation_unknown"])
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_captcha_pauses_same_store_for_manual_verification(self, assemble):
@@ -578,6 +648,36 @@ class CartPipelineTests(TestCase):
             process_cart_cleanup(run)
 
         cleanup.assert_not_called()
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    def test_uncertain_cleanup_failure_requires_manual_check(self, cleanup):
+        run = self.make_run()
+        run.status = CartRun.Status.CLEANING
+        run.cleanup_requested_at = timezone.now()
+        run.save(update_fields=["status", "cleanup_requested_at"])
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            result={
+                "cart_cleared": False,
+                "added_items": [
+                    {
+                        "product_name": "Спагетти",
+                        "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
+                        "package_count": 2,
+                    }
+                ],
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+        cleanup.return_value = {"status": "failed", "summary": "Связь оборвалась"}
+
+        with self.assertRaises(CartAgentError) as caught:
+            process_cart_cleanup(run)
+
+        self.assertTrue(caught.exception.mutation_possible)
 
     def test_new_assembly_waits_for_unfinished_cleanup(self):
         old_run = self.make_run()

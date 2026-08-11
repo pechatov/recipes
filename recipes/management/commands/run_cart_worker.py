@@ -66,8 +66,15 @@ class Command(BaseCommand):
                     else:
                         process_cart_run(run)
                 except CartAgentError as error:
-                    run.status = CartRun.Status.FAILED
-                    run.error = str(error)[:2000]
+                    if error.mutation_possible:
+                        run.status = CartRun.Status.MANUAL_CHECK
+                        run.error = (
+                            "Результат изменения корзины неизвестен. Откройте "
+                            "Яндекс Еду, проверьте корзину и подтвердите ручную проверку."
+                        )
+                    else:
+                        run.status = CartRun.Status.FAILED
+                        run.error = str(error)[:2000]
                     run.finished_at = timezone.now()
                     run.save(update_fields=["status", "error", "finished_at"])
                     action = "cleanup" if cleaning else "assembly"

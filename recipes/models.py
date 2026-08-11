@@ -252,6 +252,7 @@ class CartRun(models.Model):
         CONFIRMED = "confirmed", "Подтверждена"
         CLEANUP_PENDING = "cleanup_pending", "Ожидает очистки"
         CLEANING = "cleaning", "Очищается"
+        MANUAL_CHECK = "manual_check", "Нужна ручная проверка"
         CANCELLED = "cancelled", "Отменена"
         LOGIN_REQUIRED = "login_required", "Нужен вход"
         FAILED = "failed", "Ошибка"
@@ -304,6 +305,7 @@ class CartRun(models.Model):
             self.Status.PROCESSING,
             self.Status.CLEANUP_PENDING,
             self.Status.CLEANING,
+            self.Status.MANUAL_CHECK,
         }
 
 

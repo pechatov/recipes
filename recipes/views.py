@@ -318,6 +318,7 @@ def cart_start(request, slug):
                 CartRun.Status.PROCESSING,
                 CartRun.Status.CLEANUP_PENDING,
                 CartRun.Status.CLEANING,
+                CartRun.Status.MANUAL_CHECK,
             ]
         )
         | Q(cleanup_requested_at__isnull=False, cleaned_at__isnull=True)
@@ -455,6 +456,64 @@ def cart_cancel(request, pk):
         fields = ["status", "cleaned_at", "confirmation_deadline"]
         messages.info(request, "Сборка отменена; очищать корзину не потребовалось.")
     run.save(update_fields=fields)
+    return redirect("cart-detail", pk=run.pk)
+
+
+@login_required
+@require_POST
+def cart_manual_resolved(request, pk):
+    with transaction.atomic():
+        run = get_object_or_404(
+            CartRun.objects.select_for_update().select_related("selected_attempt"),
+            pk=pk,
+            requested_by=request.user,
+            status=CartRun.Status.MANUAL_CHECK,
+        )
+        attempt = run.selected_attempt
+        if not attempt:
+            messages.error(request, "Не найдена попытка, требующая проверки.")
+            return redirect("cart-detail", pk=run.pk)
+
+        now = timezone.now()
+        result = dict(attempt.result or {})
+        result["mutation_unknown"] = False
+        result["manual_check_resolved_at"] = now.isoformat()
+        result["cart_cleared"] = True
+        attempt.result = result
+        attempt.cart_url = ""
+        attempt.save(update_fields=["result", "cart_url"])
+
+        run.error = ""
+        run.confirmation_deadline = None
+        if run.cleanup_requested_at:
+            run.status = CartRun.Status.CANCELLED
+            run.cleaned_at = now
+            run.finished_at = now
+            fields = [
+                "status",
+                "cleaned_at",
+                "finished_at",
+                "confirmation_deadline",
+                "error",
+            ]
+            message = "Ручная проверка сохранена; сборка отменена."
+        else:
+            run.status = CartRun.Status.PENDING
+            run.selected_attempt = None
+            run.started_at = None
+            run.finished_at = None
+            fields = [
+                "status",
+                "selected_attempt",
+                "started_at",
+                "finished_at",
+                "confirmation_deadline",
+                "error",
+            ]
+            message = "Ручная проверка сохранена; сборка снова поставлена в очередь."
+        run.save(update_fields=fields)
+
+    messages.success(request, message)
     return redirect("cart-detail", pk=run.pk)
 
 

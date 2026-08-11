@@ -32,6 +32,10 @@
       <div class="status-orb is-working">…</div>
       <h2>Очищаем корзину</h2>
       <p>Удаляем только товары и количества, добавленные этой попыткой.</p>
+    {% elif run.status == 'manual_check' %}
+      <div class="status-orb is-error">!</div>
+      <h2>Нужно вручную проверить корзину</h2>
+      <p>Связь с браузером оборвалась во время изменения корзины, поэтому безопасно повторить операцию автоматически нельзя. Откройте Яндекс Еду, удалите возможные добавления этой попытки и только затем подтвердите проверку.</p>
     {% elif run.status == 'cancelled' %}
       <div class="status-orb is-done">✓</div>
       <h2>Сборка отменена</h2>
@@ -73,6 +77,13 @@
         <form method="post" action="{% url 'cart-retry' run.pk %}">
           {% csrf_token %}
           <button class="button" type="submit">Проверка пройдена — продолжить</button>
+        </form>
+      {% endif %}
+      {% if run.status == 'manual_check' %}
+        <a class="button" href="https://eda.yandex.ru/retail" target="_blank" rel="noopener noreferrer">Открыть корзину Яндекс Еды ↗</a>
+        <form method="post" action="{% url 'cart-manual-resolved' run.pk %}">
+          {% csrf_token %}
+          <button class="button button-secondary" type="submit">Я проверил и удалил добавления</button>
         </form>
       {% endif %}
       {% if run.status == 'completed' or run.status == 'review' %}

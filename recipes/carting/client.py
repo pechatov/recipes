@@ -11,6 +11,10 @@ from django.conf import settings
 class CartAgentError(Exception):
     """A safe, user-facing cart-agent failure."""
 
+    def __init__(self, message: str, *, mutation_possible: bool = False):
+        super().__init__(message)
+        self.mutation_possible = mutation_possible
+
 
 STORE_INSTRUCTIONS = {
     "auchan": ("Ашан", "https://eda.yandex.ru/retail", "Яндекс Еда · Магазины"),
@@ -198,12 +202,24 @@ def run_store_cart_task(
             )
             response.raise_for_status()
     except httpx.HTTPError as error:
-        raise CartAgentError("Браузерный агент недоступен или не завершил сборку.") from error
+        raise CartAgentError(
+            "Браузерный агент недоступен или не завершил сборку.",
+            mutation_possible=True,
+        ) from error
     try:
         content = response.json()["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as error:
-        raise CartAgentError("Браузерный агент вернул неполный ответ.") from error
-    return _extract_json(content)
+        raise CartAgentError(
+            "Браузерный агент вернул неполный ответ.",
+            mutation_possible=True,
+        ) from error
+    try:
+        return _extract_json(content)
+    except CartAgentError as error:
+        raise CartAgentError(
+            str(error),
+            mutation_possible=True,
+        ) from error
 
 
 def assemble_store_cart(run, store: str) -> dict[str, Any]:

@@ -306,11 +306,29 @@ def process_cart_run(run: CartRun) -> None:
         )
         try:
             data = assemble_store_cart(run, store)
-        except CartAgentError:
+        except CartAgentError as error:
             attempt.status = CartAttempt.Status.FAILED
             attempt.summary = "Браузерный агент не завершил одноэтапную сборку."
+            attempt.result = {"mutation_unknown": error.mutation_possible}
             attempt.finished_at = timezone.now()
-            attempt.save(update_fields=["status", "summary", "finished_at"])
+            attempt.save(update_fields=["status", "summary", "result", "finished_at"])
+            if error.mutation_possible:
+                run.status = CartRun.Status.MANUAL_CHECK
+                run.selected_attempt = attempt
+                run.finished_at = timezone.now()
+                run.error = (
+                    "Связь с браузером оборвалась после запуска задачи. "
+                    "Проверьте корзину вручную перед повтором."
+                )
+                run.save(
+                    update_fields=[
+                        "status",
+                        "selected_attempt",
+                        "finished_at",
+                        "error",
+                    ]
+                )
+                return
             raise
         _save_result(attempt, data)
         run.next_store_index += 1
@@ -380,7 +398,9 @@ def process_cart_run(run: CartRun) -> None:
                         "Нужно завершить очистку после неудачной сборки.",
                     )
                     raise CartAgentError(
-                        "Агент не смог очистить товары после неудачной сборки."
+                        "Агент не смог подтвердить полную очистку после "
+                        "неудачной сборки.",
+                        mutation_possible=True,
                     )
             continue
 
@@ -398,29 +418,16 @@ def process_cart_run(run: CartRun) -> None:
                     "Не удалось очистить неполную корзину.",
                 )
                 raise
-            if cleanup_status in {"login_required", "blocked"}:
-                run.status = CartRun.Status.LOGIN_REQUIRED
-                run.selected_attempt = attempt
-                run.cleanup_requested_at = timezone.now()
-                run.error = "Нужно войти в Яндекс, чтобы безопасно очистить попытку."
-                run.finished_at = timezone.now()
-                run.save(
-                    update_fields=[
-                        "status",
-                        "selected_attempt",
-                        "cleanup_requested_at",
-                        "error",
-                        "finished_at",
-                    ]
-                )
-                return
             if cleanup_status != "cleared":
                 _record_outstanding_cleanup(
                     run,
                     attempt,
                     "Не удалось безопасно очистить неполную корзину.",
                 )
-                raise CartAgentError("Агент не смог безопасно очистить неполную корзину.")
+                raise CartAgentError(
+                    "Агент не смог подтвердить полную очистку неполной корзины.",
+                    mutation_possible=True,
+                )
 
         if attempt_needs_cleanup(attempt):
             _finish_ready_run(run, attempt)
@@ -497,13 +504,11 @@ def process_cart_cleanup(run: CartRun) -> None:
         return
 
     status = _cleanup_attempt(run, attempt)
-    if status in {"login_required", "blocked"}:
-        run.status = CartRun.Status.LOGIN_REQUIRED
-        run.error = "Нужно войти в Яндекс, чтобы очистить неподтверждённую корзину."
-        run.save(update_fields=["status", "error"])
-        return
     if status != "cleared":
-        raise CartAgentError("Агент не смог безопасно очистить корзину.")
+        raise CartAgentError(
+            "Агент не смог подтвердить полную очистку корзины.",
+            mutation_possible=True,
+        )
 
     run.status = CartRun.Status.CANCELLED
     run.cleaned_at = timezone.now()
