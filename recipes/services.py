@@ -57,7 +57,7 @@ def build_shopping_items(
                     build_store_search_url(
                         preferred_store, ingredient.effective_search_query
                     )
-                    if preferred_store
+                    if preferred_store and preferred_store != StorePreference.Store.LAVKA
                     else ""
                 ),
             )
