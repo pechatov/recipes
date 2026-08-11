@@ -16,10 +16,20 @@
   <script>
     // До первой отрисовки, иначе тёмная тема моргнёт светлой.
     (() => {
-      const saved = localStorage.getItem("theme");
-      const theme = saved === "light" || saved === "dark" ? saved : "dark";
-      document.documentElement.dataset.theme = theme;
-      document.querySelector("[data-theme-color]").content = theme === "light" ? "#fbf7f0" : "#191512";
+      // Цвет строки состояния берём из --bg активной темы, чтобы не дублировать палитру.
+      window.applyTheme = theme => {
+        document.documentElement.dataset.theme = theme;
+        const meta = document.querySelector("[data-theme-color]");
+        const background = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+        if (background) meta.content = background;
+      };
+      let saved = null;
+      try {
+        saved = localStorage.getItem("theme");
+      } catch (error) {
+        // Хранилище заблокировано настройками сайта — остаёмся на теме по умолчанию.
+      }
+      window.applyTheme(saved === "light" || saved === "dark" ? saved : "dark");
     })();
   </script>
 </head>
