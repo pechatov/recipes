@@ -45,10 +45,10 @@ if [[ ! -f "$app_root/.env" ]]; then
     printf 'POSTGRES_DB=recipes\n'
     printf 'POSTGRES_USER=recipes\n'
     printf 'DEBUG=false\n'
-    printf 'ALLOWED_HOSTS=192.168.31.2,truenas,localhost,127.0.0.1\n'
-    printf 'CSRF_TRUSTED_ORIGINS=http://192.168.31.2:30111\n'
+    printf 'ALLOWED_HOSTS=192.168.31.2,truenas,localhost,127.0.0.1,recipes.pechatov.com,gotovka.pechatov.com\n'
+    printf 'CSRF_TRUSTED_ORIGINS=http://192.168.31.2:30111,https://recipes.pechatov.com,https://gotovka.pechatov.com\n'
     printf 'TIME_ZONE=Europe/Moscow\n'
-    printf 'COOKIE_SECURE=false\n'
+    printf 'COOKIE_SECURE=true\n'
     printf 'SECURE_SSL_REDIRECT=false\n'
     printf 'SECURE_HSTS_SECONDS=0\n'
   } >"$temp_env"

@@ -136,11 +136,20 @@ Runner регистрируется только для `pechatov/recipes` и п
 
 ### Reverse proxy и HTTPS
 
-Первое развёртывание доступно только в локальной сети по HTTP. Перед публикацией через Nginx Proxy Manager нужно:
+Приложение публикуется через существующий Nginx Proxy Manager по двум адресам:
 
-1. добавить доменное имя в `ALLOWED_HOSTS`;
-2. добавить `https://домен` в `CSRF_TRUSTED_ORIGINS`;
-3. установить `COOKIE_SECURE=true`;
-4. установить `SECURE_SSL_REDIRECT=true`;
-5. после проверки HTTPS включить HSTS через `SECURE_HSTS_SECONDS`;
-6. перезапустить приложение.
+- `https://recipes.pechatov.com`;
+- `https://gotovka.pechatov.com`.
+
+Runtime-файл `/mnt/main-pool/config/recipes/.env` должен содержать оба имени в `ALLOWED_HOSTS`, оба HTTPS origin в `CSRF_TRUSTED_ORIGINS` и `COOKIE_SECURE=true`. `SECURE_SSL_REDIRECT` остаётся выключенным: редирект и HSTS выполняет Nginx Proxy Manager, а локальный `/healthz/` остаётся доступен приложению по HTTP.
+
+Идемпотентная настройка proxy host использует существующий wildcard-сертификат `*.pechatov.com` и сохраняет резервную копию базы NPM перед изменением:
+
+```bash
+ssh truenas "sudo env \
+  NPM_DATA_DIR=/mnt/main-pool/config/nginx/data \
+  RECIPES_CERTIFICATE_ID=2 \
+  bash -s" < scripts/deploy/configure-npm-proxy.sh
+```
+
+По умолчанию оба домена проксируются на `192.168.31.2:30111`, HTTP принудительно перенаправляется на HTTPS, а конфигурация Nginx проверяется перед reload.
