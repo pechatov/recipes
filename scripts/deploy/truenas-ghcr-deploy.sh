@@ -24,6 +24,10 @@ if [[ ! "$GHCR_USERNAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "Invalid GHCR username" >&2
   exit 1
 fi
+if [[ ! "$RECIPES_IMAGE" =~ ^ghcr\.io/[a-z0-9][a-z0-9._/-]*$ ]]; then
+  echo "Invalid GHCR image name" >&2
+  exit 1
+fi
 if [[ ! "$RECIPES_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
   echo "Deploy tag must be an immutable sha-<commit> tag" >&2
   exit 1
@@ -58,9 +62,7 @@ if [[ ! "$run_id" =~ ^([0-9]+|manual)$ ]]; then
 fi
 auth_dir="/tmp/recipes-ghcr-$run_id"
 printf '%s' "$GHCR_TOKEN" | ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" \
-  "sudo install -d -m 0700 '$auth_dir' && sudo env DOCKER_CONFIG='$auth_dir' docker login ghcr.io --username '$GHCR_USERNAME' --password-stdin >/dev/null"
-ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" \
-  "set +e; sudo env DOCKER_CONFIG='$auth_dir' docker pull '$IMAGE_REF' >/dev/null; status=\$?; sudo rm -rf '$auth_dir'; exit \$status"
+  "set -eu; trap 'sudo rm -rf -- \"$auth_dir\"' EXIT HUP INT TERM; sudo install -d -m 0700 '$auth_dir'; sudo env DOCKER_CONFIG='$auth_dir' docker login ghcr.io --username '$GHCR_USERNAME' --password-stdin >/dev/null; sudo env DOCKER_CONFIG='$auth_dir' docker pull '$IMAGE_REF' >/dev/null"
 
 ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" bash -s -- "$APP_NAME" "$remote_compose" "$IMAGE_REF" <<'REMOTE'
 set -Eeuo pipefail
