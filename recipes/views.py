@@ -26,6 +26,8 @@ from .services import build_shopping_items, get_store_preferences
 
 
 SEARCH_CANDIDATE_LIMIT = 500
+MAX_SEARCH_QUERY_LENGTH = 120
+MAX_SEARCH_TOKENS = 8
 
 
 def health(request):
@@ -80,7 +82,7 @@ def _search_candidate_filter(query: str) -> Q:
         "ingredients__name",
     )
     candidate_filter = Q()
-    for token in _normalize_recipe_search(query).split():
+    for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
         fragments = {token} if len(token) < 3 else {
             token[index:index + 2] for index in range(len(token) - 1)
         }
@@ -117,6 +119,12 @@ def setup_owner(request):
 @login_required
 def recipe_list(request):
     query = request.GET.get("q", "").strip()
+    normalized_tokens = _normalize_recipe_search(query).split()
+    if len(query) > MAX_SEARCH_QUERY_LENGTH or len(normalized_tokens) > MAX_SEARCH_TOKENS:
+        return JsonResponse(
+            {"error": "Поисковый запрос слишком длинный."},
+            status=400,
+        )
     selected_category = request.GET.get("category", "").strip()
     selected_author = request.GET.get("author", "").strip()
     recipes = (
@@ -309,8 +317,17 @@ def recipe_update(request, slug):
             )
             recalculate = "servings" in form.changed_data or ingredients_changed
             if manual_calorie_change:
+                changed_calorie_fields = calorie_fields.intersection(form.changed_data)
+                cleared_fields = []
+                if calories_were_estimated and len(changed_calorie_fields) == 1:
+                    unchanged_field = (calorie_fields - changed_calorie_fields).pop()
+                    setattr(recipe, unchanged_field, None)
+                    cleared_fields.append(unchanged_field)
                 recipe.calories_estimated = False
-                recipe.save(update_fields=["calories_estimated", "updated_at"])
+                recipe.save(
+                    update_fields=cleared_fields
+                    + ["calories_estimated", "updated_at"]
+                )
             elif recalculate and (
                 calories_were_estimated
                 or (

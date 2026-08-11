@@ -82,7 +82,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy to TrueNAS
+    name: Deploy application
     needs: build
     if: github.ref == 'refs/heads/main'
     runs-on:
@@ -96,6 +96,9 @@ jobs:
     env:
       DEPLOY_SSH_TARGET: ${{ vars.DEPLOY_SSH_TARGET }}
       RECIPES_APP_ROOT: ${{ vars.RECIPES_APP_ROOT }}
+      RECIPES_BIND_ADDRESS: ${{ secrets.RECIPES_BIND_ADDRESS }}
+      RECIPES_PORT: ${{ secrets.RECIPES_PORT }}
+      RECIPES_HEALTH_URL: ${{ secrets.RECIPES_HEALTH_URL }}
       RECIPES_IMAGE: ghcr.io/${{ github.repository }}
       RECIPES_TAG: ${{ needs.build.outputs.image-tag }}
       GHCR_USERNAME: ${{ github.actor }}
@@ -108,6 +111,9 @@ jobs:
         run: |
           test -n "$DEPLOY_SSH_TARGET"
           test -n "$RECIPES_APP_ROOT"
+          test -n "$RECIPES_BIND_ADDRESS"
+          test -n "$RECIPES_PORT"
+          test -n "$RECIPES_HEALTH_URL"
 
       - name: Deploy immutable image
         run: scripts/deploy/truenas-ghcr-deploy.sh

@@ -12,6 +12,7 @@ from PIL import Image, UnidentifiedImageError
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from recipes.categories import CATEGORY_TAXONOMY
@@ -319,36 +320,63 @@ def save_draft(
     data: dict | list[dict],
     *,
     document: SourceDocument | None = None,
+    expected_draft_versions: dict[int, Any] | None = None,
 ) -> list[Recipe]:
-    has_published_recipe = (
-        bool(job.recipe_id and job.recipe.status == Recipe.Status.PUBLISHED)
-        or job.recipes.filter(status=Recipe.Status.PUBLISHED).exists()
-    )
-    if has_published_recipe:
-        raise ImportPipelineError(
-            "Нельзя повторно обработать импорт после публикации одного из рецептов. "
-            "Оставшиеся черновики сохранены без изменений."
-        )
+    if expected_draft_versions is None:
+        expected_draft_versions = {
+            recipe.pk: recipe.updated_at
+            for recipe in Recipe.objects.filter(
+                Q(import_jobs=job) | Q(import_job=job),
+                status=Recipe.Status.DRAFT,
+            ).distinct()
+        }
     recipe_data = normalize_recipes(data)
     prepared_images = _prepare_images(document, recipe_data)
     new_files: list[tuple[Any, str]] = []
     old_files: list[tuple[Any, str]] = []
     try:
         with transaction.atomic():
-            existing_drafts: list[Recipe] = []
-            if job.recipe and job.recipe.status == Recipe.Status.DRAFT:
-                existing_drafts.append(job.recipe)
-            existing_drafts.extend(
-                job.recipes.filter(status=Recipe.Status.DRAFT)
-                .exclude(pk=job.recipe_id)
+            locked_job = ImportJob.objects.select_for_update().get(pk=job.pk)
+            linked_recipe_ids = set(locked_job.recipes.values_list("pk", flat=True))
+            if locked_job.recipe_id:
+                linked_recipe_ids.add(locked_job.recipe_id)
+            locked_recipes = {
+                recipe.pk: recipe
+                for recipe in Recipe.objects.select_for_update()
+                .filter(pk__in=linked_recipe_ids)
                 .order_by("pk")
+            }
+            if any(
+                recipe.status == Recipe.Status.PUBLISHED
+                for recipe in locked_recipes.values()
+            ):
+                raise ImportPipelineError(
+                    "Нельзя повторно обработать импорт после публикации одного из "
+                    "рецептов. Оставшиеся черновики сохранены без изменений."
+                )
+            current_versions = {
+                recipe.pk: recipe.updated_at for recipe in locked_recipes.values()
+            }
+            if current_versions != expected_draft_versions:
+                raise ImportPipelineError(
+                    "Черновики изменились во время обработки. Повторный импорт отменён, "
+                    "чтобы не потерять пользовательские правки."
+                )
+            existing_drafts: list[Recipe] = []
+            primary_recipe = locked_recipes.get(locked_job.recipe_id)
+            if primary_recipe:
+                existing_drafts.append(primary_recipe)
+            existing_drafts.extend(
+                recipe
+                for recipe_id, recipe in locked_recipes.items()
+                if recipe_id != locked_job.recipe_id
             )
             saved_recipes: list[Recipe] = []
             for recipe_index, values in enumerate(recipe_data):
                 cover_image, step_images = prepared_images[recipe_index]
                 if recipe_index < len(existing_drafts):
                     recipe = existing_drafts[recipe_index]
-                    for field, value in _recipe_values(job, values).items():
+                    for field, value in _recipe_values(locked_job, values).items():
                         setattr(recipe, field, value)
                     if cover_image:
                         old_cover = _stored_file(recipe.cover)
@@ -368,9 +396,9 @@ def save_draft(
                     recipe.steps.all().delete()
                 else:
                     recipe = Recipe(
-                        **_recipe_values(job, values),
+                        **_recipe_values(locked_job, values),
                         status=Recipe.Status.DRAFT,
-                        created_by=job.requested_by,
+                        created_by=locked_job.requested_by,
                     )
                     if cover_image:
                         recipe.cover.save(
@@ -410,14 +438,14 @@ def save_draft(
                 _set_categories(recipe, values.get("categories", []))
                 saved_recipes.append(recipe)
 
-            job.recipe = saved_recipes[0]
+            locked_job.recipe = saved_recipes[0]
             # A non-deterministic re-import may return fewer recipes. Detach
             # unmatched drafts from this job instead of deleting user edits.
-            job.recipes.set(saved_recipes)
-            job.status = ImportJob.Status.COMPLETED
-            job.finished_at = timezone.now()
-            job.error = ""
-            job.save(update_fields=["recipe", "status", "finished_at", "error"])
+            locked_job.recipes.set(saved_recipes)
+            locked_job.status = ImportJob.Status.COMPLETED
+            locked_job.finished_at = timezone.now()
+            locked_job.error = ""
+            locked_job.save(update_fields=["recipe", "status", "finished_at", "error"])
 
             kept_file_refs = []
             for recipe in saved_recipes:
@@ -439,10 +467,21 @@ def save_draft(
     except Exception:
         _delete_stored_files(new_files)
         raise
+    job.recipe = locked_job.recipe
+    job.status = locked_job.status
+    job.finished_at = locked_job.finished_at
+    job.error = locked_job.error
     return saved_recipes
 
 
 def process_import_job(job: ImportJob) -> list[Recipe]:
+    expected_draft_versions = {
+        recipe.pk: recipe.updated_at
+        for recipe in Recipe.objects.filter(
+            Q(import_jobs=job) | Q(import_job=job),
+            status=Recipe.Status.DRAFT,
+        ).distinct()
+    }
     document = extract_source(job.source_url)
     validate_source_safety(document)
     job.source_title = document.title
@@ -456,4 +495,9 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
             "Для этого источника нужен AI-сервис. Страница без Recipe-разметки или YouTube "
             "не могут быть адаптированы автоматически без модели."
         )
-    return save_draft(job, data, document=document)
+    return save_draft(
+        job,
+        data,
+        document=document,
+        expected_draft_versions=expected_draft_versions,
+    )

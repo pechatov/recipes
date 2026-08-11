@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PI_SSH_HOST="${PI_SSH_HOST:-pi}"
+: "${PI_SSH_HOST:?Set PI_SSH_HOST}"
 HERMES_PROFILE="${HERMES_PROFILE:-recipecart}"
 ACTION="${1:-start}"
 USER_ID="${2:-}"

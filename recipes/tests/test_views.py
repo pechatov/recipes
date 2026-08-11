@@ -173,6 +173,18 @@ class RecipeViewTests(TestCase):
 
         self.assertEqual(matcher.call_count, 5)
 
+    def test_fuzzy_search_rejects_input_before_building_an_unbounded_query(self):
+        self.client.force_login(self.user)
+
+        for query in ("а" * 121, "один два три четыре пять шесть семь восемь девять"):
+            with self.subTest(query=query), patch(
+                "recipes.views._search_candidate_filter"
+            ) as candidate_filter:
+                response = self.client.get(reverse("recipe-list"), {"q": query})
+
+            self.assertEqual(response.status_code, 400)
+            candidate_filter.assert_not_called()
+
     def test_server_search_excludes_unrelated_recipes_without_javascript(self):
         other = Recipe.objects.create(title="Яблочный пирог", created_by=self.user)
         RecipeIngredient.objects.create(
@@ -324,6 +336,49 @@ class RecipeViewTests(TestCase):
         self.assertFalse(created.calories_estimated)
         detail = self.client.get(created.get_absolute_url())
         self.assertIsNone(detail.context["recipe"].calories_per_100g)
+
+    def test_manual_calorie_edit_clears_unchanged_estimated_pair(self):
+        _fill_missing_recipe_calories(self.recipe, save=True)
+        self.recipe.calories_estimated = True
+        self.recipe.save(update_fields=["calories_estimated", "updated_at"])
+        ingredient = self.recipe.ingredients.get()
+        step = self.recipe.steps.get()
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            reverse("recipe-update", args=[self.recipe.slug]),
+            {
+                "title": self.recipe.title,
+                "description": self.recipe.description,
+                "servings": self.recipe.servings,
+                "prep_minutes": self.recipe.prep_minutes,
+                "cook_minutes": self.recipe.cook_minutes,
+                "calories_per_serving": "999",
+                "calories_per_100g": self.recipe.calories_per_100g,
+                "ingredients-TOTAL_FORMS": 1,
+                "ingredients-INITIAL_FORMS": 1,
+                "ingredients-MIN_NUM_FORMS": 1,
+                "ingredients-MAX_NUM_FORMS": 1000,
+                "ingredients-0-id": ingredient.pk,
+                "ingredients-0-name": ingredient.name,
+                "ingredients-0-quantity": ingredient.quantity,
+                "ingredients-0-unit": ingredient.unit,
+                "ingredients-0-search_query": ingredient.search_query,
+                "steps-TOTAL_FORMS": 1,
+                "steps-INITIAL_FORMS": 1,
+                "steps-MIN_NUM_FORMS": 1,
+                "steps-MAX_NUM_FORMS": 1000,
+                "steps-0-id": step.pk,
+                "steps-0-title": step.title,
+                "steps-0-instruction": step.instruction,
+            },
+        )
+
+        self.assertRedirects(response, self.recipe.get_absolute_url())
+        self.recipe.refresh_from_db()
+        self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
+        self.assertIsNone(self.recipe.calories_per_100g)
+        self.assertFalse(self.recipe.calories_estimated)
 
     def test_draft_is_hidden_until_published(self):
         draft = Recipe.objects.create(

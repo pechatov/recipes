@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PI_SSH_HOST="${PI_SSH_HOST:-pi}"
-TRUENAS_SSH_HOST="${TRUENAS_SSH_HOST:-truenas}"
-PI_ADDRESS="${PI_ADDRESS:-192.168.1.147}"
-PI_API_PORT="${PI_API_PORT:-8651}"
+: "${PI_SSH_HOST:?Set PI_SSH_HOST}"
+: "${TRUENAS_SSH_HOST:?Set TRUENAS_SSH_HOST}"
+: "${PI_ADDRESS:?Set PI_ADDRESS}"
+: "${PI_API_PORT:?Set PI_API_PORT}"
+: "${TRUENAS_ENV:?Set TRUENAS_ENV}"
+
 HERMES_PROFILE="${HERMES_PROFILE:-recipecart}"
 HERMES_MODEL="${HERMES_MODEL:-gpt-5.6-sol}"
-TRUENAS_ENV="${TRUENAS_ENV:-/mnt/main-pool/config/recipes/.env}"
 
 ssh "$PI_SSH_HOST" "PI_ADDRESS='$PI_ADDRESS' PI_API_PORT='$PI_API_PORT' HERMES_PROFILE='$HERMES_PROFILE' HERMES_MODEL='$HERMES_MODEL' bash -s" <<'REMOTE'
 set -Eeuo pipefail
@@ -349,5 +350,5 @@ tmp.chmod(0o600)
 tmp.replace(path)
 '"
 
-echo "Hermes cart profile is ready on pi:${PI_API_PORT}."
+echo "Hermes cart profile is ready."
 echo "For manual login: ./scripts/cart-browser-login-pi.sh start USER_ID"

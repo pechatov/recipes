@@ -2,16 +2,17 @@
 set -Eeuo pipefail
 
 : "${NPM_DATA_DIR:?Set NPM_DATA_DIR}"
+: "${NPM_EXPECTED_DATA_DIR:?Set NPM_EXPECTED_DATA_DIR}"
 : "${RECIPES_CERTIFICATE_ID:?Set RECIPES_CERTIFICATE_ID}"
+: "${RECIPES_PRIMARY_DOMAIN:?Set RECIPES_PRIMARY_DOMAIN}"
+: "${RECIPES_ALIAS_DOMAIN:?Set RECIPES_ALIAS_DOMAIN}"
+: "${RECIPES_FORWARD_HOST:?Set RECIPES_FORWARD_HOST}"
+: "${RECIPES_FORWARD_PORT:?Set RECIPES_FORWARD_PORT}"
+: "${NPM_CONTAINER:?Set NPM_CONTAINER}"
 
-RECIPES_PRIMARY_DOMAIN="${RECIPES_PRIMARY_DOMAIN:-recipes.pechatov.com}"
-RECIPES_ALIAS_DOMAIN="${RECIPES_ALIAS_DOMAIN:-gotovka.pechatov.com}"
-RECIPES_FORWARD_HOST="${RECIPES_FORWARD_HOST:-192.168.31.2}"
-RECIPES_FORWARD_PORT="${RECIPES_FORWARD_PORT:-30111}"
-NPM_CONTAINER="${NPM_CONTAINER:-ix-nginx-proxy-manager-npm-1}"
-EXPECTED_DATA_DIR="/mnt/main-pool/config/nginx/data"
-
-if [[ "$NPM_DATA_DIR" != "$EXPECTED_DATA_DIR" ]]; then
+if [[ "$NPM_DATA_DIR" != "$NPM_EXPECTED_DATA_DIR" ]] \
+  || [[ ! "$NPM_DATA_DIR" =~ ^/mnt/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] \
+  || [[ "$NPM_DATA_DIR" == *"/../"* || "$NPM_DATA_DIR" == *"/./"* ]]; then
   echo "Refusing to modify unexpected NPM data directory: $NPM_DATA_DIR" >&2
   exit 1
 fi

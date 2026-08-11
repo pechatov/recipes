@@ -581,6 +581,57 @@ class PipelineTests(TestCase):
         self.assertEqual(initial[1].title, "Второй")
         self.assertCountEqual(job.recipes.all(), initial)
 
+    def test_reprocessing_rechecks_publication_after_image_preparation(self):
+        user = get_user_model().objects.create_user("concurrent-publisher")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/menu",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        draft = save_draft(job, self.recipe_data("Черновик"))[0]
+        expected_versions = {draft.pk: draft.updated_at}
+
+        def publish_during_preparation(document, recipes):
+            draft.status = Recipe.Status.PUBLISHED
+            draft.save(update_fields=["status", "updated_at"])
+            return [(None, [None] * len(recipes[0]["steps"]))]
+
+        with patch(
+            "recipes.importing.pipeline._prepare_images",
+            side_effect=publish_during_preparation,
+        ), self.assertRaisesRegex(ImportPipelineError, "после публикации"):
+            save_draft(
+                job,
+                self.recipe_data("Перезаписанный"),
+                expected_draft_versions=expected_versions,
+            )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.title, "Черновик")
+        self.assertEqual(draft.status, Recipe.Status.PUBLISHED)
+
+    def test_reprocessing_aborts_if_draft_changed_since_job_started(self):
+        user = get_user_model().objects.create_user("concurrent-editor")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/menu",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        draft = save_draft(job, self.recipe_data("Черновик"))[0]
+        expected_versions = {draft.pk: draft.updated_at}
+        draft.title = "Правка пользователя"
+        draft.save(update_fields=["title", "updated_at"])
+
+        with self.assertRaisesRegex(ImportPipelineError, "изменились во время обработки"):
+            save_draft(
+                job,
+                self.recipe_data("Перезаписанный"),
+                expected_draft_versions=expected_versions,
+            )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.title, "Правка пользователя")
+
     @patch("recipes.importing.pipeline._download_image")
     def test_step_images_keep_their_recipe_and_step_positions(self, download_image):
         download_image.side_effect = lambda url, **kwargs: DownloadedImage(

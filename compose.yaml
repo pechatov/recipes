@@ -10,7 +10,7 @@ services:
       DATABASE_HOST: db
       DATABASE_PORT: "5432"
     ports:
-      - "${WEB_PORT:-30111}:8000"
+      - "${WEB_PORT:-8000}:8000"
     volumes:
       - "${RECIPES_DATA_PATH:-./data}:/app/data"
     depends_on:
