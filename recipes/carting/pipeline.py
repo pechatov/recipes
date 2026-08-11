@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import timedelta
 from urllib.parse import urlparse
 
@@ -26,6 +27,7 @@ MATCH_QUALITIES = {
     CartItemMatch.MatchQuality.SUBSTITUTE,
     CartItemMatch.MatchQuality.MISSING,
 }
+PRODUCT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,128}")
 
 
 def _text(value, limit: int) -> str:
@@ -41,6 +43,17 @@ def _safe_yandex_food_url(value) -> str:
     if parsed.scheme != "https" or parsed.hostname != "eda.yandex.ru":
         return ""
     return url
+
+
+def _yandex_food_product_id(value) -> str:
+    url = _safe_yandex_food_url(value)
+    if not url:
+        return ""
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    if len(parts) < 2 or parts[-2] != "product":
+        return ""
+    product_id = parts[-1]
+    return product_id if PRODUCT_ID_PATTERN.fullmatch(product_id) else ""
 
 
 def _package_count(value, *, maximum: int = 100) -> int:
@@ -73,6 +86,7 @@ def _save_result(attempt: CartAttempt, data: dict) -> None:
         package_count = _package_count(item.get("package_count"))
         product_name = _text(item.get("product_name"), 300)
         product_url = _safe_yandex_food_url(item.get("product_url"))
+        product_id = _yandex_food_product_id(product_url)
         matches.append(
             CartItemMatch(
                 attempt=attempt,
@@ -101,12 +115,13 @@ def _save_result(attempt: CartAttempt, data: dict) -> None:
             and product_name
             and quality != CartItemMatch.MatchQuality.MISSING
         ):
-            key = product_url or product_name.casefold()
+            key = product_id or product_url or product_name.casefold()
             existing = added_by_product.setdefault(
                 key,
                 {
                     "product_name": product_name,
                     "product_url": product_url,
+                    "product_id": product_id,
                     "package_count": 0,
                 },
             )
@@ -210,7 +225,33 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
     items = attempt_added_items(attempt)
     if not items:
         return "cleared"
-    data = cleanup_store_cart(run, attempt.store, items, attempt.cart_url)
+    safe_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise CartAgentError(
+                "Безопасная очистка невозможна: журнал добавлений повреждён."
+            )
+        product_name = _text(item.get("product_name"), 300)
+        product_url = _safe_yandex_food_url(item.get("product_url"))
+        product_id = _yandex_food_product_id(product_url)
+        try:
+            package_count = int(item.get("package_count") or 0)
+        except (TypeError, ValueError):
+            package_count = 0
+        if not product_name or not product_id or not 1 <= package_count <= 100:
+            raise CartAgentError(
+                "Автоматическая очистка остановлена: товар нельзя однозначно "
+                "сопоставить со строкой корзины."
+            )
+        safe_items.append(
+            {
+                "product_name": product_name,
+                "product_url": product_url,
+                "product_id": product_id,
+                "package_count": package_count,
+            }
+        )
+    data = cleanup_store_cart(run, attempt.store, safe_items, attempt.cart_url)
     status = _text(data.get("status"), 24)
     if status == "cleared":
         _mark_attempt_cleaned(attempt, data.get("summary", ""))

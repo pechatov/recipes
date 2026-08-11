@@ -12,7 +12,11 @@ from recipes.carting.pipeline import (
     process_cart_cleanup,
     process_cart_run,
 )
-from recipes.carting.client import STORE_INSTRUCTIONS, cart_browser_session_key
+from recipes.carting.client import (
+    STORE_INSTRUCTIONS,
+    CartAgentError,
+    cart_browser_session_key,
+)
 from recipes.models import (
     CartAttempt,
     CartItemMatch,
@@ -248,7 +252,7 @@ class CartPipelineTests(TestCase):
             "added_items": [
                 {
                     "product_name": "Спагетти 450 г",
-                    "product_url": "https://eda.yandex.ru/product/1",
+                    "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
                     "package_count": 1,
                 }
             ],
@@ -257,7 +261,7 @@ class CartPipelineTests(TestCase):
                     "ingredient_name": "Спагетти",
                     "requested_quantity": "400 г",
                     "product_name": "Спагетти 450 г",
-                    "product_url": "https://eda.yandex.ru/product/1",
+                    "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
                     "package_count": 1,
                     "added_package_count": 1,
                     "quality": "exact",
@@ -322,6 +326,7 @@ class CartPipelineTests(TestCase):
                 {
                     "product_name": "Спагетти 450 г",
                     "product_url": "https://eda.yandex.ru/product/legitimate",
+                    "product_id": "legitimate",
                     "package_count": 2,
                 }
             ],
@@ -342,7 +347,7 @@ class CartPipelineTests(TestCase):
                     "ingredient_name": "Спагетти",
                     "requested_quantity": "400 г",
                     "product_name": "Лапша рисовая",
-                    "product_url": "https://eda.yandex.ru/product/2",
+                    "product_url": "https://eda.yandex.ru/product/sku-noodles-2",
                     "package_count": 1,
                     "added_package_count": 1,
                     "quality": "substitute",
@@ -432,12 +437,16 @@ class CartPipelineTests(TestCase):
                     "ingredient_name": name,
                     "requested_quantity": "1 шт.",
                     "product_name": f"{name} товар",
+                    "product_url": f"https://eda.yandex.ru/product/sku-{index:08d}",
                     "package_count": 1,
                     "added_package_count": 1,
                     "quality": "exact",
                     "warning": "",
                 }
-                for name in ["Первый", "Второй", "Третий", "Четвёртый"]
+                for index, name in enumerate(
+                    ["Первый", "Второй", "Третий", "Четвёртый"],
+                    start=1,
+                )
             ],
         }
         assemble.side_effect = [incomplete, exact]
@@ -469,6 +478,11 @@ class CartPipelineTests(TestCase):
                     "package_count": 1 if index < 2 else 0,
                     "added_package_count": 1 if index < 2 else 0,
                     "product_name": f"{name} товар" if index < 2 else "",
+                    "product_url": (
+                        f"https://eda.yandex.ru/product/sku-{index:08d}"
+                        if index < 2
+                        else ""
+                    ),
                     "quality": "exact" if index < 2 else "missing",
                     "warning": "" if index < 2 else "Нет товара",
                 }
@@ -500,7 +514,11 @@ class CartPipelineTests(TestCase):
             result={
                 "cart_cleared": False,
                 "added_items": [
-                    {"product_name": "Спагетти", "package_count": 2}
+                    {
+                        "product_name": "Спагетти",
+                        "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
+                        "package_count": 2,
+                    }
                 ],
             },
         )
@@ -522,9 +540,44 @@ class CartPipelineTests(TestCase):
         cleanup.assert_called_once_with(
             run,
             "auchan",
-            [{"product_name": "Спагетти", "package_count": 2}],
+            [
+                {
+                    "product_name": "Спагетти",
+                    "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
+                    "product_id": "sku-pasta-1",
+                    "package_count": 2,
+                }
+            ],
             "https://eda.yandex.ru/cart",
         )
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    def test_cleanup_stops_when_product_has_no_stable_id(self, cleanup):
+        run = self.make_run()
+        run.status = CartRun.Status.CLEANING
+        run.save(update_fields=["status"])
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            result={
+                "cart_cleared": False,
+                "added_items": [
+                    {
+                        "product_name": "Спагетти",
+                        "product_url": "",
+                        "package_count": 2,
+                    }
+                ],
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        with self.assertRaisesMessage(CartAgentError, "нельзя однозначно"):
+            process_cart_cleanup(run)
+
+        cleanup.assert_not_called()
 
     def test_new_assembly_waits_for_unfinished_cleanup(self):
         old_run = self.make_run()
