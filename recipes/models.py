@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal
 
 from django.conf import settings
@@ -7,6 +8,64 @@ from django.urls import reverse
 from django.utils.text import slugify
 
 from .validators import validate_recipe_image
+
+
+def is_water_ingredient_name(name: str) -> bool:
+    """Return whether an ingredient is plain water rather than a food product."""
+    words = set(re.findall(r"[a-zа-я]+", (name or "").lower().replace("ё", "е")))
+    water_words = {
+        "вода",
+        "воды",
+        "воду",
+        "water",
+        "кипяток",
+        "кипятка",
+        "лед",
+        "льда",
+        "ice",
+    }
+    qualifiers = {
+        "горячая",
+        "горячей",
+        "горячую",
+        "холодная",
+        "холодной",
+        "холодную",
+        "теплая",
+        "теплой",
+        "теплую",
+        "питьевая",
+        "питьевой",
+        "питьевую",
+        "фильтрованная",
+        "фильтрованной",
+        "фильтрованную",
+        "кипяченая",
+        "кипяченой",
+        "кипяченую",
+        "ледяная",
+        "ледяной",
+        "ледяную",
+        "газированная",
+        "газированной",
+        "газированную",
+        "минеральная",
+        "минеральной",
+        "минеральную",
+        "комнатная",
+        "комнатной",
+        "комнатную",
+        "температура",
+        "температуры",
+        "кубик",
+        "кубики",
+        "кубиках",
+        "колотый",
+        "колотого",
+        "в",
+        "из",
+    }
+    return bool(words & water_words) and words <= water_words | qualifiers
 
 
 class Category(models.Model):
@@ -34,6 +93,22 @@ class Recipe(models.Model):
     servings = models.PositiveSmallIntegerField("порций", default=2)
     prep_minutes = models.PositiveSmallIntegerField("подготовка, минут", default=0)
     cook_minutes = models.PositiveSmallIntegerField("приготовление, минут", default=0)
+    calories_per_serving = models.DecimalField(
+        "ккал на порцию",
+        max_digits=8,
+        decimal_places=1,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    calories_per_100g = models.DecimalField(
+        "ккал на 100 г",
+        max_digits=8,
+        decimal_places=1,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
     cover = models.ImageField(
         "фотография блюда",
         upload_to="recipes/covers/%Y/%m/",
@@ -121,6 +196,11 @@ class RecipeIngredient(models.Model):
         help_text="Если оставить пустым, будет использовано название ингредиента.",
     )
     optional = models.BooleanField("необязательный", default=False)
+    is_pantry = models.BooleanField(
+        "приправа, специя или продукт из запасов",
+        default=False,
+        help_text="По умолчанию не включается в корзину.",
+    )
     estimated = models.BooleanField(
         "количество примерное",
         default=False,
@@ -140,9 +220,19 @@ class RecipeIngredient(models.Model):
     def effective_search_query(self):
         return self.search_query.strip() or self.name.strip()
 
+    @property
+    def is_water(self):
+        return is_water_ingredient_name(self.name)
+
 
 class RecipeStep(models.Model):
     recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name="steps")
+    section = models.CharField(
+        "часть блюда",
+        max_length=120,
+        blank=True,
+        help_text="Например, «Суп» или «Гренки».",
+    )
     title = models.CharField("заголовок", max_length=180, blank=True)
     instruction = models.TextField("инструкция")
     image = models.ImageField(
@@ -174,6 +264,11 @@ class ImportJob(models.Model):
         FAILED = "failed", "Ошибка"
 
     source_url = models.URLField("ссылка", max_length=2048)
+    custom_prompt = models.TextField(
+        "пожелания к импорту",
+        blank=True,
+        help_text="Дополнительные требования к адаптации рецепта.",
+    )
     source_type = models.CharField("тип источника", max_length=16, choices=SourceType.choices)
     status = models.CharField(
         "статус",
@@ -188,6 +283,12 @@ class ImportJob(models.Model):
         null=True,
         blank=True,
         related_name="import_job",
+    )
+    recipes = models.ManyToManyField(
+        Recipe,
+        blank=True,
+        related_name="import_jobs",
+        verbose_name="созданные рецепты",
     )
     requested_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

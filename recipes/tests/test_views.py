@@ -3,6 +3,7 @@ from django.test import TestCase
 from django.urls import reverse
 
 from recipes.models import Category, ImportJob, Recipe, RecipeIngredient, RecipeStep
+from recipes.views import _fill_missing_recipe_calories
 
 
 class FirstRunTests(TestCase):
@@ -51,6 +52,20 @@ class RecipeViewTests(TestCase):
         response = self.client.get(self.recipe.get_absolute_url())
         self.assertContains(response, "Семейная паста")
         self.assertContains(response, "Прогреть сливки")
+        self.assertEqual(str(response.context["recipe"].calories_per_serving), "205.0")
+        self.assertEqual(str(response.context["recipe"].calories_per_100g), "205.0")
+
+    def test_estimated_calories_can_be_recalculated_after_ingredient_changes(self):
+        _fill_missing_recipe_calories(self.recipe, save=True)
+        ingredient = self.recipe.ingredients.get()
+        ingredient.quantity = 400
+        ingredient.save(update_fields=["quantity"])
+
+        _fill_missing_recipe_calories(self.recipe, save=True, overwrite=True)
+
+        self.recipe.refresh_from_db()
+        self.assertEqual(str(self.recipe.calories_per_serving), "410.0")
+        self.assertEqual(str(self.recipe.calories_per_100g), "205.0")
 
     def test_edit_form_has_clipboard_zones_for_cover_and_step_images(self):
         self.client.force_login(self.user)
@@ -72,6 +87,13 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("recipe-list"), {"q": "сливки"})
         self.assertContains(response, "Семейная паста")
 
+    def test_fuzzy_query_keeps_candidates_for_client_side_filtering(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "слвк"})
+
+        self.assertContains(response, "Семейная паста")
+
     def test_recipe_list_filters_by_category(self):
         soup_category = Category.objects.get(slug="soup")
         salad_category = Category.objects.get(slug="salad")
@@ -84,6 +106,17 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "Семейная паста")
         self.assertNotContains(response, "Овощной салат")
         self.assertContains(response, "Суп")
+
+    def test_recipe_list_filters_by_author(self):
+        other = get_user_model().objects.create_user(username="guest")
+        other_recipe = Recipe.objects.create(title="Чужой пирог", created_by=other)
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"author": self.user.pk})
+
+        self.assertContains(response, self.recipe.title)
+        self.assertNotContains(response, other_recipe.title)
+        self.assertContains(response, self.user.username)
 
     def test_invalid_servings_falls_back_to_recipe_servings(self):
         self.client.force_login(self.user)
@@ -129,6 +162,8 @@ class RecipeViewTests(TestCase):
         self.assertRedirects(response, created.get_absolute_url())
         self.assertEqual(created.ingredients.count(), 1)
         self.assertEqual(created.steps.count(), 1)
+        self.assertEqual(str(created.calories_per_serving), "96.2")
+        self.assertEqual(str(created.calories_per_100g), "77.0")
 
     def test_draft_is_hidden_until_published(self):
         draft = Recipe.objects.create(
@@ -154,13 +189,36 @@ class RecipeViewTests(TestCase):
         self.client.force_login(self.user)
         response = self.client.post(
             reverse("import-create"),
-            {"source_url": "https://youtu.be/dQw4w9WgXcQ"},
+            {
+                "source_url": "https://youtu.be/dQw4w9WgXcQ",
+                "custom_prompt": "Сохрани острые ингредиенты",
+            },
         )
         job = ImportJob.objects.get()
         self.assertRedirects(response, reverse("import-detail", args=[job.pk]))
         self.assertEqual(job.source_type, ImportJob.SourceType.YOUTUBE)
         self.assertEqual(job.status, ImportJob.Status.PENDING)
         self.assertEqual(job.requested_by, self.user)
+        self.assertEqual(job.custom_prompt, "Сохрани острые ингредиенты")
+
+    def test_task_list_shows_current_users_imports_and_carts(self):
+        other = get_user_model().objects.create_user(username="guest")
+        own_job = ImportJob.objects.create(
+            source_url="https://example.com/own",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=self.user,
+        )
+        ImportJob.objects.create(
+            source_url="https://example.com/other",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=other,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("task-list"))
+
+        self.assertContains(response, reverse("import-detail", args=[own_job.pk]))
+        self.assertNotContains(response, "https://example.com/other")
 
     def test_completed_draft_can_be_queued_for_reprocessing(self):
         draft = Recipe.objects.create(

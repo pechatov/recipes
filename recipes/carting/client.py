@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -110,11 +111,16 @@ def _chat_url(base_url: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
-def cart_browser_session_key(user_id: int) -> str:
+def cart_browser_session_key(user_id: int, shard: int | None = None) -> str:
     """Return the stable, non-PII browser scope for a recipe-site user."""
     if not isinstance(user_id, int) or user_id < 1:
         raise ValueError("user_id must be a positive integer")
-    return f"recipes-cart-user-{user_id}"
+    key = f"recipes-cart-user-{user_id}"
+    if shard is None:
+        return key
+    if not isinstance(shard, int) or not 1 <= shard <= 5:
+        raise ValueError("shard must be an integer between 1 and 5")
+    return f"{key}-shard-{shard}"
 
 
 def _extract_json(content: Any) -> dict[str, Any]:
@@ -141,6 +147,10 @@ def run_store_cart_task(
     *,
     added_items: list[dict[str, Any]] | None = None,
     cart_url: str = "",
+    ingredients: list[dict[str, Any]] | None = None,
+    session_shard: int | None = None,
+    total_shards: int | None = None,
+    cleanup_missing_threshold: int | None = None,
 ) -> dict[str, Any]:
     if not settings.CART_AI_BASE_URL or not settings.CART_AI_MODEL:
         raise CartAgentError("Браузерный агент для корзин ещё не подключён.")
@@ -161,20 +171,35 @@ def run_store_cart_task(
         system_prompt = CLEANUP_PROMPT
         instruction = "Удали только добавления из следующего журнала."
     else:
+        ingredient_snapshot = (
+            ingredients if ingredients is not None else run.ingredient_snapshot
+        )
         task.update(
             {
-                "ingredients": run.ingredient_snapshot,
-                "cleanup_missing_threshold": max(
-                    2,
-                    math.ceil(len(run.ingredient_snapshot) * 0.25),
+                "ingredients": ingredient_snapshot,
+                "cleanup_missing_threshold": (
+                    cleanup_missing_threshold
+                    if cleanup_missing_threshold is not None
+                    else max(2, math.ceil(len(ingredient_snapshot) * 0.25))
                 ),
             }
         )
+        if session_shard is not None:
+            task["parallel_shard"] = {
+                "index": session_shard,
+                "count": total_shards,
+            }
         system_prompt = ASSEMBLE_PROMPT
         instruction = (
             "Собери корзину за один проход: для каждого ингредиента сразу "
             "добавляй рассчитанное количество."
         )
+        if session_shard is not None:
+            instruction += (
+                " Другие независимые агенты одновременно работают с той же "
+                "серверной корзиной; обрабатывай только переданные тебе "
+                "ингредиенты и не изменяй остальные позиции."
+            )
     messages = [
         {"role": "system", "content": system_prompt},
         {
@@ -184,7 +209,10 @@ def run_store_cart_task(
     ]
     headers = {
         "Content-Type": "application/json",
-        "X-Hermes-Session-Key": cart_browser_session_key(run.requested_by_id),
+        "X-Hermes-Session-Key": cart_browser_session_key(
+            run.requested_by_id,
+            session_shard,
+        ),
     }
     if settings.CART_AI_API_KEY:
         headers["Authorization"] = f"Bearer {settings.CART_AI_API_KEY}"
@@ -222,8 +250,194 @@ def run_store_cart_task(
         ) from error
 
 
+def _parallel_agent_limit() -> int:
+    try:
+        configured = int(getattr(settings, "CART_MAX_PARALLEL_AGENTS", 5))
+    except (TypeError, ValueError):
+        configured = 5
+    return max(1, min(configured, 5))
+
+
+def _ingredient_shards(
+    ingredients: list[dict[str, Any]],
+    maximum: int,
+) -> list[list[dict[str, Any]]]:
+    """Balance ingredients without splitting exact duplicate search terms."""
+    groups: list[list[dict[str, Any]]] = []
+    group_indexes: dict[str, int] = {}
+    for index, ingredient in enumerate(ingredients):
+        if isinstance(ingredient, dict):
+            group_key = str(
+                ingredient.get("search_query") or ingredient.get("name") or ""
+            ).strip().casefold()
+        else:
+            group_key = ""
+        # Invalid/unnamed entries stay isolated so one cannot collapse the
+        # worker count or affect another ingredient's response matching.
+        if not group_key:
+            group_key = f"__ingredient_{index}"
+        if group_key not in group_indexes:
+            group_indexes[group_key] = len(groups)
+            groups.append([])
+        groups[group_indexes[group_key]].append(ingredient)
+
+    worker_count = min(maximum, len(ingredients), len(groups))
+    if worker_count < 1:
+        return []
+    shards: list[list[dict[str, Any]]] = [[] for _ in range(worker_count)]
+    for group in sorted(groups, key=len, reverse=True):
+        smallest = min(range(worker_count), key=lambda item: len(shards[item]))
+        shards[smallest].extend(group)
+    return shards
+
+
+def _merge_shard_results(
+    shards: list[list[dict[str, Any]]],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    statuses = []
+    items = []
+    summaries = []
+    cart_urls = []
+    all_cleared = True
+    mutation_unknown = False
+
+    for index, (ingredients, result) in enumerate(zip(shards, results), start=1):
+        if not isinstance(result, dict):
+            raise CartAgentError(
+                "Один из агентов вернул результат в неожиданном формате.",
+                mutation_possible=True,
+            )
+        status = str(result.get("status") or "").strip()
+        statuses.append(status)
+        summary = str(result.get("summary") or "").strip()
+        if summary:
+            summaries.append(f"{index}/{len(shards)}: {summary}")
+        cart_url = result.get("cart_url")
+        if isinstance(cart_url, str) and cart_url.strip():
+            cart_urls.append(cart_url.strip())
+        all_cleared = all_cleared and result.get("cart_cleared") is True
+        mutation_unknown = (
+            mutation_unknown or result.get("mutation_unknown") is True
+        )
+
+        allowed_names = {
+            str(item.get("name") or "").strip().casefold()
+            for item in ingredients
+            if isinstance(item, dict)
+        }
+        reported_items = result.get("items")
+        if isinstance(reported_items, list):
+            items.extend(
+                item
+                for item in reported_items
+                if isinstance(item, dict)
+                and str(item.get("ingredient_name") or "").strip().casefold()
+                in allowed_names
+            )
+
+    if mutation_unknown or any(
+        status not in {
+            "exact",
+            "substitutions",
+            "incomplete",
+            "login_required",
+            "blocked",
+        }
+        for status in statuses
+    ):
+        status = "failed"
+    elif any(status == "blocked" for status in statuses):
+        status = "blocked"
+    elif any(status == "login_required" for status in statuses):
+        status = "login_required"
+    elif any(status == "incomplete" for status in statuses):
+        status = "incomplete"
+    elif any(status == "substitutions" for status in statuses):
+        status = "substitutions"
+    else:
+        status = "exact"
+
+    return {
+        "status": status,
+        "cart_url": cart_urls[0] if cart_urls else "",
+        "summary": "; ".join(summaries),
+        "cart_cleared": all_cleared,
+        "items": items,
+        "shard_count": len(shards),
+    }
+
+
 def assemble_store_cart(run, store: str) -> dict[str, Any]:
-    return run_store_cart_task(run, store, "assemble")
+    ingredients = run.ingredient_snapshot
+    if not isinstance(ingredients, list) or not ingredients:
+        return {
+            "status": "incomplete",
+            "cart_url": "",
+            "summary": "Для сборки не выбраны ингредиенты.",
+            "cart_cleared": True,
+            "items": [],
+        }
+
+    shards = _ingredient_shards(ingredients, _parallel_agent_limit())
+    if len(shards) == 1:
+        return run_store_cart_task(run, store, "assemble")
+
+    # Load lazy model attributes before entering worker threads. Each worker
+    # then only performs its own isolated HTTP/browser request.
+    run.recipe.title
+    run.requested_by_id
+    run.servings
+    # Routine threshold cleanup is deliberately disabled in shards. The
+    # pipeline evaluates the combined result and, when needed, performs one
+    # sequential cleanup against the shared server-side cart.
+    no_shard_cleanup_threshold = len(ingredients) + 1
+    results: list[dict[str, Any] | None] = [None] * len(shards)
+    errors: list[Exception] = []
+    futures = []
+    try:
+        with ThreadPoolExecutor(
+            max_workers=len(shards),
+            thread_name_prefix="cart-shard",
+        ) as executor:
+            for index, shard in enumerate(shards, start=1):
+                futures.append(
+                    executor.submit(
+                        run_store_cart_task,
+                        run,
+                        store,
+                        "assemble",
+                        ingredients=shard,
+                        session_shard=index,
+                        total_shards=len(shards),
+                        cleanup_missing_threshold=no_shard_cleanup_threshold,
+                    )
+                )
+            for index, future in enumerate(futures):
+                try:
+                    results[index] = future.result()
+                except Exception as error:  # wait for every mutating shard
+                    errors.append(error)
+    except Exception as error:
+        raise CartAgentError(
+            "Не удалось безопасно запустить параллельную сборку.",
+            mutation_possible=bool(futures),
+        ) from error
+
+    if errors:
+        raise CartAgentError(
+            "Не все параллельные агенты завершили сборку. Проверьте корзину "
+            "вручную перед повтором.",
+            mutation_possible=True,
+        ) from errors[0]
+    merged = _merge_shard_results(shards, results)  # type: ignore[arg-type]
+    if merged["status"] == "failed":
+        raise CartAgentError(
+            "Один из параллельных агентов не смог подтвердить результат. "
+            "Проверьте корзину вручную перед повтором.",
+            mutation_possible=True,
+        )
+    return merged
 
 
 def cleanup_store_cart(

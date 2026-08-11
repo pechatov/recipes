@@ -43,9 +43,9 @@
       {% for section in item_sections %}
         {% if section.grouper %}<li class="shopping-section-title">{{ section.grouper }}</li>{% endif %}
         {% for item in section.list %}
-          <li class="shopping-item{% if item.ingredient.optional %} optional{% endif %}" data-shopping-item>
+          {% if not item.ingredient.is_water %}<li class="shopping-item{% if item.ingredient.optional %} optional{% endif %}{% if item.ingredient.is_pantry %} pantry{% endif %}" data-shopping-item>
             <label class="shopping-check">
-              <input type="checkbox" name="ingredients" value="{{ item.ingredient.pk }}" checked data-item-checkbox>
+              <input type="checkbox" name="ingredients" value="{{ item.ingredient.pk }}"{% if not item.ingredient.is_pantry %} checked{% endif %} data-item-checkbox>
               <span></span>
             </label>
             <div class="shopping-description" data-item-text="{% if item.ingredient.estimated %}≈ {% endif %}{% if item.quantity != None %}{{ item.display_quantity }} {{ item.ingredient.unit }} {% endif %}{{ item.ingredient.name }}">
@@ -54,14 +54,15 @@
                 {% if item.ingredient.estimated %}≈{% endif %}
                 {% if item.quantity != None %}{{ item.display_quantity }} {{ item.ingredient.unit }}{% endif %}
                 {% if item.ingredient.optional %} · по желанию{% endif %}
+                {% if item.ingredient.is_pantry %} · обычно есть дома{% endif %}
               </span>
             </div>
             <a class="button search-button" href="{{ item.search_url }}" target="_blank" rel="noopener noreferrer">Найти в Лавке ↗</a>
-          </li>
+          </li>{% endif %}
         {% endfor %}
       {% endfor %}
     </ul>
-    <p class="shopping-note">Снимите галочки с продуктов, которые уже есть дома. Агент никогда не трогает прежние товары, не оформляет заказ и не подтверждает оплату. Любые сомнительные замены будут выделены отдельно.</p>
+    <p class="shopping-note">Приправы, специи и прочее по умолчанию выключены. Отметьте их, если запасы нужно пополнить. Агент не оформляет заказ и не подтверждает оплату.</p>
   </form>
   <div class="toast" role="status" aria-live="polite" data-toast>Список скопирован</div>
 {% endblock %}

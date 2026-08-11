@@ -31,7 +31,7 @@ class StepInline(admin.StackedInline):
 
 @admin.register(Recipe)
 class RecipeAdmin(admin.ModelAdmin):
-    list_display = ("title", "status", "servings", "updated_at")
+    list_display = ("title", "status", "created_by", "servings", "updated_at")
     list_filter = ("status", "categories")
     search_fields = ("title", "description", "ingredients__name")
     readonly_fields = ("created_at", "updated_at")

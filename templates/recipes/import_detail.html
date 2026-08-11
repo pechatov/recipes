@@ -14,15 +14,31 @@
       <p class="eyebrow">Обрабатываем источник</p>
       <h1>Составляем рецепт</h1>
       <p class="lead">Извлекаем материал, отделяем рецепт от лишнего текста и приводим его к формату вашей книги.</p>
-    {% elif job.status == "completed" and job.recipe %}
-      <div class="status-orb is-done">✓</div>
-      <p class="eyebrow">Черновик готов</p>
-      <h1>{{ job.recipe.title }}</h1>
-      <p class="lead">Проверьте количества и шаги, при желании добавьте фотографии, затем опубликуйте.</p>
-      <div class="action-row centered-actions">
-        <a class="button" href="{{ job.recipe.get_absolute_url }}">Открыть черновик</a>
-        <a class="button button-secondary" href="{% url 'recipe-update' job.recipe.slug %}">Сразу редактировать</a>
-      </div>
+    {% elif job.status == "completed" %}
+      {% with imported_recipes=job.recipes.all %}
+        <div class="status-orb is-done">✓</div>
+        <p class="eyebrow">Импорт завершён</p>
+        <h1>{% if imported_recipes|length == 1 %}Черновик готов{% else %}Готово черновиков: {{ imported_recipes|length }}{% endif %}</h1>
+        <p class="lead">Мы разделили самостоятельные блюда на отдельные рецепты. Проверьте каждый черновик перед публикацией.</p>
+        {% if imported_recipes %}
+          <div class="imported-recipes">
+            {% for recipe in imported_recipes %}
+              <article class="imported-recipe">
+                <div>
+                  <strong>{{ recipe.title }}</strong>
+                  <span>{{ recipe.ingredients.count }} ингредиентов · {{ recipe.steps.count }} шагов</span>
+                </div>
+                <div class="action-row">
+                  <a class="button button-small" href="{{ recipe.get_absolute_url }}">Открыть</a>
+                  <a class="button button-small button-secondary" href="{% url 'recipe-update' recipe.slug %}">Редактировать</a>
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="muted">Импорт завершён, но черновики не созданы.</p>
+        {% endif %}
+      {% endwith %}
       <form class="reprocess-form" method="post" action="{% url 'import-reprocess' job.pk %}">
         {% csrf_token %}
         <button class="link-button reprocess-link" type="submit">Заново обработать источник</button>

@@ -28,6 +28,19 @@ class SourceDocument:
     title: str
     text: str
     structured_recipe: dict[str, Any] | None = None
+    structured_recipes: tuple[dict[str, Any], ...] = ()
+    cover_image_urls: tuple[str, ...] = ()
+    step_image_urls: tuple[str, ...] = ()
+    recipe_cover_image_urls: tuple[tuple[str, ...], ...] = ()
+    recipe_step_image_urls: tuple[tuple[str, ...], ...] = ()
+
+    @property
+    def all_structured_recipes(self) -> tuple[dict[str, Any], ...]:
+        """Return every JSON-LD recipe while retaining the legacy singular field."""
+        recipes = list(self.structured_recipes)
+        if self.structured_recipe and self.structured_recipe not in recipes:
+            recipes.insert(0, self.structured_recipe)
+        return tuple(recipes)
 
 
 def youtube_video_id(url: str) -> str | None:
@@ -104,45 +117,159 @@ def _download_html(url: str) -> tuple[str, str]:
                     encoding = response.encoding or "utf-8"
                     return b"".join(chunks).decode(encoding, errors="replace"), str(response.url)
             except httpx.HTTPStatusError as error:
-                raise SourceError(f"Сайт вернул ошибку HTTP {error.response.status_code}.") from error
+                raise SourceError(
+                    f"Сайт вернул ошибку HTTP {error.response.status_code}."
+                ) from error
             except httpx.HTTPError as error:
                 raise SourceError("Не удалось загрузить страницу с рецептом.") from error
     raise SourceError("Сайт перенаправляет запрос слишком много раз.")
 
 
-def _find_recipe_json(value: Any) -> dict[str, Any] | None:
+def _find_recipe_jsons(value: Any) -> list[dict[str, Any]]:
+    recipes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         recipe_type = value.get("@type")
         types = recipe_type if isinstance(recipe_type, list) else [recipe_type]
         if any(str(item).lower() == "recipe" for item in types):
-            return value
+            recipes.append(value)
+            return recipes
         for nested in value.values():
-            result = _find_recipe_json(nested)
-            if result:
-                return result
+            recipes.extend(_find_recipe_jsons(nested))
     elif isinstance(value, list):
         for nested in value:
-            result = _find_recipe_json(nested)
-            if result:
-                return result
-    return None
+            recipes.extend(_find_recipe_jsons(nested))
+    return recipes
 
 
-def _structured_recipe(soup: BeautifulSoup) -> dict[str, Any] | None:
+def _find_recipe_json(value: Any) -> dict[str, Any] | None:
+    recipes = _find_recipe_jsons(value)
+    return recipes[0] if recipes else None
+
+
+def _structured_recipes(soup: BeautifulSoup) -> list[dict[str, Any]]:
+    recipes: list[dict[str, Any]] = []
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             value = json.loads(script.string or script.get_text())
         except (json.JSONDecodeError, TypeError):
             continue
-        recipe = _find_recipe_json(value)
-        if recipe:
-            return recipe
-    return None
+        for recipe in _find_recipe_jsons(value):
+            if recipe not in recipes:
+                recipes.append(recipe)
+    return recipes
+
+
+def _structured_recipe(soup: BeautifulSoup) -> dict[str, Any] | None:
+    recipes = _structured_recipes(soup)
+    return recipes[0] if recipes else None
+
+
+def _absolute_image_url(value: Any, base_url: str) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("contentUrl")
+    value = str(value or "").strip()
+    if not value or value.startswith("data:"):
+        return None
+    candidate = urljoin(base_url, value)
+    parsed = urlsplit(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    return candidate[:2048]
+
+
+def _schema_image_urls(value: Any, base_url: str) -> list[str]:
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            result.extend(_schema_image_urls(item, base_url))
+        return result
+    url = _absolute_image_url(value, base_url)
+    return [url] if url else []
+
+
+def _source_images(
+    soup: BeautifulSoup,
+    recipes: list[dict[str, Any]],
+    base_url: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    cover_candidates: list[str] = []
+    step_candidates: list[str] = []
+
+    def append_instruction_images(instructions: Any) -> None:
+        if not isinstance(instructions, list):
+            instructions = [instructions]
+        for instruction in instructions:
+            if not isinstance(instruction, dict):
+                continue
+            step_candidates.extend(_schema_image_urls(instruction.get("image"), base_url))
+            append_instruction_images(instruction.get("itemListElement", []))
+
+    for recipe in recipes:
+        cover_candidates.extend(_schema_image_urls(recipe.get("image"), base_url))
+        append_instruction_images(recipe.get("recipeInstructions", []))
+
+    for selector, attribute in (
+        ('meta[property="og:image"]', "content"),
+        ('meta[name="twitter:image"]', "content"),
+        ('link[rel="image_src"]', "href"),
+    ):
+        element = soup.select_one(selector)
+        if element:
+            url = _absolute_image_url(element.get(attribute), base_url)
+            if url:
+                cover_candidates.append(url)
+
+    scored_images: list[tuple[int, str]] = []
+    for image in soup.select("main img, article img"):
+        raw_url = (
+            image.get("src")
+            or image.get("data-src")
+            or image.get("data-lazy-src")
+            or image.get("data-original")
+        )
+        url = _absolute_image_url(raw_url, base_url)
+        if not url:
+            continue
+        try:
+            width = int(str(image.get("width") or "0").rstrip("px"))
+            height = int(str(image.get("height") or "0").rstrip("px"))
+        except ValueError:
+            width = height = 0
+        scored_images.append((width * height, url))
+    for _, url in sorted(scored_images, reverse=True):
+        cover_candidates.append(url)
+        step_candidates.append(url)
+
+    def unique(values: list[str], limit: int) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(values))[:limit]
+
+    return unique(cover_candidates, 12), unique(step_candidates, 30)
+
+
+def _structured_step_image_slots(value: Any, base_url: str) -> tuple[str, ...]:
+    """Keep an image slot for each structured step so positions are not lost."""
+    values = value if isinstance(value, list) else [value]
+    slots: list[str] = []
+    for item in values:
+        if not isinstance(item, dict):
+            slots.append("")
+            continue
+        item_type = str(item.get("@type") or "").lower()
+        if item_type == "howtosection":
+            slots.extend(
+                _structured_step_image_slots(item.get("itemListElement", []), base_url)
+            )
+            continue
+        urls = _schema_image_urls(item.get("image"), base_url)
+        slots.append(urls[0] if urls else "")
+    return tuple(slots)
 
 
 def extract_website(url: str) -> SourceDocument:
-    html, _ = _download_html(url)
+    html, final_url = _download_html(url)
     soup = BeautifulSoup(html, "html.parser")
+    recipes = _structured_recipes(soup)
+    cover_image_urls, step_image_urls = _source_images(soup, recipes, final_url)
     for element in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
         element.decompose()
     title = ""
@@ -158,7 +285,23 @@ def extract_website(url: str) -> SourceDocument:
     )[:MAX_SOURCE_CHARS]
     if len(text) < 80:
         raise SourceError("На странице недостаточно текста, чтобы составить рецепт.")
-    return SourceDocument("website", title[:300], text, _structured_recipe(BeautifulSoup(html, "html.parser")))
+    return SourceDocument(
+        source_type="website",
+        title=title[:300],
+        text=text,
+        structured_recipe=recipes[0] if recipes else None,
+        structured_recipes=tuple(recipes),
+        cover_image_urls=cover_image_urls,
+        step_image_urls=step_image_urls,
+        recipe_cover_image_urls=tuple(
+            tuple(_schema_image_urls(recipe.get("image"), final_url))
+            for recipe in recipes
+        ),
+        recipe_step_image_urls=tuple(
+            _structured_step_image_slots(recipe.get("recipeInstructions", []), final_url)
+            for recipe in recipes
+        ),
+    )
 
 
 def extract_youtube(url: str) -> SourceDocument:
@@ -175,7 +318,15 @@ def extract_youtube(url: str) -> SourceDocument:
     text = " ".join(snippet.text.strip() for snippet in transcript if snippet.text.strip())
     if len(text) < 80:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
-    return SourceDocument("youtube", f"YouTube {video_id}", text[:MAX_SOURCE_CHARS])
+    return SourceDocument(
+        "youtube",
+        f"YouTube {video_id}",
+        text[:MAX_SOURCE_CHARS],
+        cover_image_urls=(
+            f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        ),
+    )
 
 
 def extract_source(url: str) -> SourceDocument:

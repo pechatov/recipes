@@ -16,6 +16,10 @@
     </a>
     {% if user.is_authenticated %}
       <nav class="site-nav" aria-label="Основная навигация">
+        <a href="{% url 'task-list' %}" class="nav-link tasks-nav-link">
+          Задачи
+          {% if active_task_count %}<span class="task-count" aria-label="Активных задач: {{ active_task_count }}">{{ active_task_count }}</span>{% endif %}
+        </a>
         <a href="{% url 'draft-list' %}" class="nav-link">Черновики</a>
         <a href="{% url 'import-create' %}" class="button button-small">Импортировать</a>
         <a href="{% url 'recipe-create' %}" class="nav-link">Добавить вручную</a>

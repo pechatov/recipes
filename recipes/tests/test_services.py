@@ -42,3 +42,19 @@ class ShoppingServiceTests(TestCase):
 
         self.assertIsNone(item.quantity)
         self.assertEqual(item.display_quantity, "")
+
+    def test_plain_water_is_not_a_shopping_item(self):
+        RecipeIngredient.objects.create(
+            recipe=self.recipe,
+            name="Горячая вода",
+            quantity=Decimal("500"),
+            unit="мл",
+        )
+        RecipeIngredient.objects.create(
+            recipe=self.recipe,
+            name="Лёд в кубиках",
+            quantity=Decimal("6"),
+            unit="шт.",
+        )
+
+        self.assertEqual(build_shopping_items(self.recipe, servings=2), [])

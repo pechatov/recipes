@@ -11,6 +11,7 @@
   </div>
   <div class="ingredient-flags">
     {% include "recipes/_form_field.html" with field=ingredient.optional %}
+    {% include "recipes/_form_field.html" with field=ingredient.is_pantry %}
     {% include "recipes/_form_field.html" with field=ingredient.estimated %}
   </div>
   {% if ingredient.DELETE %}

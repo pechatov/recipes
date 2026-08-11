@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load static %}
 {% block title %}Домашние рецепты{% endblock %}
 {% block content %}
   <section class="hero compact-hero">
@@ -6,44 +7,61 @@
       <p class="eyebrow">Наша семейная коллекция</p>
       <h1>Что приготовим?</h1>
     </div>
-    <form class="search-form" role="search">
-      <label class="sr-only" for="recipe-search">Поиск рецептов</label>
-      <input id="recipe-search" type="search" name="q" value="{{ query }}" placeholder="Блюдо или ингредиент">
+    <form class="search-form" role="search" data-recipe-filters>
+      <div class="search-field">
+        <label class="sr-only" for="recipe-search">Поиск рецептов</label>
+        <input id="recipe-search" type="search" name="q" value="{{ query }}" placeholder="Блюдо или ингредиент" autocomplete="off" data-recipe-search>
+        <span class="search-hint" aria-hidden="true">фильтр сразу</span>
+      </div>
+      <label class="author-filter">
+        <span class="sr-only">Автор рецепта</span>
+        <select name="author" aria-label="Автор рецепта" data-author-filter>
+          <option value="">Все авторы</option>
+          {% for author in authors %}
+            <option value="{{ author.pk }}"{% if selected_author == author.pk|stringformat:"s" %} selected{% endif %}>{% firstof author.get_full_name author.username %}</option>
+          {% endfor %}
+        </select>
+      </label>
       {% if selected_category %}<input type="hidden" name="category" value="{{ selected_category }}">{% endif %}
-      <button class="button" type="submit">Найти</button>
     </form>
   </section>
 
   <nav class="category-filters" aria-label="Категории рецептов">
-    <a href="{% url 'recipe-list' %}{% if query %}?q={{ query|urlencode }}{% endif %}"{% if not selected_category %} class="is-active"{% endif %}>Все</a>
+    <a href="{% url 'recipe-list' %}?{% if query %}q={{ query|urlencode }}&amp;{% endif %}{% if selected_author %}author={{ selected_author|urlencode }}{% endif %}"{% if not selected_category %} class="is-active"{% endif %}>Все</a>
     {% for category in categories %}
-      <a href="{% url 'recipe-list' %}?category={{ category.slug }}{% if query %}&amp;q={{ query|urlencode }}{% endif %}"{% if selected_category == category.slug %} class="is-active"{% endif %}>{{ category.name }}</a>
+      <a href="{% url 'recipe-list' %}?category={{ category.slug }}{% if query %}&amp;q={{ query|urlencode }}{% endif %}{% if selected_author %}&amp;author={{ selected_author|urlencode }}{% endif %}"{% if selected_category == category.slug %} class="is-active"{% endif %}>{{ category.name }}</a>
     {% endfor %}
   </nav>
 
   {% if recipes %}
-    <div class="recipe-grid">
+    <div class="recipe-grid" data-recipe-grid>
       {% for recipe in recipes %}
-        <article class="recipe-card">
-          <a href="{{ recipe.get_absolute_url }}" class="recipe-card-image">
+        <article class="recipe-card" data-recipe-card data-search-text="{{ recipe.title }} {{ recipe.description }} {% firstof recipe.created_by.get_full_name recipe.created_by.username %} {% for category in recipe.categories.all %}{{ category.name }} {% endfor %}{% for ingredient in recipe.ingredients.all %}{{ ingredient.name }} {% endfor %}">
+          <a href="{{ recipe.get_absolute_url }}" class="recipe-card-link" aria-label="Открыть рецепт «{{ recipe.title }}»"></a>
+          <div class="recipe-card-image">
             {% if recipe.cover %}
               <img src="{{ recipe.cover.url }}" alt="{{ recipe.title }}">
             {% else %}
               <span class="image-placeholder">{{ recipe.title|first }}</span>
             {% endif %}
-          </a>
+          </div>
           <div class="recipe-card-body">
             {% if recipe.categories.all %}
               <div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}</div>
             {% endif %}
             <p class="recipe-meta">{{ recipe.servings }} порц. · {{ recipe.total_minutes }} мин.</p>
-            <h2><a href="{{ recipe.get_absolute_url }}">{{ recipe.title }}</a></h2>
+            <h2>{{ recipe.title }}</h2>
             {% if recipe.description %}<p>{{ recipe.description|truncatewords:20 }}</p>{% endif %}
+            <p class="recipe-author">Добавил: {% firstof recipe.created_by.get_full_name recipe.created_by.username "неизвестный автор" %}</p>
             <a class="text-link" href="{% url 'shopping-list' recipe.slug %}">Список покупок →</a>
           </div>
         </article>
       {% endfor %}
     </div>
+    <section class="empty-state live-empty" hidden data-live-empty>
+      <h2>Совпадений нет</h2>
+      <p>Измените запрос — карточки появятся сразу.</p>
+    </section>
   {% else %}
     <section class="empty-state">
       <div class="empty-icon">＋</div>
@@ -61,3 +79,4 @@
     </section>
   {% endif %}
 {% endblock %}
+{% block scripts %}<script src="{% static 'recipes/recipe-list.js' %}" defer></script>{% endblock %}

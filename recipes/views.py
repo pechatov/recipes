@@ -18,6 +18,7 @@ from django.views.decorators.http import require_http_methods, require_POST
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
 from .importing.extractors import detect_source_type
+from .importing.normalizer import estimate_calories
 from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePreference
 from .services import build_shopping_items, get_store_preferences
 
@@ -54,20 +55,16 @@ def setup_owner(request):
 def recipe_list(request):
     query = request.GET.get("q", "").strip()
     selected_category = request.GET.get("category", "").strip()
-    recipes = Recipe.objects.filter(status=Recipe.Status.PUBLISHED).prefetch_related(
-        "ingredients", "categories"
+    selected_author = request.GET.get("author", "").strip()
+    recipes = (
+        Recipe.objects.filter(status=Recipe.Status.PUBLISHED)
+        .select_related("created_by")
+        .prefetch_related("ingredients", "categories")
     )
     if selected_category:
         recipes = recipes.filter(categories__slug=selected_category)
-    if query:
-        text_query = Q()
-        for variant in {query, query.lower(), query.upper(), query.capitalize()}:
-            text_query |= (
-                Q(title__contains=variant)
-                | Q(description__contains=variant)
-                | Q(ingredients__name__contains=variant)
-            )
-        recipes = recipes.filter(text_query).distinct()
+    if selected_author.isdigit():
+        recipes = recipes.filter(created_by_id=selected_author)
     return render(
         request,
         "recipes/recipe_list.html",
@@ -76,6 +73,11 @@ def recipe_list(request):
             "query": query,
             "categories": Category.objects.all(),
             "selected_category": selected_category,
+            "authors": get_user_model()
+            .objects.filter(created_recipes__status=Recipe.Status.PUBLISHED)
+            .distinct()
+            .order_by("username"),
+            "selected_author": selected_author,
         },
     )
 
@@ -92,10 +94,69 @@ def draft_list(request):
 @login_required
 def recipe_detail(request, slug):
     recipe = get_object_or_404(
-        Recipe.objects.prefetch_related("ingredients", "steps"),
+        Recipe.objects.select_related("created_by").prefetch_related(
+            "ingredients", "steps", "import_jobs"
+        ),
         slug=slug,
     )
-    return render(request, "recipes/recipe_detail.html", {"recipe": recipe})
+    ingredients = [ingredient for ingredient in recipe.ingredients.all() if not ingredient.is_water]
+    _fill_missing_recipe_calories(recipe, ingredients, save=False)
+    import_job = getattr(recipe, "import_job", None) or next(
+        iter(recipe.import_jobs.all()), None
+    )
+    return render(
+        request,
+        "recipes/recipe_detail.html",
+        {
+            "recipe": recipe,
+            "main_ingredients": [item for item in ingredients if not item.is_pantry],
+            "pantry_ingredients": [item for item in ingredients if item.is_pantry],
+            "source_import_job": import_job,
+        },
+    )
+
+
+def _fill_missing_recipe_calories(
+    recipe,
+    ingredients=None,
+    *,
+    save: bool,
+    overwrite: bool = False,
+    preserve_fields: set[str] | None = None,
+) -> None:
+    preserve_fields = preserve_fields or set()
+    if (
+        not overwrite
+        and recipe.calories_per_serving is not None
+        and recipe.calories_per_100g is not None
+    ):
+        return
+    ingredients = list(ingredients if ingredients is not None else recipe.ingredients.all())
+    per_serving, per_100g = estimate_calories(
+        [
+            {
+                "name": ingredient.name,
+                "quantity": (
+                    str(ingredient.quantity) if ingredient.quantity is not None else None
+                ),
+                "unit": ingredient.unit,
+            }
+            for ingredient in ingredients
+        ],
+        recipe.servings,
+    )
+    changed = []
+    for field, value in (
+        ("calories_per_serving", per_serving),
+        ("calories_per_100g", per_100g),
+    ):
+        if field in preserve_fields:
+            continue
+        if overwrite or getattr(recipe, field) is None:
+            setattr(recipe, field, value)
+            changed.append(field)
+    if save and changed:
+        recipe.save(update_fields=changed + ["updated_at"])
 
 
 def _recipe_form_context(request, instance=None):
@@ -130,6 +191,7 @@ def recipe_create(request):
             ingredient_formset.save()
             step_formset.instance = recipe
             step_formset.save()
+            _fill_missing_recipe_calories(recipe, save=True)
         messages.success(request, "Рецепт добавлен.")
         return redirect(recipe)
 
@@ -156,6 +218,14 @@ def recipe_update(request, slug):
             recipe = form.save()
             ingredient_formset.save()
             step_formset.save()
+            calorie_fields = {"calories_per_serving", "calories_per_100g"}
+            recalculate = "servings" in form.changed_data or ingredient_formset.has_changed()
+            _fill_missing_recipe_calories(
+                recipe,
+                save=True,
+                overwrite=recalculate,
+                preserve_fields=calorie_fields.intersection(form.changed_data),
+            )
         messages.success(request, "Изменения сохранены.")
         return redirect(recipe)
 
@@ -198,7 +268,10 @@ def import_create(request):
 
 @login_required
 def import_detail(request, pk):
-    job = get_object_or_404(ImportJob.objects.select_related("recipe"), pk=pk)
+    job = get_object_or_404(
+        ImportJob.objects.select_related("recipe").prefetch_related("recipes"),
+        pk=pk,
+    )
     return render(request, "recipes/import_detail.html", {"job": job})
 
 
@@ -219,11 +292,16 @@ def import_retry(request, pk):
 @require_POST
 def import_reprocess(request, pk):
     job = get_object_or_404(
-        ImportJob.objects.select_related("recipe"),
+        ImportJob.objects.select_related("recipe").prefetch_related("recipes"),
         pk=pk,
         status=ImportJob.Status.COMPLETED,
-        recipe__status=Recipe.Status.DRAFT,
     )
+    drafts = list(job.recipes.filter(status=Recipe.Status.DRAFT))
+    if job.recipe and job.recipe.status == Recipe.Status.DRAFT and job.recipe not in drafts:
+        drafts.append(job.recipe)
+    if not drafts:
+        messages.info(request, "У этого импорта не осталось черновиков для обновления.")
+        return redirect("import-detail", pk=job.pk)
     job.status = ImportJob.Status.PENDING
     job.error = ""
     job.started_at = None
@@ -231,6 +309,23 @@ def import_reprocess(request, pk):
     job.save(update_fields=["status", "error", "started_at", "finished_at"])
     messages.success(request, "Черновик поставлен на повторную обработку.")
     return redirect("import-detail", pk=job.pk)
+
+
+@login_required
+def task_list(request):
+    import_jobs = (
+        ImportJob.objects.filter(requested_by=request.user)
+        .select_related("recipe")
+        .prefetch_related("recipes")[:50]
+    )
+    cart_runs = CartRun.objects.filter(requested_by=request.user).select_related(
+        "recipe", "selected_attempt"
+    )[:50]
+    return render(
+        request,
+        "recipes/task_list.html",
+        {"import_jobs": import_jobs, "cart_runs": cart_runs},
+    )
 
 
 @login_required
@@ -340,6 +435,7 @@ def cart_start(request, slug):
             "unit": item.ingredient.unit,
             "search_query": item.ingredient.effective_search_query,
             "optional": item.ingredient.optional,
+            "is_pantry": item.ingredient.is_pantry,
         }
         for item in items
     ]

@@ -2,7 +2,7 @@ from unittest.mock import patch
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -15,7 +15,9 @@ from recipes.carting.pipeline import (
 from recipes.carting.client import (
     STORE_INSTRUCTIONS,
     CartAgentError,
+    assemble_store_cart,
     cart_browser_session_key,
+    cleanup_store_cart,
 )
 from recipes.models import (
     CartAttempt,
@@ -289,10 +291,190 @@ class CartPipelineTests(TestCase):
 
     def test_browser_session_key_is_stable_and_user_specific(self):
         self.assertEqual(cart_browser_session_key(self.user.pk), "recipes-cart-user-1")
+        self.assertEqual(
+            cart_browser_session_key(self.user.pk, 3),
+            "recipes-cart-user-1-shard-3",
+        )
         other_user = get_user_model().objects.create_user(username="other")
         self.assertNotEqual(
-            cart_browser_session_key(self.user.pk),
-            cart_browser_session_key(other_user.pk),
+            cart_browser_session_key(self.user.pk, 3),
+            cart_browser_session_key(other_user.pk, 3),
+        )
+
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_single_ingredient_keeps_legacy_agent_call(self, run_task):
+        run = self.make_run()
+        run_task.return_value = {"status": "exact", "items": []}
+
+        self.assertEqual(assemble_store_cart(run, "auchan"), run_task.return_value)
+
+        run_task.assert_called_once_with(run, "auchan", "assemble")
+
+    @override_settings(CART_MAX_PARALLEL_AGENTS=99)
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_parallel_assembly_uses_at_most_five_isolated_shards(self, run_task):
+        names = [f"Ингредиент {index}" for index in range(8)]
+        run = self.make_run()
+        run.ingredient_snapshot = [
+            {
+                "name": name,
+                "quantity": "1",
+                "unit": "шт.",
+                "search_query": name.casefold(),
+            }
+            for name in names
+        ]
+        run.save(update_fields=["ingredient_snapshot"])
+
+        def shard_result(_run, _store, _operation, **kwargs):
+            shard = kwargs["session_shard"]
+            return {
+                "status": "substitutions" if shard == 2 else "exact",
+                "cart_url": "https://eda.yandex.ru/cart",
+                "summary": f"Шард {shard} завершён",
+                "cart_cleared": False,
+                "items": [
+                    {
+                        "ingredient_name": ingredient["name"],
+                        "quality": "substitute" if shard == 2 else "exact",
+                        "package_count": 1,
+                    }
+                    for ingredient in kwargs["ingredients"]
+                ]
+                + [
+                    {
+                        "ingredient_name": "Чужой ингредиент",
+                        "quality": "exact",
+                        "package_count": 1,
+                    }
+                ],
+            }
+
+        run_task.side_effect = shard_result
+
+        result = assemble_store_cart(run, "auchan")
+
+        self.assertEqual(run_task.call_count, 5)
+        calls = run_task.call_args_list
+        self.assertEqual(
+            sorted(call.kwargs["session_shard"] for call in calls),
+            [1, 2, 3, 4, 5],
+        )
+        self.assertTrue(all(call.kwargs["total_shards"] == 5 for call in calls))
+        self.assertTrue(
+            all(call.kwargs["cleanup_missing_threshold"] == 9 for call in calls)
+        )
+        assigned_names = [
+            ingredient["name"]
+            for call in calls
+            for ingredient in call.kwargs["ingredients"]
+        ]
+        self.assertCountEqual(assigned_names, names)
+        self.assertEqual(len(assigned_names), len(set(assigned_names)))
+        self.assertEqual(result["status"], "substitutions")
+        self.assertEqual(result["shard_count"], 5)
+        self.assertFalse(result["cart_cleared"])
+        self.assertEqual(result["cart_url"], "https://eda.yandex.ru/cart")
+        self.assertCountEqual(
+            [item["ingredient_name"] for item in result["items"]],
+            names,
+        )
+        self.assertNotIn("Чужой ингредиент", repr(result["items"]))
+
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_parallel_worker_error_marks_mutation_as_unknown(self, run_task):
+        run = self.make_run()
+        run.ingredient_snapshot = [
+            {"name": f"Ингредиент {index}", "quantity": "1", "unit": "шт."}
+            for index in range(3)
+        ]
+        run.save(update_fields=["ingredient_snapshot"])
+
+        def shard_result(_run, _store, _operation, **kwargs):
+            if kwargs["session_shard"] == 2:
+                raise CartAgentError("Обрыв", mutation_possible=False)
+            return {
+                "status": "exact",
+                "cart_url": "https://eda.yandex.ru/cart",
+                "cart_cleared": False,
+                "items": [],
+            }
+
+        run_task.side_effect = shard_result
+
+        with self.assertRaises(CartAgentError) as caught:
+            assemble_store_cart(run, "auchan")
+
+        self.assertEqual(run_task.call_count, 3)
+        self.assertTrue(caught.exception.mutation_possible)
+
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_parallel_failed_status_marks_mutation_as_unknown(self, run_task):
+        run = self.make_run()
+        run.ingredient_snapshot = [
+            {"name": f"Ингредиент {index}", "quantity": "1", "unit": "шт."}
+            for index in range(2)
+        ]
+        run.save(update_fields=["ingredient_snapshot"])
+        run_task.side_effect = [
+            {"status": "failed", "items": [], "cart_cleared": False},
+            {
+                "status": "exact",
+                "items": [],
+                "cart_url": "https://eda.yandex.ru/cart",
+                "cart_cleared": False,
+            },
+        ]
+
+        with self.assertRaises(CartAgentError) as caught:
+            assemble_store_cart(run, "auchan")
+
+        self.assertTrue(caught.exception.mutation_possible)
+
+    @override_settings(CART_MAX_PARALLEL_AGENTS=2)
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_parallel_agent_limit_is_configurable(self, run_task):
+        run = self.make_run()
+        run.ingredient_snapshot = [
+            {"name": f"Ингредиент {index}", "quantity": "1", "unit": "шт."}
+            for index in range(6)
+        ]
+        run.save(update_fields=["ingredient_snapshot"])
+        run_task.return_value = {
+            "status": "incomplete",
+            "items": [],
+            "cart_cleared": False,
+        }
+
+        assemble_store_cart(run, "auchan")
+
+        self.assertEqual(run_task.call_count, 2)
+
+        run_task.reset_mock()
+        with self.settings(CART_MAX_PARALLEL_AGENTS=0):
+            assemble_store_cart(run, "auchan")
+        run_task.assert_called_once_with(run, "auchan", "assemble")
+
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_cleanup_keeps_single_unsharded_agent_call(self, run_task):
+        run = self.make_run()
+        added_items = [{"product_id": "sku-pasta-1", "package_count": 1}]
+        run_task.return_value = {"status": "cleared"}
+
+        result = cleanup_store_cart(
+            run,
+            "auchan",
+            added_items,
+            "https://eda.yandex.ru/cart",
+        )
+
+        self.assertEqual(result, {"status": "cleared"})
+        run_task.assert_called_once_with(
+            run,
+            "auchan",
+            "cleanup",
+            added_items=added_items,
+            cart_url="https://eda.yandex.ru/cart",
         )
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
