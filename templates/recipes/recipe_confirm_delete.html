@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Удалить «{{ recipe.title }}»{% endblock %}
+{% block content %}
+  <section class="auth-card">
+    <p class="eyebrow">Удаление</p>
+    <h1>Удалить «{{ recipe.title }}»?</h1>
+    <p class="muted">Рецепт, ингредиенты и фотографии шагов будут удалены без возможности восстановления.</p>
+    <form method="post" class="action-row">
+      {% csrf_token %}
+      <a class="button button-secondary" href="{{ recipe.get_absolute_url }}">Отмена</a>
+      <button class="button button-danger" type="submit">Удалить</button>
+    </form>
+  </section>
+{% endblock %}

@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}{{ recipe.title }} · Домашние рецепты{% endblock %}
+{% block content %}
+  <article>
+    <header class="recipe-hero">
+      <div class="recipe-hero-copy">
+        <a class="back-link" href="{% url 'recipe-list' %}">← Все рецепты</a>
+        {% if recipe.is_draft %}<p class="status-badge">Черновик — проверьте перед публикацией</p>{% endif %}
+        {% if recipe.categories.all %}
+          <div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}</div>
+        {% endif %}
+        <h1>{{ recipe.title }}</h1>
+        {% if recipe.description %}<p class="lead">{{ recipe.description }}</p>{% endif %}
+        <div class="recipe-stats">
+          <span><strong>{{ recipe.servings }}</strong> порций</span>
+          {% if recipe.prep_minutes %}<span><strong>{{ recipe.prep_minutes }}</strong> мин. подготовка</span>{% endif %}
+          {% if recipe.cook_minutes %}<span><strong>{{ recipe.cook_minutes }}</strong> мин. готовка</span>{% endif %}
+        </div>
+        <div class="action-row">
+          {% if recipe.is_draft %}
+            <form method="post" action="{% url 'recipe-publish' recipe.slug %}">
+              {% csrf_token %}
+              <button class="button" type="submit">Опубликовать</button>
+            </form>
+          {% else %}
+            <a class="button" href="{% url 'shopping-list' recipe.slug %}">Собрать продукты</a>
+          {% endif %}
+          <a class="button button-secondary" href="{% url 'recipe-update' recipe.slug %}">Редактировать</a>
+        </div>
+        {% if recipe.source_url %}
+          <p class="source-note">Создано по <a href="{{ recipe.source_url }}" target="_blank" rel="noopener noreferrer">исходной ссылке ↗</a></p>
+        {% endif %}
+      </div>
+      <div class="recipe-hero-image">
+        {% if recipe.cover %}
+          <img src="{{ recipe.cover.url }}" alt="{{ recipe.title }}">
+        {% else %}
+          <span class="image-placeholder large">{{ recipe.title|first }}</span>
+        {% endif %}
+      </div>
+    </header>
+
+    <div class="recipe-layout">
+      <aside class="ingredients-panel">
+        <p class="eyebrow">Ингредиенты</p>
+        <h2>На {{ recipe.servings }} порций</h2>
+        <ul class="ingredient-list">
+          {% regroup recipe.ingredients.all by section as ingredient_sections %}
+          {% for section in ingredient_sections %}
+            {% if section.grouper %}<li class="ingredient-section-title">{{ section.grouper }}</li>{% endif %}
+            {% for ingredient in section.list %}
+              <li>
+                <span class="ingredient-amount">
+                  {% if ingredient.estimated %}≈{% endif %}
+                  {% if ingredient.quantity != None %}{{ ingredient.quantity|floatformat:"-2" }}{% endif %}
+                  {{ ingredient.unit }}
+                </span>
+                <span>
+                  {{ ingredient.name }}
+                  {% if ingredient.optional %}<em>по желанию</em>{% endif %}
+                </span>
+              </li>
+            {% endfor %}
+          {% endfor %}
+        </ul>
+        <a class="button button-wide" href="{% url 'shopping-list' recipe.slug %}">Открыть список покупок</a>
+      </aside>
+
+      <section class="steps-section">
+        <p class="eyebrow">Приготовление</p>
+        <h2>Шаг за шагом</h2>
+        <ol class="steps-list">
+          {% for step in recipe.steps.all %}
+            <li class="step-card">
+              <div class="step-number">{{ forloop.counter }}</div>
+              <div class="step-content">
+                {% if step.title %}<h3>{{ step.title }}</h3>{% endif %}
+                <p>{{ step.instruction|linebreaksbr }}</p>
+                {% if step.image %}<img src="{{ step.image.url }}" alt="{{ step.title|default:'Шаг приготовления' }}" loading="lazy">{% endif %}
+              </div>
+            </li>
+          {% endfor %}
+        </ol>
+      </section>
+    </div>
+    <footer class="danger-zone">
+      {% if recipe.is_draft and recipe.import_job %}
+        <form method="post" action="{% url 'import-reprocess' recipe.import_job.pk %}">
+          {% csrf_token %}
+          <button class="link-button reprocess-link" type="submit">Заново обработать исходную ссылку</button>
+        </form>
+      {% endif %}
+      <a href="{% url 'recipe-delete' recipe.slug %}">Удалить рецепт</a>
+    </footer>
+  </article>
+{% endblock %}

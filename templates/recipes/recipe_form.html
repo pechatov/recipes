@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{% if is_create %}Новый рецепт{% else %}Редактирование{% endif %} · Домашние рецепты{% endblock %}
+{% block content %}
+  <header class="page-heading">
+    <a class="back-link" href="{% if is_create %}{% url 'recipe-list' %}{% else %}{{ recipe.get_absolute_url }}{% endif %}">← Назад</a>
+    <p class="eyebrow">{% if is_create %}Новый рецепт{% else %}Редактирование{% endif %}</p>
+    <h1>{% if is_create %}Добавить блюдо{% else %}{{ recipe.title }}{% endif %}</h1>
+  </header>
+
+  <form method="post" enctype="multipart/form-data" class="recipe-form" id="recipe-form">
+    {% csrf_token %}
+    {% if form.non_field_errors %}<div class="form-errors">{{ form.non_field_errors }}</div>{% endif %}
+
+    <section class="form-section">
+      <div class="section-heading">
+        <span>01</span>
+        <div><h2>Основное</h2><p>Название, описание и время.</p></div>
+      </div>
+      <div class="form-grid two-columns">
+        {% for field in form %}{% include "recipes/_form_field.html" with field=field %}{% endfor %}
+      </div>
+    </section>
+
+    <section class="form-section">
+      <div class="section-heading">
+        <span>02</span>
+        <div><h2>Ингредиенты</h2><p>Запрос для Лавки можно уточнить: например, «сливки 20%».</p></div>
+      </div>
+      {{ ingredient_formset.management_form }}
+      {% if ingredient_formset.non_form_errors %}<div class="form-errors">{{ ingredient_formset.non_form_errors }}</div>{% endif %}
+      <div id="ingredient-forms" class="formset-list">
+        {% for ingredient in ingredient_formset %}{% include "recipes/_ingredient_form.html" %}{% endfor %}
+      </div>
+      <template id="ingredient-empty-form">{% include "recipes/_ingredient_form.html" with ingredient=ingredient_formset.empty_form %}</template>
+      <button class="button button-secondary add-form" type="button" data-prefix="ingredients">＋ Добавить ингредиент</button>
+    </section>
+
+    <section class="form-section">
+      <div class="section-heading">
+        <span>03</span>
+        <div><h2>Шаги приготовления</h2><p>У каждого шага может быть своя фотография.</p></div>
+      </div>
+      {{ step_formset.management_form }}
+      {% if step_formset.non_form_errors %}<div class="form-errors">{{ step_formset.non_form_errors }}</div>{% endif %}
+      <div id="step-forms" class="formset-list">
+        {% for step in step_formset %}{% include "recipes/_step_form.html" %}{% endfor %}
+      </div>
+      <template id="step-empty-form">{% include "recipes/_step_form.html" with step=step_formset.empty_form %}</template>
+      <button class="button button-secondary add-form" type="button" data-prefix="steps">＋ Добавить шаг</button>
+    </section>
+
+    <div class="sticky-actions">
+      <a href="{% if is_create %}{% url 'recipe-list' %}{% else %}{{ recipe.get_absolute_url }}{% endif %}" class="button button-ghost">Отмена</a>
+      <button class="button" type="submit">Сохранить рецепт</button>
+    </div>
+  </form>
+{% endblock %}
+{% block scripts %}<script src="{% static 'recipes/formsets.js' %}" defer></script>{% endblock %}

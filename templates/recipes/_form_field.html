@@ -1,0 +1,19 @@
+<div class="field{% if field.errors %} field-error{% endif %}">
+  {% if not field.is_hidden %}<label for="{{ field.id_for_label }}">{{ field.label }}</label>{% endif %}
+  {{ field }}
+  {% if field.field.widget.input_type == "file" %}
+    <div class="image-paste-zone" data-image-paste-zone tabindex="0" role="button" aria-label="Вставить изображение из буфера обмена">
+      <div class="image-paste-preview{% if not field.value %} is-empty{% endif %}" data-image-preview-wrap>
+        <img data-image-preview{% if field.value %} src="{{ field.value.url }}"{% endif %} alt="Предпросмотр изображения">
+        <span class="image-paste-placeholder">＋</span>
+      </div>
+      <div class="image-paste-copy">
+        <strong>Вставить из буфера</strong>
+        <span>Кликните сюда и нажмите Ctrl+V</span>
+        <small data-image-paste-status>JPG, PNG или WebP, до 10 МБ</small>
+      </div>
+    </div>
+  {% endif %}
+  {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+  {{ field.errors }}
+</div>

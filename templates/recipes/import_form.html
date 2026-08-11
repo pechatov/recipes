@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Импорт рецепта · Домашние рецепты{% endblock %}
+{% block content %}
+  <section class="import-layout">
+    <div>
+      <a class="back-link" href="{% url 'recipe-list' %}">← Все рецепты</a>
+      <p class="eyebrow">Умный импорт</p>
+      <h1>Добавить по ссылке</h1>
+      <p class="lead">Вставьте ссылку на рецепт или YouTube-видео. Мы выделим ингредиенты и шаги, адаптируем текст и сохраним результат как черновик.</p>
+    </div>
+    <form method="post" class="form-section stack-form import-card">
+      {% csrf_token %}
+      {% include "recipes/_form_field.html" with field=form.source_url %}
+      <button class="button" type="submit">Создать черновик</button>
+      <p class="fine-print">Для YouTube нужны доступные субтитры. Автоматический результат всегда стоит проверить перед публикацией.</p>
+    </form>
+  </section>
+{% endblock %}

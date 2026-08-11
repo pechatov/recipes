@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Импорт рецепта · Домашние рецепты{% endblock %}
+{% block content %}
+  {% if job.status == "pending" or job.status == "processing" %}<meta http-equiv="refresh" content="4">{% endif %}
+  <section class="status-card">
+    <a class="back-link" href="{% url 'draft-list' %}">← Черновики</a>
+    {% if job.status == "pending" %}
+      <div class="status-orb is-working">…</div>
+      <p class="eyebrow">В очереди</p>
+      <h1>Скоро начнём</h1>
+      <p class="lead">Воркер заберёт ссылку через несколько секунд. Страница обновляется автоматически.</p>
+    {% elif job.status == "processing" %}
+      <div class="status-orb is-working">↻</div>
+      <p class="eyebrow">Обрабатываем источник</p>
+      <h1>Составляем рецепт</h1>
+      <p class="lead">Извлекаем материал, отделяем рецепт от лишнего текста и приводим его к формату вашей книги.</p>
+    {% elif job.status == "completed" and job.recipe %}
+      <div class="status-orb is-done">✓</div>
+      <p class="eyebrow">Черновик готов</p>
+      <h1>{{ job.recipe.title }}</h1>
+      <p class="lead">Проверьте количества и шаги, при желании добавьте фотографии, затем опубликуйте.</p>
+      <div class="action-row centered-actions">
+        <a class="button" href="{{ job.recipe.get_absolute_url }}">Открыть черновик</a>
+        <a class="button button-secondary" href="{% url 'recipe-update' job.recipe.slug %}">Сразу редактировать</a>
+      </div>
+      <form class="reprocess-form" method="post" action="{% url 'import-reprocess' job.pk %}">
+        {% csrf_token %}
+        <button class="link-button reprocess-link" type="submit">Заново обработать источник</button>
+      </form>
+    {% else %}
+      <div class="status-orb is-error">!</div>
+      <p class="eyebrow">Не получилось</p>
+      <h1>Импорт остановлен</h1>
+      <p class="lead">{{ job.error|default:"Неизвестная ошибка импорта." }}</p>
+      <form method="post" action="{% url 'import-retry' job.pk %}">
+        {% csrf_token %}
+        <button class="button" type="submit">Попробовать снова</button>
+      </form>
+    {% endif %}
+    <p class="source-note"><a href="{{ job.source_url }}" target="_blank" rel="noopener noreferrer">Открыть исходную ссылку ↗</a></p>
+  </section>
+{% endblock %}

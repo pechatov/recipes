@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Первый запуск · Домашние рецепты{% endblock %}
+{% block content %}
+  <section class="auth-card">
+    <p class="eyebrow">Первый запуск</p>
+    <h1>Создайте владельца</h1>
+    <p class="muted">Это единственная открытая регистрация. После создания владельца добавлять пользователей можно через панель администратора.</p>
+    <form method="post" class="stack-form">
+      {% csrf_token %}
+      {{ form.non_field_errors }}
+      {% for field in form %}
+        <div class="field">
+          <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+          {{ field }}
+          {% if field.help_text %}<small>{{ field.help_text|safe }}</small>{% endif %}
+          {{ field.errors }}
+        </div>
+      {% endfor %}
+      <button class="button button-wide" type="submit">Создать книгу рецептов</button>
+    </form>
+  </section>
+{% endblock %}

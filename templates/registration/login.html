@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Вход · Домашние рецепты{% endblock %}
+{% block content %}
+  <section class="auth-card">
+    <p class="eyebrow">Семейная книга</p>
+    <h1>С возвращением</h1>
+    <p class="muted">Войдите, чтобы открыть рецепты и списки покупок.</p>
+    <form method="post" class="stack-form">
+      {% csrf_token %}
+      {% if form.non_field_errors %}<div class="form-errors">{{ form.non_field_errors }}</div>{% endif %}
+      <div class="field">
+        <label for="{{ form.username.id_for_label }}">Имя пользователя</label>
+        {{ form.username }}
+      </div>
+      <div class="field">
+        <label for="{{ form.password.id_for_label }}">Пароль</label>
+        {{ form.password }}
+      </div>
+      {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+      <button class="button button-wide" type="submit">Войти</button>
+    </form>
+  </section>
+{% endblock %}

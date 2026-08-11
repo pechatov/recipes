@@ -1,0 +1,355 @@
+from decimal import Decimal
+
+from django.conf import settings
+from django.core.validators import MinValueValidator
+from django.db import models
+from django.urls import reverse
+from django.utils.text import slugify
+
+from .validators import validate_recipe_image
+
+
+class Category(models.Model):
+    slug = models.SlugField(max_length=60, unique=True)
+    name = models.CharField("название", max_length=80, unique=True)
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "name"]
+        verbose_name = "категория"
+        verbose_name_plural = "категории"
+
+    def __str__(self):
+        return self.name
+
+
+class Recipe(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        PUBLISHED = "published", "Опубликован"
+
+    title = models.CharField("название", max_length=180)
+    slug = models.SlugField(max_length=220, unique=True, blank=True, allow_unicode=True)
+    description = models.TextField("описание", blank=True)
+    servings = models.PositiveSmallIntegerField("порций", default=2)
+    prep_minutes = models.PositiveSmallIntegerField("подготовка, минут", default=0)
+    cook_minutes = models.PositiveSmallIntegerField("приготовление, минут", default=0)
+    cover = models.ImageField(
+        "фотография блюда",
+        upload_to="recipes/covers/%Y/%m/",
+        blank=True,
+        validators=[validate_recipe_image],
+    )
+    status = models.CharField(
+        "статус",
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PUBLISHED,
+        db_index=True,
+    )
+    source_url = models.URLField("источник", max_length=2048, blank=True)
+    categories = models.ManyToManyField(
+        Category,
+        blank=True,
+        related_name="recipes",
+        verbose_name="категории",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_recipes",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "title"]
+        verbose_name = "рецепт"
+        verbose_name_plural = "рецепты"
+
+    def __str__(self):
+        return self.title
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.title, allow_unicode=True) or "recipe"
+            candidate = base
+            suffix = 2
+            while Recipe.objects.exclude(pk=self.pk).filter(slug=candidate).exists():
+                candidate = f"{base}-{suffix}"
+                suffix += 1
+            self.slug = candidate
+        super().save(*args, **kwargs)
+
+    def get_absolute_url(self):
+        return reverse("recipe-detail", kwargs={"slug": self.slug})
+
+    @property
+    def total_minutes(self):
+        return self.prep_minutes + self.cook_minutes
+
+    @property
+    def is_draft(self):
+        return self.status == self.Status.DRAFT
+
+
+class RecipeIngredient(models.Model):
+    recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name="ingredients")
+    section = models.CharField(
+        "раздел",
+        max_length=120,
+        blank=True,
+        help_text="Например, «Для супа» или «Для гренок».",
+    )
+    name = models.CharField("ингредиент", max_length=180)
+    quantity = models.DecimalField(
+        "количество",
+        max_digits=9,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    unit = models.CharField("единица", max_length=40, blank=True)
+    note = models.CharField("примечание", max_length=240, blank=True)
+    search_query = models.CharField(
+        "запрос для Лавки",
+        max_length=240,
+        blank=True,
+        help_text="Если оставить пустым, будет использовано название ингредиента.",
+    )
+    optional = models.BooleanField("необязательный", default=False)
+    estimated = models.BooleanField(
+        "количество примерное",
+        default=False,
+        help_text="Отметьте, если точного количества не было в источнике.",
+    )
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "pk"]
+        verbose_name = "ингредиент"
+        verbose_name_plural = "ингредиенты"
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def effective_search_query(self):
+        return self.search_query.strip() or self.name.strip()
+
+
+class RecipeStep(models.Model):
+    recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name="steps")
+    title = models.CharField("заголовок", max_length=180, blank=True)
+    instruction = models.TextField("инструкция")
+    image = models.ImageField(
+        "фотография шага",
+        upload_to="recipes/steps/%Y/%m/",
+        blank=True,
+        validators=[validate_recipe_image],
+    )
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "pk"]
+        verbose_name = "шаг"
+        verbose_name_plural = "шаги"
+
+    def __str__(self):
+        return self.title or f"Шаг {self.order + 1}"
+
+
+class ImportJob(models.Model):
+    class SourceType(models.TextChoices):
+        WEBSITE = "website", "Сайт"
+        YOUTUBE = "youtube", "YouTube"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "В очереди"
+        PROCESSING = "processing", "Обрабатывается"
+        COMPLETED = "completed", "Готово"
+        FAILED = "failed", "Ошибка"
+
+    source_url = models.URLField("ссылка", max_length=2048)
+    source_type = models.CharField("тип источника", max_length=16, choices=SourceType.choices)
+    status = models.CharField(
+        "статус",
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    recipe = models.OneToOneField(
+        Recipe,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_job",
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="recipe_imports",
+    )
+    source_title = models.CharField("название источника", max_length=300, blank=True)
+    error = models.TextField("ошибка", blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "импорт рецепта"
+        verbose_name_plural = "импорты рецептов"
+
+    def __str__(self):
+        return f"{self.get_source_type_display()}: {self.source_url}"
+
+
+class StorePreference(models.Model):
+    class Store(models.TextChoices):
+        AUCHAN = "auchan", "Ашан"
+        PEREKRESTOK = "perekrestok", "Перекрёсток"
+        PYATEROCHKA = "pyaterochka", "Пятёрочка"
+        MAGNIT = "magnit", "Магнит"
+        LAVKA = "lavka", "Яндекс Лавка"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="store_preferences",
+    )
+    store = models.CharField("магазин", max_length=24, choices=Store.choices)
+    position = models.PositiveSmallIntegerField("приоритет", default=0)
+    enabled = models.BooleanField("использовать", default=True)
+
+    class Meta:
+        ordering = ["position", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "store"],
+                name="unique_store_preference_per_user",
+            )
+        ]
+        verbose_name = "приоритет магазина"
+        verbose_name_plural = "приоритеты магазинов"
+
+    def __str__(self):
+        return f"{self.user}: {self.get_store_display()}"
+
+
+class CartRun(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "В очереди"
+        PROCESSING = "processing", "Собирается"
+        COMPLETED = "completed", "Корзина готова"
+        REVIEW = "review", "Нужна проверка"
+        LOGIN_REQUIRED = "login_required", "Нужен вход"
+        FAILED = "failed", "Ошибка"
+
+    recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name="cart_runs")
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="cart_runs",
+    )
+    servings = models.PositiveSmallIntegerField("порций")
+    status = models.CharField(
+        "статус",
+        max_length=24,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    store_priority = models.JSONField("очередь магазинов", default=list)
+    ingredient_snapshot = models.JSONField("ингредиенты", default=list)
+    next_store_index = models.PositiveSmallIntegerField(default=0)
+    selected_attempt = models.ForeignKey(
+        "CartAttempt",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="selected_for_runs",
+    )
+    error = models.TextField("ошибка", blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "сборка корзины"
+        verbose_name_plural = "сборки корзин"
+
+    def __str__(self):
+        return f"{self.recipe}: {self.get_status_display()}"
+
+    @property
+    def is_active(self):
+        return self.status in {self.Status.PENDING, self.Status.PROCESSING}
+
+
+class CartAttempt(models.Model):
+    class Status(models.TextChoices):
+        PROCESSING = "processing", "Поиск"
+        EXACT = "exact", "Все продукты найдены"
+        SUBSTITUTIONS = "substitutions", "Есть замены"
+        INCOMPLETE = "incomplete", "Не всё найдено"
+        LOGIN_REQUIRED = "login_required", "Нужен вход"
+        BLOCKED = "blocked", "Сайт заблокировал браузер"
+        FAILED = "failed", "Ошибка"
+
+    run = models.ForeignKey(CartRun, on_delete=models.CASCADE, related_name="attempts")
+    store = models.CharField("магазин", max_length=24, choices=StorePreference.Store.choices)
+    status = models.CharField(
+        "статус",
+        max_length=24,
+        choices=Status.choices,
+        default=Status.PROCESSING,
+    )
+    cart_url = models.URLField("ссылка на корзину", max_length=2048, blank=True)
+    summary = models.CharField("результат", max_length=500, blank=True)
+    result = models.JSONField("ответ агента", default=dict, blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["started_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["run", "store"], name="unique_store_attempt_per_run")
+        ]
+        verbose_name = "попытка сборки корзины"
+        verbose_name_plural = "попытки сборки корзины"
+
+    def __str__(self):
+        return f"{self.get_store_display()}: {self.get_status_display()}"
+
+
+class CartItemMatch(models.Model):
+    class MatchQuality(models.TextChoices):
+        EXACT = "exact", "Точное совпадение"
+        SUBSTITUTE = "substitute", "Замена"
+        MISSING = "missing", "Не найдено"
+
+    attempt = models.ForeignKey(CartAttempt, on_delete=models.CASCADE, related_name="matches")
+    ingredient_name = models.CharField("ингредиент", max_length=180)
+    requested_quantity = models.CharField("нужно", max_length=80, blank=True)
+    product_name = models.CharField("выбранный товар", max_length=300, blank=True)
+    product_url = models.URLField("ссылка на товар", max_length=2048, blank=True)
+    package_count = models.PositiveSmallIntegerField("упаковок", default=0)
+    quality = models.CharField("качество совпадения", max_length=16, choices=MatchQuality.choices)
+    warning = models.CharField("предупреждение", max_length=500, blank=True)
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "pk"]
+        verbose_name = "подбор товара"
+        verbose_name_plural = "подборы товаров"
+
+    def __str__(self):
+        return f"{self.ingredient_name}: {self.get_quality_display()}"

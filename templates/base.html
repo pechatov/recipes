@@ -1,0 +1,40 @@
+{% load static %}
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4efe5">
+  <title>{% block title %}Домашние рецепты{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'recipes/app.css' %}">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="{% url 'recipe-list' %}" aria-label="Домой">
+      <span class="brand-mark">Р</span>
+      <span>Домашние рецепты</span>
+    </a>
+    {% if user.is_authenticated %}
+      <nav class="site-nav" aria-label="Основная навигация">
+        <a href="{% url 'draft-list' %}" class="nav-link">Черновики</a>
+        <a href="{% url 'import-create' %}" class="button button-small">Импортировать</a>
+        <a href="{% url 'recipe-create' %}" class="nav-link">Добавить вручную</a>
+        <form method="post" action="{% url 'logout' %}">
+          {% csrf_token %}
+          <button type="submit" class="link-button">Выйти</button>
+        </form>
+      </nav>
+    {% endif %}
+  </header>
+
+  <main class="page-shell">
+    {% if messages %}
+      <div class="messages" aria-live="polite">
+        {% for message in messages %}<div class="message">{{ message }}</div>{% endfor %}
+      </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Черновики · Домашние рецепты{% endblock %}
+{% block content %}
+  <header class="page-heading split-heading">
+    <div><p class="eyebrow">Подготовка</p><h1>Черновики</h1></div>
+    <a class="button" href="{% url 'import-create' %}">Импортировать рецепт</a>
+  </header>
+
+  {% if jobs %}
+    <section class="queue-panel">
+      <h2>Очередь импорта</h2>
+      <div class="queue-list">
+        {% for job in jobs %}
+          <a href="{% url 'import-detail' job.pk %}">
+            <span>{{ job.source_title|default:job.source_url|truncatechars:70 }}</span>
+            <strong>{{ job.get_status_display }}</strong>
+          </a>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if recipes %}
+    <div class="recipe-grid">
+      {% for recipe in recipes %}
+        <article class="recipe-card">
+          <a href="{{ recipe.get_absolute_url }}" class="recipe-card-image">
+            {% if recipe.cover %}<img src="{{ recipe.cover.url }}" alt="{{ recipe.title }}">{% else %}<span class="image-placeholder">{{ recipe.title|first }}</span>{% endif %}
+          </a>
+          <div class="recipe-card-body">
+            {% if recipe.categories.all %}<div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}</div>{% endif %}
+            <p class="recipe-meta">Черновик · {{ recipe.ingredients.count }} ингредиентов</p>
+            <h2><a href="{{ recipe.get_absolute_url }}">{{ recipe.title }}</a></h2>
+            <a class="text-link" href="{% url 'recipe-update' recipe.slug %}">Проверить и изменить →</a>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  {% elif not jobs %}
+    <section class="empty-state"><h2>Черновиков пока нет</h2><p>Импортируйте рецепт по ссылке — результат появится здесь.</p></section>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Приоритет магазинов · Домашние рецепты{% endblock %}
+{% block content %}
+  <header class="page-heading">
+    <a class="back-link" href="{% url 'recipe-list' %}">← К рецептам</a>
+    <p class="eyebrow">Автосборка корзины</p>
+    <h1>Приоритет магазинов</h1>
+    <p class="lead">Меньшее число проверяется раньше. Отключённые магазины агент пропустит.</p>
+  </header>
+
+  <form method="post" class="store-priority-card">
+    {% csrf_token %}
+    <div class="store-priority-list">
+      {% for preference in preferences %}
+        <div class="store-priority-row">
+          <label class="store-enabled">
+            <input type="checkbox" name="enabled_{{ preference.store }}"{% if preference.enabled %} checked{% endif %}>
+            <strong>{{ preference.get_store_display }}</strong>
+          </label>
+          <label class="store-position">
+            <span>Приоритет</span>
+            <input type="number" name="position_{{ preference.store }}" min="0" max="99" value="{{ preference.position }}">
+          </label>
+          <span class="store-platform">через Яндекс Еду</span>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="sticky-actions">
+      <button class="button" type="submit">Сохранить порядок</button>
+    </div>
+  </form>
+{% endblock %}

@@ -1,0 +1,126 @@
+from django import forms
+from django.contrib.auth import get_user_model
+from django.contrib.auth.forms import UserCreationForm
+from django.forms import BaseInlineFormSet, inlineformset_factory
+
+from .models import ImportJob, Recipe, RecipeIngredient, RecipeStep
+
+
+class SetupForm(UserCreationForm):
+    class Meta(UserCreationForm.Meta):
+        model = get_user_model()
+        fields = ("username",)
+        labels = {"username": "Имя пользователя"}
+
+
+class RecipeForm(forms.ModelForm):
+    class Meta:
+        model = Recipe
+        fields = (
+            "title",
+            "description",
+            "categories",
+            "servings",
+            "prep_minutes",
+            "cook_minutes",
+            "cover",
+        )
+        widgets = {
+            "description": forms.Textarea(attrs={"rows": 4}),
+            "categories": forms.CheckboxSelectMultiple(attrs={"class": "category-checkboxes"}),
+            "servings": forms.NumberInput(attrs={"min": 1}),
+            "prep_minutes": forms.NumberInput(attrs={"min": 0}),
+            "cook_minutes": forms.NumberInput(attrs={"min": 0}),
+            "cover": forms.ClearableFileInput(
+                attrs={"accept": "image/jpeg,image/png,image/webp", "data-image-input": ""}
+            ),
+        }
+
+
+class ImportRecipeForm(forms.ModelForm):
+    class Meta:
+        model = ImportJob
+        fields = ("source_url",)
+        labels = {"source_url": "Ссылка на рецепт или видео"}
+        help_texts = {
+            "source_url": "Подойдут страница с текстовым рецептом или видео на YouTube.",
+        }
+        widgets = {
+            "source_url": forms.URLInput(
+                attrs={"placeholder": "https://…", "autocomplete": "url"}
+            )
+        }
+
+
+class IngredientForm(forms.ModelForm):
+    class Meta:
+        model = RecipeIngredient
+        fields = (
+            "section",
+            "name",
+            "quantity",
+            "unit",
+            "search_query",
+            "optional",
+            "estimated",
+        )
+        widgets = {
+            "section": forms.TextInput(attrs={"placeholder": "Для основного блюда"}),
+            "name": forms.TextInput(attrs={"placeholder": "Например, сливки"}),
+            "quantity": forms.NumberInput(attrs={"step": "0.01", "min": 0}),
+            "unit": forms.TextInput(attrs={"placeholder": "г, мл, шт."}),
+            "search_query": forms.TextInput(attrs={"placeholder": "сливки 20%"}),
+        }
+
+
+class StepForm(forms.ModelForm):
+    class Meta:
+        model = RecipeStep
+        fields = ("title", "instruction", "image")
+        widgets = {
+            "title": forms.TextInput(attrs={"placeholder": "Например, приготовить соус"}),
+            "instruction": forms.Textarea(attrs={"rows": 5, "placeholder": "Подробно опишите действие"}),
+            "image": forms.ClearableFileInput(
+                attrs={"accept": "image/jpeg,image/png,image/webp", "data-image-input": ""}
+            ),
+        }
+
+
+class OrderedInlineFormSet(BaseInlineFormSet):
+    def save(self, commit=True):
+        instances = super().save(commit=commit)
+        if commit:
+            active_instances = [
+                form.instance
+                for form in self.forms
+                if form.cleaned_data
+                and not form.cleaned_data.get("DELETE", False)
+                and form.instance.pk
+            ]
+            for index, instance in enumerate(active_instances):
+                instance.order = index
+            self.model.objects.bulk_update(active_instances, ["order"])
+        return instances
+
+
+IngredientFormSet = inlineformset_factory(
+    Recipe,
+    RecipeIngredient,
+    form=IngredientForm,
+    formset=OrderedInlineFormSet,
+    extra=1,
+    can_delete=True,
+    min_num=1,
+    validate_min=True,
+)
+
+StepFormSet = inlineformset_factory(
+    Recipe,
+    RecipeStep,
+    form=StepForm,
+    formset=OrderedInlineFormSet,
+    extra=1,
+    can_delete=True,
+    min_num=1,
+    validate_min=True,
+)

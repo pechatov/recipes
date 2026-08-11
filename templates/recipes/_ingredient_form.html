@@ -1,0 +1,19 @@
+<div class="repeatable-card formset-row">
+  {{ ingredient.id }}
+  <div class="ingredient-section-field">
+    {% include "recipes/_form_field.html" with field=ingredient.section %}
+  </div>
+  <div class="form-grid ingredient-grid">
+    {% include "recipes/_form_field.html" with field=ingredient.name %}
+    {% include "recipes/_form_field.html" with field=ingredient.quantity %}
+    {% include "recipes/_form_field.html" with field=ingredient.unit %}
+    {% include "recipes/_form_field.html" with field=ingredient.search_query %}
+  </div>
+  <div class="ingredient-flags">
+    {% include "recipes/_form_field.html" with field=ingredient.optional %}
+    {% include "recipes/_form_field.html" with field=ingredient.estimated %}
+  </div>
+  {% if ingredient.DELETE %}
+    <label class="delete-control">{{ ingredient.DELETE }} Удалить ингредиент</label>
+  {% endif %}
+</div>

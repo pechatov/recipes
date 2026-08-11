@@ -1,0 +1,414 @@
+import mimetypes
+from pathlib import Path
+
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth import get_user_model, login
+from django.contrib.auth import views as auth_views
+from django.contrib.auth.decorators import login_required
+from django.db import transaction
+from django.db.models import Q
+from django.http import FileResponse, Http404, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils._os import safe_join
+from django.views.decorators.http import require_http_methods, require_POST
+
+from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
+from .importing.extractors import detect_source_type
+from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePreference
+from .services import build_shopping_items, get_store_preferences
+
+
+def health(request):
+    return JsonResponse({"status": "ok"})
+
+
+def login_view(request):
+    if not get_user_model().objects.exists():
+        return redirect("setup-owner")
+    return auth_views.LoginView.as_view(template_name="registration/login.html")(request)
+
+
+@require_http_methods(["GET", "POST"])
+def setup_owner(request):
+    if get_user_model().objects.exists():
+        return redirect("recipe-list" if request.user.is_authenticated else "login")
+
+    form = SetupForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        user = form.save(commit=False)
+        user.is_staff = True
+        user.is_superuser = True
+        user.save()
+        login(request, user)
+        messages.success(request, "Домашняя книга рецептов готова.")
+        return redirect("recipe-list")
+
+    return render(request, "recipes/setup.html", {"form": form})
+
+
+@login_required
+def recipe_list(request):
+    query = request.GET.get("q", "").strip()
+    selected_category = request.GET.get("category", "").strip()
+    recipes = Recipe.objects.filter(status=Recipe.Status.PUBLISHED).prefetch_related(
+        "ingredients", "categories"
+    )
+    if selected_category:
+        recipes = recipes.filter(categories__slug=selected_category)
+    if query:
+        text_query = Q()
+        for variant in {query, query.lower(), query.upper(), query.capitalize()}:
+            text_query |= (
+                Q(title__contains=variant)
+                | Q(description__contains=variant)
+                | Q(ingredients__name__contains=variant)
+            )
+        recipes = recipes.filter(text_query).distinct()
+    return render(
+        request,
+        "recipes/recipe_list.html",
+        {
+            "recipes": recipes,
+            "query": query,
+            "categories": Category.objects.all(),
+            "selected_category": selected_category,
+        },
+    )
+
+
+@login_required
+def draft_list(request):
+    recipes = Recipe.objects.filter(status=Recipe.Status.DRAFT).prefetch_related(
+        "ingredients", "categories"
+    )
+    jobs = ImportJob.objects.exclude(status=ImportJob.Status.COMPLETED)[:20]
+    return render(request, "recipes/draft_list.html", {"recipes": recipes, "jobs": jobs})
+
+
+@login_required
+def recipe_detail(request, slug):
+    recipe = get_object_or_404(
+        Recipe.objects.prefetch_related("ingredients", "steps"),
+        slug=slug,
+    )
+    return render(request, "recipes/recipe_detail.html", {"recipe": recipe})
+
+
+def _recipe_form_context(request, instance=None):
+    recipe = instance or Recipe()
+    form = RecipeForm(request.POST or None, request.FILES or None, instance=recipe)
+    ingredient_formset = IngredientFormSet(
+        request.POST or None,
+        request.FILES or None,
+        instance=recipe,
+        prefix="ingredients",
+    )
+    step_formset = StepFormSet(
+        request.POST or None,
+        request.FILES or None,
+        instance=recipe,
+        prefix="steps",
+    )
+    return recipe, form, ingredient_formset, step_formset
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def recipe_create(request):
+    recipe, form, ingredient_formset, step_formset = _recipe_form_context(request)
+    if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
+        with transaction.atomic():
+            recipe = form.save(commit=False)
+            recipe.created_by = request.user
+            recipe.save()
+            form.save_m2m()
+            ingredient_formset.instance = recipe
+            ingredient_formset.save()
+            step_formset.instance = recipe
+            step_formset.save()
+        messages.success(request, "Рецепт добавлен.")
+        return redirect(recipe)
+
+    return render(
+        request,
+        "recipes/recipe_form.html",
+        {
+            "recipe": recipe,
+            "form": form,
+            "ingredient_formset": ingredient_formset,
+            "step_formset": step_formset,
+            "is_create": True,
+        },
+    )
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def recipe_update(request, slug):
+    instance = get_object_or_404(Recipe, slug=slug)
+    recipe, form, ingredient_formset, step_formset = _recipe_form_context(request, instance)
+    if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
+        with transaction.atomic():
+            recipe = form.save()
+            ingredient_formset.save()
+            step_formset.save()
+        messages.success(request, "Изменения сохранены.")
+        return redirect(recipe)
+
+    return render(
+        request,
+        "recipes/recipe_form.html",
+        {
+            "recipe": recipe,
+            "form": form,
+            "ingredient_formset": ingredient_formset,
+            "step_formset": step_formset,
+            "is_create": False,
+        },
+    )
+
+
+@login_required
+@require_POST
+def recipe_publish(request, slug):
+    recipe = get_object_or_404(Recipe, slug=slug, status=Recipe.Status.DRAFT)
+    recipe.status = Recipe.Status.PUBLISHED
+    recipe.save(update_fields=["status", "updated_at"])
+    messages.success(request, "Рецепт опубликован и появился в общей книге.")
+    return redirect(recipe)
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def import_create(request):
+    form = ImportRecipeForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        job = form.save(commit=False)
+        job.source_type = detect_source_type(job.source_url)
+        job.requested_by = request.user
+        job.save()
+        messages.success(request, "Ссылка добавлена в очередь. Можно закрыть эту страницу.")
+        return redirect("import-detail", pk=job.pk)
+    return render(request, "recipes/import_form.html", {"form": form})
+
+
+@login_required
+def import_detail(request, pk):
+    job = get_object_or_404(ImportJob.objects.select_related("recipe"), pk=pk)
+    return render(request, "recipes/import_detail.html", {"job": job})
+
+
+@login_required
+@require_POST
+def import_retry(request, pk):
+    job = get_object_or_404(ImportJob, pk=pk, status=ImportJob.Status.FAILED)
+    job.status = ImportJob.Status.PENDING
+    job.error = ""
+    job.started_at = None
+    job.finished_at = None
+    job.save(update_fields=["status", "error", "started_at", "finished_at"])
+    messages.success(request, "Импорт снова поставлен в очередь.")
+    return redirect("import-detail", pk=job.pk)
+
+
+@login_required
+@require_POST
+def import_reprocess(request, pk):
+    job = get_object_or_404(
+        ImportJob.objects.select_related("recipe"),
+        pk=pk,
+        status=ImportJob.Status.COMPLETED,
+        recipe__status=Recipe.Status.DRAFT,
+    )
+    job.status = ImportJob.Status.PENDING
+    job.error = ""
+    job.started_at = None
+    job.finished_at = None
+    job.save(update_fields=["status", "error", "started_at", "finished_at"])
+    messages.success(request, "Черновик поставлен на повторную обработку.")
+    return redirect("import-detail", pk=job.pk)
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def recipe_delete(request, slug):
+    recipe = get_object_or_404(Recipe, slug=slug)
+    if request.method == "POST":
+        recipe.delete()
+        messages.success(request, "Рецепт удалён.")
+        return redirect("recipe-list")
+    return render(request, "recipes/recipe_confirm_delete.html", {"recipe": recipe})
+
+
+@login_required
+def shopping_list(request, slug):
+    recipe = get_object_or_404(Recipe.objects.prefetch_related("ingredients"), slug=slug)
+    try:
+        servings = int(request.GET.get("servings", recipe.servings))
+    except (TypeError, ValueError):
+        servings = recipe.servings
+    servings = max(1, min(servings, 100))
+    items = build_shopping_items(recipe, servings)
+    latest_cart_run = (
+        CartRun.objects.filter(recipe=recipe, requested_by=request.user)
+        .select_related("selected_attempt")
+        .first()
+    )
+    return render(
+        request,
+        "recipes/shopping_list.html",
+        {
+            "recipe": recipe,
+            "servings": servings,
+            "items": items,
+            "latest_cart_run": latest_cart_run,
+        },
+    )
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def store_preferences(request):
+    preferences = get_store_preferences(request.user)
+    if request.method == "POST":
+        updates = []
+        for preference in preferences:
+            try:
+                position = int(request.POST.get(f"position_{preference.store}", preference.position))
+            except (TypeError, ValueError):
+                position = preference.position
+            preference.position = max(0, min(position, 99))
+            preference.enabled = f"enabled_{preference.store}" in request.POST
+            updates.append(preference)
+        StorePreference.objects.bulk_update(updates, ["position", "enabled"])
+        messages.success(request, "Приоритет магазинов сохранён.")
+        return redirect("store-preferences")
+    return render(request, "recipes/store_preferences.html", {"preferences": preferences})
+
+
+@login_required
+@require_POST
+def cart_start(request, slug):
+    recipe = get_object_or_404(Recipe.objects.prefetch_related("ingredients"), slug=slug)
+    try:
+        servings = max(1, min(int(request.POST.get("servings", recipe.servings)), 100))
+    except (TypeError, ValueError):
+        servings = recipe.servings
+
+    selected_ids = set(request.POST.getlist("ingredients"))
+    items = [
+        item
+        for item in build_shopping_items(recipe, servings)
+        if str(item.ingredient.pk) in selected_ids
+    ]
+    if not items:
+        messages.error(request, "Выберите хотя бы один ингредиент.")
+        return redirect(f"{reverse('shopping-list', args=[recipe.slug])}?servings={servings}")
+
+    active = CartRun.objects.filter(
+        requested_by=request.user,
+        status__in=[CartRun.Status.PENDING, CartRun.Status.PROCESSING],
+    ).first()
+    if active:
+        messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+        return redirect("cart-detail", pk=active.pk)
+
+    priority = [item.store for item in get_store_preferences(request.user) if item.enabled]
+    if not priority:
+        messages.error(request, "Включите хотя бы один магазин.")
+        return redirect("store-preferences")
+
+    snapshot = [
+        {
+            "name": item.ingredient.name,
+            "section": item.ingredient.section,
+            "quantity": item.display_quantity,
+            "unit": item.ingredient.unit,
+            "search_query": item.ingredient.effective_search_query,
+            "optional": item.ingredient.optional,
+        }
+        for item in items
+    ]
+    run = CartRun.objects.create(
+        recipe=recipe,
+        requested_by=request.user,
+        servings=servings,
+        store_priority=priority,
+        ingredient_snapshot=snapshot,
+    )
+    messages.success(request, "Сборка запущена. Магазины будут проверены по приоритету.")
+    return redirect("cart-detail", pk=run.pk)
+
+
+@login_required
+def cart_detail(request, pk):
+    run = get_object_or_404(
+        CartRun.objects.select_related("recipe", "selected_attempt").prefetch_related(
+            "attempts__matches"
+        ),
+        pk=pk,
+        requested_by=request.user,
+    )
+    return render(request, "recipes/cart_detail.html", {"run": run})
+
+
+@login_required
+@require_POST
+def cart_continue(request, pk):
+    run = get_object_or_404(CartRun, pk=pk, requested_by=request.user)
+    if run.is_active:
+        return redirect("cart-detail", pk=run.pk)
+    if run.next_store_index >= len(run.store_priority):
+        messages.info(request, "Все включённые магазины уже проверены.")
+        return redirect("cart-detail", pk=run.pk)
+    next_run = CartRun.objects.create(
+        recipe=run.recipe,
+        requested_by=run.requested_by,
+        servings=run.servings,
+        store_priority=run.store_priority,
+        ingredient_snapshot=run.ingredient_snapshot,
+        next_store_index=run.next_store_index,
+    )
+    messages.success(request, "Продолжаем со следующего магазина.")
+    return redirect("cart-detail", pk=next_run.pk)
+
+
+@login_required
+@require_POST
+def cart_retry(request, pk):
+    run = get_object_or_404(
+        CartRun,
+        pk=pk,
+        requested_by=request.user,
+        status__in=[CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED],
+    )
+    if run.status == CartRun.Status.FAILED:
+        blocked_stores = set(
+            run.attempts.filter(status=CartAttempt.Status.BLOCKED).values_list(
+                "store", flat=True
+            )
+        )
+        for index, store in enumerate(run.store_priority):
+            if store in blocked_stores:
+                run.next_store_index = index
+                break
+    run.status = CartRun.Status.PENDING
+    run.finished_at = None
+    run.error = ""
+    run.save(update_fields=["status", "next_store_index", "finished_at", "error"])
+    messages.success(request, "Попытка снова поставлена в очередь.")
+    return redirect("cart-detail", pk=run.pk)
+
+
+@login_required
+def media_file(request, path):
+    try:
+        resolved = Path(safe_join(settings.MEDIA_ROOT, path))
+    except ValueError as error:
+        raise Http404 from error
+    if not resolved.is_file():
+        raise Http404
+    content_type, _ = mimetypes.guess_type(resolved.name)
+    return FileResponse(resolved.open("rb"), content_type=content_type or "application/octet-stream")

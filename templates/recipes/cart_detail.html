@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Корзина для «{{ run.recipe.title }}»{% endblock %}
+{% block content %}
+  <header class="page-heading cart-run-heading">
+    <a class="back-link" href="{% url 'shopping-list' run.recipe.slug %}">← К списку покупок</a>
+    <p class="eyebrow">Автосборка · {{ run.servings }} порц.</p>
+    <h1>{{ run.recipe.title }}</h1>
+  </header>
+
+  <section class="cart-run-status status-{{ run.status }}">
+    {% if run.status == 'pending' or run.status == 'processing' %}
+      <div class="status-orb is-working">…</div>
+      <h2>{% if run.status == 'pending' %}Ожидает своей очереди{% else %}Hermes собирает корзину{% endif %}</h2>
+      <p>Поиск идёт последовательно и может занять несколько минут. Эту страницу можно закрыть.</p>
+    {% elif run.status == 'completed' %}
+      <div class="status-orb is-done">✓</div>
+      <h2>Все ингредиенты найдены</h2>
+      <p>Проверьте количество упаковок перед оформлением. Заказ не размещён.</p>
+    {% elif run.status == 'review' %}
+      <div class="status-orb is-error">!</div>
+      <h2>Есть замены или пропуски</h2>
+      <p>Ни один проверенный магазин не дал полностью точную корзину. Ниже выбран лучший результат.</p>
+    {% elif run.status == 'login_required' %}
+      <div class="status-orb is-error">↗</div>
+      <h2>Нужно подтвердить браузер</h2>
+      <p>Яндекс запросил вход или ручную проверку. Запустите свою отдельную сессию, пройдите проверку и выберите адрес, затем сохраните её и повторите попытку.</p>
+      <code class="command-chip">./scripts/cart-browser-login-pi.sh start {{ run.requested_by_id }}</code>
+      <code class="command-chip">ssh -N -L 6080:127.0.0.1:6080 pi</code>
+      <p><small>Откройте <strong>http://127.0.0.1:6080/vnc.html</strong>, войдите в Яндекс и укажите адрес доставки. После проверки выполните <strong>./scripts/cart-browser-login-pi.sh stop {{ run.requested_by_id }}</strong>. Сессия сохранится только для вашего пользователя сайта.</small></p>
+    {% else %}
+      <div class="status-orb is-error">×</div>
+      <h2>Корзину собрать не удалось</h2>
+      {% if run.error %}<p>{{ run.error }}</p>{% endif %}
+    {% endif %}
+
+    <div class="action-row centered-actions">
+      {% if run.selected_attempt.cart_url %}
+        <a class="button" href="{{ run.selected_attempt.cart_url }}" target="_blank" rel="noopener noreferrer">Открыть корзину ↗</a>
+      {% endif %}
+      {% if run.status == 'login_required' or run.status == 'failed' %}
+        <form method="post" action="{% url 'cart-retry' run.pk %}">
+          {% csrf_token %}
+          <button class="button" type="submit">Проверка пройдена — продолжить</button>
+        </form>
+      {% endif %}
+      {% if run.status == 'completed' and run.next_store_index < run.store_priority|length %}
+        <form method="post" action="{% url 'cart-continue' run.pk %}">
+          {% csrf_token %}
+          <button class="button button-secondary" type="submit">Найти в другом магазине</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if run.selected_attempt %}
+    <section class="selected-cart-result">
+      <div class="attempt-heading">
+        <div>
+          <p class="eyebrow">Предлагаемая корзина</p>
+          <h2>{{ run.selected_attempt.get_store_display }}</h2>
+        </div>
+        <span class="attempt-status status-{{ run.selected_attempt.status }}">{{ run.selected_attempt.get_status_display }}</span>
+      </div>
+      {% if run.selected_attempt.summary %}<p>{{ run.selected_attempt.summary }}</p>{% endif %}
+      <div class="match-list">
+        {% for match in run.selected_attempt.matches.all %}
+          <article class="match-row match-{{ match.quality }}">
+            <div>
+              <strong>{{ match.ingredient_name }}</strong>
+              <span>{{ match.requested_quantity }}</span>
+            </div>
+            <div>
+              {% if match.product_url %}<a href="{{ match.product_url }}" target="_blank" rel="noopener noreferrer">{{ match.product_name|default:"Открыть товар" }} ↗</a>{% else %}<strong>{{ match.product_name|default:"Не найдено" }}</strong>{% endif %}
+              {% if match.package_count %}<span>{{ match.package_count }} уп.</span>{% endif %}
+              {% if match.warning %}<p class="match-warning">{{ match.warning }}</p>{% endif %}
+            </div>
+            <span class="match-quality">{{ match.get_quality_display }}</span>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if run.attempts.all %}
+    <section class="attempt-history">
+      <h2>Проверенные магазины</h2>
+      <div class="attempt-list">
+        {% for attempt in run.attempts.all %}
+          <div class="attempt-summary">
+            <strong>{{ attempt.get_store_display }}</strong>
+            <span class="attempt-status status-{{ attempt.status }}">{{ attempt.get_status_display }}</span>
+            {% if attempt.summary %}<p>{{ attempt.summary }}</p>{% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}
+{% block scripts %}
+  {% if run.is_active %}<script>window.setTimeout(() => window.location.reload(), 5000);</script>{% endif %}
+{% endblock %}
