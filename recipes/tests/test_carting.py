@@ -259,6 +259,7 @@ class CartPipelineTests(TestCase):
                     "product_name": "Спагетти 450 г",
                     "product_url": "https://eda.yandex.ru/product/1",
                     "package_count": 1,
+                    "added_package_count": 1,
                     "quality": "exact",
                     "warning": "",
                 }
@@ -277,6 +278,56 @@ class CartPipelineTests(TestCase):
         assemble.assert_called_once_with(run, "auchan")
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_cleanup_journal_uses_only_bounded_snapshot_items(self, assemble):
+        assemble.return_value = {
+            "status": "exact",
+            "cart_url": "https://eda.yandex.ru/cart",
+            "cart_cleared": False,
+            "added_items": [
+                {
+                    "product_name": "Чужой товар из прежней корзины",
+                    "product_url": "https://eda.yandex.ru/product/pre-existing",
+                    "package_count": 99,
+                }
+            ],
+            "items": [
+                {
+                    "ingredient_name": "Не из snapshot",
+                    "product_name": "Ещё один чужой товар",
+                    "product_url": "https://eda.yandex.ru/product/injected",
+                    "package_count": 50,
+                    "added_package_count": 50,
+                    "quality": "exact",
+                },
+                {
+                    "ingredient_name": "Спагетти",
+                    "requested_quantity": "400 г",
+                    "product_name": "Спагетти 450 г",
+                    "product_url": "https://eda.yandex.ru/product/legitimate",
+                    "package_count": 2,
+                    "added_package_count": 99,
+                    "quality": "exact",
+                    "warning": "",
+                },
+            ],
+        }
+        run = self.make_run()
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(
+            run.selected_attempt.result["added_items"],
+            [
+                {
+                    "product_name": "Спагетти 450 г",
+                    "product_url": "https://eda.yandex.ru/product/legitimate",
+                    "package_count": 2,
+                }
+            ],
+        )
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_false_exact_with_substitute_stops_for_review(self, assemble):
         substitute_result = {
             "status": "exact",
@@ -293,6 +344,7 @@ class CartPipelineTests(TestCase):
                     "product_name": "Лапша рисовая",
                     "product_url": "https://eda.yandex.ru/product/2",
                     "package_count": 1,
+                    "added_package_count": 1,
                     "quality": "substitute",
                     "warning": "Другой вид лапши, может не подойти для рецепта.",
                 }
@@ -360,6 +412,7 @@ class CartPipelineTests(TestCase):
                     "requested_quantity": "1 шт.",
                     "product_name": "Первый товар" if index == 0 else "",
                     "package_count": 1 if index == 0 else 0,
+                    "added_package_count": 1 if index == 0 else 0,
                     "quality": "exact" if index == 0 else "missing",
                     "warning": "" if index == 0 else "Нет товара",
                 }
@@ -380,6 +433,7 @@ class CartPipelineTests(TestCase):
                     "requested_quantity": "1 шт.",
                     "product_name": f"{name} товар",
                     "package_count": 1,
+                    "added_package_count": 1,
                     "quality": "exact",
                     "warning": "",
                 }
@@ -413,6 +467,7 @@ class CartPipelineTests(TestCase):
                 {
                     "ingredient_name": name,
                     "package_count": 1 if index < 2 else 0,
+                    "added_package_count": 1 if index < 2 else 0,
                     "product_name": f"{name} товар" if index < 2 else "",
                     "quality": "exact" if index < 2 else "missing",
                     "warning": "" if index < 2 else "Нет товара",

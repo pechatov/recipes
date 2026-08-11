@@ -43,39 +43,77 @@ def _safe_yandex_food_url(value) -> str:
     return url
 
 
+def _package_count(value, *, maximum: int = 100) -> int:
+    try:
+        return max(0, min(int(value or 0), maximum))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _save_result(attempt: CartAttempt, data: dict) -> None:
     raw_status = _text(data.get("status"), 24)
     status = raw_status if raw_status in AGENT_STATUSES else CartAttempt.Status.FAILED
     expected = [item["name"] for item in attempt.run.ingredient_snapshot]
+    reported_items = data.get("items", [])
+    if not isinstance(reported_items, list):
+        reported_items = []
     by_name = {}
-    for item in data.get("items", []):
+    for item in reported_items:
         if isinstance(item, dict):
             by_name.setdefault(_text(item.get("ingredient_name"), 180).casefold(), item)
 
     attempt.matches.all().delete()
     matches = []
+    added_by_product = {}
     for order, ingredient_name in enumerate(expected):
         item = by_name.get(ingredient_name.casefold(), {})
         quality = _text(item.get("quality"), 16)
         if quality not in MATCH_QUALITIES:
             quality = CartItemMatch.MatchQuality.MISSING
-        try:
-            package_count = max(0, min(int(item.get("package_count") or 0), 100))
-        except (TypeError, ValueError):
-            package_count = 0
+        package_count = _package_count(item.get("package_count"))
+        product_name = _text(item.get("product_name"), 300)
+        product_url = _safe_yandex_food_url(item.get("product_url"))
         matches.append(
             CartItemMatch(
                 attempt=attempt,
                 ingredient_name=ingredient_name,
                 requested_quantity=_text(item.get("requested_quantity"), 80),
-                product_name=_text(item.get("product_name"), 300),
-                product_url=_safe_yandex_food_url(item.get("product_url")),
+                product_name=product_name,
+                product_url=product_url,
                 package_count=package_count,
                 quality=quality,
                 warning=_text(item.get("warning"), 500),
                 order=order,
             )
         )
+
+        # The cleanup journal must only contain additions tied to a requested
+        # ingredient. Never trust the agent's free-form top-level added_items:
+        # page content can influence the browser agent and make it name a
+        # pre-existing user product. The per-ingredient addition is bounded by
+        # the validated total package count for that same match.
+        added_package_count = _package_count(
+            item.get("added_package_count"),
+            maximum=package_count,
+        )
+        if (
+            added_package_count
+            and product_name
+            and quality != CartItemMatch.MatchQuality.MISSING
+        ):
+            key = product_url or product_name.casefold()
+            existing = added_by_product.setdefault(
+                key,
+                {
+                    "product_name": product_name,
+                    "product_url": product_url,
+                    "package_count": 0,
+                },
+            )
+            existing["package_count"] = min(
+                100,
+                existing["package_count"] + added_package_count,
+            )
     CartItemMatch.objects.bulk_create(matches)
 
     qualities = {match.quality for match in matches}
@@ -94,42 +132,6 @@ def _save_result(attempt: CartAttempt, data: dict) -> None:
     }:
         status = CartAttempt.Status.INCOMPLETE
 
-    reported_added_items = data.get("added_items", [])
-    if not isinstance(reported_added_items, list) or not reported_added_items:
-        reported_added_items = [
-            {
-                "product_name": item.get("product_name"),
-                "product_url": item.get("product_url"),
-                "package_count": item.get("added_package_count"),
-            }
-            for item in data.get("items", [])
-            if isinstance(item, dict) and item.get("added_package_count")
-        ]
-
-    added_by_product = {}
-    for item in reported_added_items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            package_count = max(0, min(int(item.get("package_count") or 0), 100))
-        except (TypeError, ValueError):
-            package_count = 0
-        product_name = _text(item.get("product_name"), 300)
-        if package_count and product_name:
-            product_url = _safe_yandex_food_url(item.get("product_url"))
-            key = product_url or product_name.casefold()
-            existing = added_by_product.setdefault(
-                key,
-                {
-                    "product_name": product_name,
-                    "product_url": product_url,
-                    "package_count": 0,
-                },
-            )
-            existing["package_count"] = min(
-                100,
-                existing["package_count"] + package_count,
-            )
     added_items = list(added_by_product.values())
 
     result = dict(data)
