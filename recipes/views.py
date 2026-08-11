@@ -10,7 +10,7 @@ from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
 from django.contrib.postgres.search import TrigramSimilarity
 from django.db import connection, transaction
-from django.db.models import FloatField, Max, Q, Value
+from django.db.models import Case, FloatField, IntegerField, Max, Q, Value, When
 from django.db.models.functions import Coalesce, Greatest
 from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -28,6 +28,8 @@ from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePref
 from .services import build_shopping_items, get_store_preferences
 
 
+SEARCH_CANDIDATE_LIMIT = 500
+MAX_SEARCH_RANK_FRAGMENTS = 32
 MAX_SEARCH_QUERY_LENGTH = 120
 MAX_SEARCH_TOKENS = 8
 SEARCH_FIELDS = (
@@ -175,7 +177,32 @@ def _exact_search_filter(query: str) -> Q:
 def _ranked_fuzzy_candidates(recipes, query: str):
     candidates = recipes.filter(_search_candidate_filter(query)).distinct()
     if connection.vendor != "postgresql":
-        return candidates.order_by("-updated_at")
+        fragments = []
+        for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
+            fragments.extend(token)
+            fragments.extend(
+                token[index:index + 2] for index in range(max(0, len(token) - 1))
+            )
+        fragments = list(dict.fromkeys(fragments))[:MAX_SEARCH_RANK_FRAGMENTS]
+        score_parts = []
+        for fragment in fragments:
+            fragment_filter = Q()
+            for variant in {fragment, fragment.capitalize(), fragment.upper()}:
+                for field in SEARCH_FIELDS:
+                    fragment_filter |= Q(**{f"{field}__icontains": variant})
+            score_parts.append(
+                Max(
+                    Case(
+                        When(fragment_filter, then=Value(1)),
+                        default=Value(0),
+                        output_field=IntegerField(),
+                    )
+                )
+            )
+        score = sum(score_parts, Value(0, output_field=IntegerField()))
+        return candidates.annotate(search_similarity=score).order_by(
+            "-search_similarity", "-updated_at"
+        )[:SEARCH_CANDIDATE_LIMIT]
     zero = Value(0.0, output_field=FloatField())
     similarities = [
         Coalesce(Max(TrigramSimilarity(field, query)), zero)
@@ -183,7 +210,7 @@ def _ranked_fuzzy_candidates(recipes, query: str):
     ]
     return candidates.annotate(
         search_similarity=Greatest(*similarities)
-    ).order_by("-search_similarity", "-updated_at")
+    ).order_by("-search_similarity", "-updated_at")[:SEARCH_CANDIDATE_LIMIT]
 
 
 @require_http_methods(["GET", "POST"])
@@ -208,9 +235,13 @@ def setup_owner(request):
 def recipe_list(request):
     query = request.GET.get("q", "").strip()
     normalized_tokens = _normalize_recipe_search(query).split()
-    if len(query) > MAX_SEARCH_QUERY_LENGTH or len(normalized_tokens) > MAX_SEARCH_TOKENS:
+    if (
+        len(query) > MAX_SEARCH_QUERY_LENGTH
+        or len(normalized_tokens) > MAX_SEARCH_TOKENS
+        or (query and not normalized_tokens)
+    ):
         return JsonResponse(
-            {"error": "Поисковый запрос слишком длинный."},
+            {"error": "Поисковый запрос некорректный или слишком длинный."},
             status=400,
         )
     selected_category = request.GET.get("category", "").strip()

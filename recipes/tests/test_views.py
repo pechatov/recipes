@@ -225,7 +225,11 @@ class RecipeViewTests(TestCase):
     def test_fuzzy_search_rejects_input_before_building_an_unbounded_query(self):
         self.client.force_login(self.user)
 
-        for query in ("а" * 121, "один два три четыре пять шесть семь восемь девять"):
+        for query in (
+            "а" * 121,
+            "один два три четыре пять шесть семь восемь девять",
+            "---",
+        ):
             with self.subTest(query=query), patch(
                 "recipes.views._search_candidate_filter"
             ) as candidate_filter:
