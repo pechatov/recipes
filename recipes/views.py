@@ -38,7 +38,9 @@ from .services import build_shopping_items, get_store_preferences
 
 SEARCH_CANDIDATE_LIMIT = 500
 MAX_SEARCH_RANK_FRAGMENTS = 32
+MAX_SEARCH_FRAGMENTS_PER_TOKEN = 4
 MAX_SEARCH_QUERY_LENGTH = 120
+MAX_SEARCH_TOKEN_LENGTH = 32
 MAX_SEARCH_TOKENS = 8
 SEARCH_FIELDS = (
     "title",
@@ -148,19 +150,24 @@ def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
     )
 
 
+def _search_token_fragments(token: str) -> list[str]:
+    bigrams = list(
+        dict.fromkeys(
+            token[index:index + 2] for index in range(max(0, len(token) - 1))
+        )
+    )
+    prioritized = []
+    if bigrams:
+        prioritized.extend((bigrams[0], bigrams[-1], bigrams[len(bigrams) // 2]))
+    prioritized.extend(dict.fromkeys(token))
+    return list(dict.fromkeys(prioritized))[:MAX_SEARCH_FRAGMENTS_PER_TOKEN]
+
+
 def _search_candidate_filter(query: str) -> Q:
     candidate_filter = Q()
     for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
-        # Character fallbacks keep the candidate set complete for supported
-        # substitutions/transpositions; bigrams still make common queries
-        # more selective when the database can use them.
-        fragments = set(token)
-        if len(token) >= 3:
-            fragments.update(
-                token[index:index + 2] for index in range(len(token) - 1)
-            )
         token_filter = Q()
-        for fragment in fragments:
+        for fragment in _search_token_fragments(token):
             # SQLite's LIKE does not case-fold non-ASCII text. These variants
             # keep the portable development database useful; PostgreSQL's
             # ILIKE naturally collapses them.
@@ -187,10 +194,7 @@ def _ranked_fuzzy_candidates(recipes, query: str):
     if connection.vendor != "postgresql":
         fragments = []
         for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
-            fragments.extend(token)
-            fragments.extend(
-                token[index:index + 2] for index in range(max(0, len(token) - 1))
-            )
+            fragments.extend(_search_token_fragments(token))
         fragments = list(dict.fromkeys(fragments))[:MAX_SEARCH_RANK_FRAGMENTS]
         score_parts = []
         for fragment in fragments:
@@ -246,6 +250,7 @@ def recipe_list(request):
     if (
         len(query) > MAX_SEARCH_QUERY_LENGTH
         or len(normalized_tokens) > MAX_SEARCH_TOKENS
+        or any(len(token) > MAX_SEARCH_TOKEN_LENGTH for token in normalized_tokens)
         or (query and not normalized_tokens)
     ):
         return JsonResponse(
