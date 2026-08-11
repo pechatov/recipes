@@ -8,7 +8,7 @@ from django.contrib import messages
 from django.contrib.auth import get_user_model, login
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
-from django.contrib.postgres.search import TrigramSimilarity
+from django.contrib.postgres.search import TrigramWordSimilarity
 from django.db import connection, transaction
 from django.db.models import Case, FloatField, IntegerField, Max, Q, Value, When
 from django.db.models.functions import Coalesce, Greatest
@@ -238,22 +238,28 @@ def _exact_search_filter(query: str) -> Q:
 
 def _ranked_fuzzy_candidates(recipes, query: str):
     candidates = recipes.filter(_search_candidate_filter(query)).distinct()
-    fragment_score = _search_fragment_score(query)
     if connection.vendor != "postgresql":
-        return candidates.annotate(search_fragment_score=fragment_score).order_by(
-            "-search_fragment_score", "-updated_at"
-        )[:SEARCH_CANDIDATE_LIMIT]
+        # SQLite is the small development fallback. Avoid a coarse top-N cut
+        # before the exact Python matcher because it has no word-similarity
+        # function equivalent to PostgreSQL's pg_trgm implementation.
+        return candidates.order_by("-updated_at")
+    fragment_score = _search_fragment_score(query)
     zero = Value(0.0, output_field=FloatField())
     similarities = [
-        Coalesce(Max(TrigramSimilarity(field, query)), zero)
+        Coalesce(Max(TrigramWordSimilarity(query, field)), zero)
         for field in SEARCH_FIELDS
     ]
-    return candidates.annotate(
+    ranked = candidates.annotate(
         search_fragment_score=fragment_score,
         search_similarity=Greatest(*similarities)
-    ).order_by(
+    )
+    word_similarity_pool = list(ranked.order_by(
+        "-search_similarity", "-search_fragment_score", "-updated_at"
+    )[:SEARCH_CANDIDATE_LIMIT])
+    fragment_fallback_pool = list(ranked.order_by(
         "-search_fragment_score", "-search_similarity", "-updated_at"
-    )[:SEARCH_CANDIDATE_LIMIT]
+    )[:SEARCH_CANDIDATE_LIMIT])
+    return word_similarity_pool + fragment_fallback_pool
 
 
 def _resolve_recipe_slug(slug: str, queryset=None) -> tuple[Recipe, bool]:
@@ -847,10 +853,9 @@ def cart_detail(request, pk):
     )
     attempts = list(run.attempts.all())
     status_attempt = run.selected_attempt or (attempts[-1] if attempts else None)
-    matches = {
-        match.ingredient_name.casefold(): match
-        for match in (status_attempt.matches.all() if status_attempt else [])
-    }
+    matches_by_name = {}
+    for match in status_attempt.matches.all() if status_attempt else []:
+        matches_by_name.setdefault(match.ingredient_name.casefold(), []).append(match)
     quality_labels = {
         "exact": "Найдено полное совпадение",
         "substitute": "Найдена альтернатива",
@@ -867,7 +872,8 @@ def cart_detail(request, pk):
     }
     for item in run.ingredient_snapshot:
         name = str(item.get("name", "")).strip()
-        match = matches.get(name.casefold())
+        matching_items = matches_by_name.get(name.casefold(), [])
+        match = matching_items.pop(0) if matching_items else None
         if match:
             quality = match.quality
         elif is_waiting:

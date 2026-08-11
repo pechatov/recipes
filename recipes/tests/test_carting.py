@@ -196,6 +196,52 @@ class CartViewTests(TestCase):
         self.assertContains(response, "Не проверено")
         self.assertNotContains(response, "Ничего не найдено")
 
+    def test_cart_detail_keeps_separate_matches_for_duplicate_ingredient_names(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.REVIEW,
+            store_priority=["auchan"],
+            ingredient_snapshot=[
+                {"name": "Масло", "quantity": "20", "unit": "г"},
+                {"name": "Масло", "quantity": "10", "unit": "г"},
+            ],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.SUBSTITUTIONS,
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+        CartItemMatch.objects.create(
+            attempt=attempt,
+            ingredient_name="Масло",
+            product_name="Масло первое",
+            quality=CartItemMatch.MatchQuality.EXACT,
+            order=0,
+        )
+        CartItemMatch.objects.create(
+            attempt=attempt,
+            ingredient_name="Масло",
+            product_name="Масло второе",
+            quality=CartItemMatch.MatchQuality.SUBSTITUTE,
+            order=1,
+        )
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        statuses = response.context["cart_item_statuses"]
+        self.assertEqual(
+            [item["match"].product_name for item in statuses],
+            ["Масло первое", "Масло второе"],
+        )
+        self.assertEqual(
+            [item["quality"] for item in statuses],
+            ["exact", "substitute"],
+        )
+
     def test_retry_of_old_captcha_failure_resumes_blocked_store(self):
         run = CartRun.objects.create(
             recipe=self.recipe,
