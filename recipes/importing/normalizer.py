@@ -42,7 +42,7 @@ def _nutrient(value: Any, units: str = r"г|g") -> str | None:
     if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
         return None
     match = re.fullmatch(
-        rf"\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:{units})?\s*",
+        rf"\s*(\d+(?:[.,]\d+)?)\s*(?:{units})?\s*",
         str(value),
         re.IGNORECASE,
     )

@@ -172,6 +172,30 @@ class CartViewTests(TestCase):
         self.assertNotContains(response, "В очереди")
         self.assertNotContains(response, "Проверенные магазины")
 
+    def test_cart_detail_marks_items_unchecked_after_failed_attempt(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[
+                {"name": "Картофель", "quantity": "400", "unit": "г"},
+            ],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.BLOCKED,
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Не проверено")
+        self.assertNotContains(response, "Ничего не найдено")
+
     def test_retry_of_old_captcha_failure_resumes_blocked_store(self):
         run = CartRun.objects.create(
             recipe=self.recipe,

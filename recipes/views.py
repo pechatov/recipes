@@ -346,7 +346,10 @@ def _fill_missing_recipe_calories(
     overwrite: bool = False,
     preserve_fields: set[str] | None = None,
 ) -> None:
-    preserve_fields = preserve_fields or set()
+    if preserve_fields is None:
+        preserve_fields = set(recipe.nutrition_manual_fields or [])
+    else:
+        preserve_fields = set(preserve_fields)
     if (
         not overwrite
         and all(getattr(recipe, field) is not None for field in NUTRITION_FIELDS)
@@ -785,13 +788,27 @@ def cart_detail(request, pk):
         "exact": "Найдено полное совпадение",
         "substitute": "Найдена альтернатива",
         "missing": "Ничего не найдено",
+        "queued": "В очереди",
+        "unchecked": "Не проверено",
     }
     item_statuses = []
     is_waiting = run.status in {CartRun.Status.PENDING, CartRun.Status.PROCESSING}
+    attempt_completed = status_attempt and status_attempt.status in {
+        CartAttempt.Status.EXACT,
+        CartAttempt.Status.SUBSTITUTIONS,
+        CartAttempt.Status.INCOMPLETE,
+    }
     for item in run.ingredient_snapshot:
         name = str(item.get("name", "")).strip()
         match = matches.get(name.casefold())
-        quality = match.quality if match else ("queued" if is_waiting else "missing")
+        if match:
+            quality = match.quality
+        elif is_waiting:
+            quality = "queued"
+        elif attempt_completed:
+            quality = "missing"
+        else:
+            quality = "unchecked"
         item_statuses.append(
             {
                 "name": name,
@@ -801,7 +818,7 @@ def cart_detail(request, pk):
                     if part
                 ),
                 "quality": quality,
-                "label": quality_labels.get(quality, "В очереди"),
+                "label": quality_labels[quality],
                 "match": match,
             }
         )

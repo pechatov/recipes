@@ -20,7 +20,12 @@ from recipes.importing.extractors import (
     youtube_video_id,
 )
 from recipes.importing.llm import _parse_json
-from recipes.importing.normalizer import _calories, normalize_recipe, normalize_recipes
+from recipes.importing.normalizer import (
+    _calories,
+    _nutrient,
+    normalize_recipe,
+    normalize_recipes,
+)
 from recipes.importing.pipeline import (
     DownloadedImage,
     MAX_IMPORTED_IMAGES,
@@ -157,6 +162,12 @@ class NormalizerTests(TestCase):
         self.assertIsNone(_calories([100]))
         self.assertIsNone(_calories("-100 kcal"))
         self.assertEqual(_calories("450 ккал"), "450.0")
+
+    def test_nutrients_reject_signed_and_out_of_range_values(self):
+        self.assertIsNone(_nutrient("-5 г"))
+        self.assertIsNone(_nutrient("+5 г"))
+        self.assertIsNone(_nutrient("1000000 г"))
+        self.assertEqual(_nutrient("5,25 г"), "5.2")
 
     def test_normalizes_limits_and_decimal_quantity(self):
         recipe = normalize_recipe(

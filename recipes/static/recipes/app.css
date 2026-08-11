@@ -351,6 +351,7 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent);
 .quality-substitute .item-status-dot { background: #c5852d; }
 .quality-missing .item-status-dot { background: var(--danger); }
 .quality-queued .item-status-dot { box-shadow: 0 0 0 4px rgba(170, 163, 154, .16); }
+.quality-unchecked .item-status-dot { background: #77716a; }
 .item-status-label { font-weight: 750; }
 .cart-run-status h2 { margin-bottom: 10px; }
 .cart-run-status > p { max-width: 720px; margin-inline: auto; color: var(--muted); }

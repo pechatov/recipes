@@ -458,6 +458,13 @@ class RecipeViewTests(TestCase):
         self.assertEqual(
             self.recipe.nutrition_manual_fields, ["calories_per_serving"]
         )
+        detail = self.client.get(self.recipe.get_absolute_url())
+        self.assertEqual(
+            str(detail.context["recipe"].calories_per_serving), "999.0"
+        )
+        self.assertEqual(
+            str(detail.context["recipe"].calories_per_100g), original_per_100g
+        )
 
     def test_detail_renders_partial_nutrition_without_empty_labels(self):
         ingredient = self.recipe.ingredients.get()
