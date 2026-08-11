@@ -67,6 +67,61 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(self.recipe.calories_per_serving), "410.0")
         self.assertEqual(str(self.recipe.calories_per_100g), "205.0")
 
+    def test_pantry_toggle_does_not_overwrite_manual_calories(self):
+        self.recipe.calories_per_serving = 999
+        self.recipe.calories_per_100g = 888
+        self.recipe.calories_estimated = False
+        self.recipe.save(
+            update_fields=[
+                "calories_per_serving",
+                "calories_per_100g",
+                "calories_estimated",
+            ]
+        )
+        ingredient = self.recipe.ingredients.get()
+        step = self.recipe.steps.get()
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            reverse("recipe-update", args=[self.recipe.slug]),
+            {
+                "title": self.recipe.title,
+                "description": self.recipe.description,
+                "servings": self.recipe.servings,
+                "prep_minutes": self.recipe.prep_minutes,
+                "cook_minutes": self.recipe.cook_minutes,
+                "calories_per_serving": "999",
+                "calories_per_100g": "888",
+                "ingredients-TOTAL_FORMS": 1,
+                "ingredients-INITIAL_FORMS": 1,
+                "ingredients-MIN_NUM_FORMS": 1,
+                "ingredients-MAX_NUM_FORMS": 1000,
+                "ingredients-0-id": ingredient.pk,
+                "ingredients-0-section": ingredient.section,
+                "ingredients-0-name": ingredient.name,
+                "ingredients-0-quantity": ingredient.quantity,
+                "ingredients-0-unit": ingredient.unit,
+                "ingredients-0-search_query": ingredient.search_query,
+                "ingredients-0-is_pantry": "on",
+                "steps-TOTAL_FORMS": 1,
+                "steps-INITIAL_FORMS": 1,
+                "steps-MIN_NUM_FORMS": 1,
+                "steps-MAX_NUM_FORMS": 1000,
+                "steps-0-id": step.pk,
+                "steps-0-section": step.section,
+                "steps-0-title": step.title,
+                "steps-0-instruction": step.instruction,
+            },
+        )
+
+        self.assertRedirects(response, self.recipe.get_absolute_url())
+        self.recipe.refresh_from_db()
+        ingredient.refresh_from_db()
+        self.assertTrue(ingredient.is_pantry)
+        self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
+        self.assertEqual(str(self.recipe.calories_per_100g), "888.0")
+        self.assertFalse(self.recipe.calories_estimated)
+
     def test_edit_form_has_clipboard_zones_for_cover_and_step_images(self):
         self.client.force_login(self.user)
         response = self.client.get(reverse("recipe-update", args=[self.recipe.slug]))
@@ -93,6 +148,15 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("recipe-list"), {"q": "слвк"})
 
         self.assertContains(response, "Семейная паста")
+
+    def test_fuzzy_search_keeps_matches_alongside_exact_match(self):
+        exact = Recipe.objects.create(title="СЛВК — семейная заметка", created_by=self.user)
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "слвк"})
+
+        self.assertContains(response, exact.title)
+        self.assertContains(response, self.recipe.title)
 
     def test_server_search_excludes_unrelated_recipes_without_javascript(self):
         other = Recipe.objects.create(title="Яблочный пирог", created_by=self.user)
@@ -270,3 +334,43 @@ class RecipeViewTests(TestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, ImportJob.Status.PENDING)
         self.assertEqual(job.recipe, draft)
+
+    def test_import_endpoints_are_private_to_requesting_user(self):
+        other = get_user_model().objects.create_user(username="private-importer")
+        draft = Recipe.objects.create(
+            title="Чужой черновик",
+            status=Recipe.Status.DRAFT,
+            created_by=other,
+        )
+        completed = ImportJob.objects.create(
+            source_url="https://example.com/private-completed",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.COMPLETED,
+            recipe=draft,
+            requested_by=other,
+        )
+        completed.recipes.add(draft)
+        failed = ImportJob.objects.create(
+            source_url="https://example.com/private-failed",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.FAILED,
+            requested_by=other,
+        )
+        self.client.force_login(self.user)
+
+        self.assertEqual(
+            self.client.get(reverse("import-detail", args=[completed.pk])).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.post(reverse("import-reprocess", args=[completed.pk])).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.post(reverse("import-retry", args=[failed.pk])).status_code,
+            404,
+        )
+        completed.refresh_from_db()
+        failed.refresh_from_db()
+        self.assertEqual(completed.status, ImportJob.Status.COMPLETED)
+        self.assertEqual(failed.status, ImportJob.Status.FAILED)

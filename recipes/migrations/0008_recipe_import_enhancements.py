@@ -95,6 +95,15 @@ class Migration(migrations.Migration):
             ),
         ),
         migrations.AddField(
+            model_name="recipe",
+            name="calories_estimated",
+            field=models.BooleanField(
+                default=False,
+                editable=False,
+                verbose_name="калорийность рассчитана автоматически",
+            ),
+        ),
+        migrations.AddField(
             model_name="recipeingredient",
             name="is_pantry",
             field=models.BooleanField(

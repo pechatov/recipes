@@ -99,26 +99,9 @@ def recipe_list(request):
     if selected_author.isdigit():
         recipes = recipes.filter(created_by_id=selected_author)
     if query:
-        exact_recipes = recipes
-        for token in _normalize_recipe_search(query).split():
-            exact_recipes = exact_recipes.filter(
-                Q(title__icontains=token)
-                | Q(description__icontains=token)
-                | Q(ingredients__name__icontains=token)
-                | Q(categories__name__icontains=token)
-                | Q(created_by__username__icontains=token)
-                | Q(created_by__first_name__icontains=token)
-                | Q(created_by__last_name__icontains=token)
-            )
-        exact_recipes = exact_recipes.distinct()
-        if exact_recipes.exists():
-            recipes = exact_recipes
-        else:
-            recipes = [
-                recipe
-                for recipe in recipes
-                if _recipe_matches_fuzzy_query(recipe, query)
-            ]
+        recipes = [
+            recipe for recipe in recipes if _recipe_matches_fuzzy_query(recipe, query)
+        ]
     return render(
         request,
         "recipes/recipe_list.html",
@@ -246,7 +229,13 @@ def recipe_create(request):
             ingredient_formset.save()
             step_formset.instance = recipe
             step_formset.save()
+            manual_calories = any(
+                form.cleaned_data[field] is not None
+                for field in ("calories_per_serving", "calories_per_100g")
+            )
             _fill_missing_recipe_calories(recipe, save=True)
+            recipe.calories_estimated = not manual_calories
+            recipe.save(update_fields=["calories_estimated", "updated_at"])
         messages.success(request, "Рецепт добавлен.")
         return redirect(recipe)
 
@@ -267,6 +256,7 @@ def recipe_create(request):
 @require_http_methods(["GET", "POST"])
 def recipe_update(request, slug):
     instance = get_object_or_404(Recipe, slug=slug)
+    calories_were_estimated = instance.calories_estimated
     recipe, form, ingredient_formset, step_formset = _recipe_form_context(request, instance)
     if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
         with transaction.atomic():
@@ -274,13 +264,26 @@ def recipe_update(request, slug):
             ingredient_formset.save()
             step_formset.save()
             calorie_fields = {"calories_per_serving", "calories_per_100g"}
-            recalculate = "servings" in form.changed_data or ingredient_formset.has_changed()
-            _fill_missing_recipe_calories(
-                recipe,
-                save=True,
-                overwrite=recalculate,
-                preserve_fields=calorie_fields.intersection(form.changed_data),
+            manual_calorie_change = bool(calorie_fields.intersection(form.changed_data))
+            ingredient_energy_fields = {"name", "quantity", "unit", "DELETE"}
+            ingredients_changed = any(
+                ingredient_energy_fields.intersection(ingredient_form.changed_data)
+                for ingredient_form in ingredient_formset.forms
             )
+            recalculate = "servings" in form.changed_data or ingredients_changed
+            if manual_calorie_change:
+                recipe.calories_estimated = False
+                recipe.save(update_fields=["calories_estimated", "updated_at"])
+            elif recalculate and (
+                calories_were_estimated
+                or (
+                    recipe.calories_per_serving is None
+                    and recipe.calories_per_100g is None
+                )
+            ):
+                _fill_missing_recipe_calories(recipe, save=True, overwrite=True)
+                recipe.calories_estimated = True
+                recipe.save(update_fields=["calories_estimated", "updated_at"])
         messages.success(request, "Изменения сохранены.")
         return redirect(recipe)
 
@@ -326,6 +329,7 @@ def import_detail(request, pk):
     job = get_object_or_404(
         ImportJob.objects.select_related("recipe").prefetch_related("recipes"),
         pk=pk,
+        requested_by=request.user,
     )
     return render(request, "recipes/import_detail.html", {"job": job})
 
@@ -333,7 +337,12 @@ def import_detail(request, pk):
 @login_required
 @require_POST
 def import_retry(request, pk):
-    job = get_object_or_404(ImportJob, pk=pk, status=ImportJob.Status.FAILED)
+    job = get_object_or_404(
+        ImportJob,
+        pk=pk,
+        requested_by=request.user,
+        status=ImportJob.Status.FAILED,
+    )
     job.status = ImportJob.Status.PENDING
     job.error = ""
     job.started_at = None
@@ -349,6 +358,7 @@ def import_reprocess(request, pk):
     job = get_object_or_404(
         ImportJob.objects.select_related("recipe").prefetch_related("recipes"),
         pk=pk,
+        requested_by=request.user,
         status=ImportJob.Status.COMPLETED,
     )
     drafts = list(job.recipes.filter(status=Recipe.Status.DRAFT))

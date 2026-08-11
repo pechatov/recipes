@@ -12,7 +12,7 @@ from recipes.importing.extractors import (
     youtube_video_id,
 )
 from recipes.importing.llm import _parse_json
-from recipes.importing.normalizer import normalize_recipe, normalize_recipes
+from recipes.importing.normalizer import _calories, normalize_recipe, normalize_recipes
 from recipes.importing.pipeline import (
     DownloadedImage,
     MAX_IMPORTED_IMAGES,
@@ -88,6 +88,12 @@ class ExtractorTests(TestCase):
 
 
 class NormalizerTests(TestCase):
+    def test_calories_reject_compound_and_negative_values(self):
+        self.assertIsNone(_calories({"value": 100}))
+        self.assertIsNone(_calories([100]))
+        self.assertIsNone(_calories("-100 kcal"))
+        self.assertEqual(_calories("450 ккал"), "450.0")
+
     def test_normalizes_limits_and_decimal_quantity(self):
         recipe = normalize_recipe(
             {
@@ -705,3 +711,77 @@ class PipelineTests(TestCase):
         self.assertTrue(Path(recipe.cover.name).stem.startswith("cover"))
         self.assertEqual(Path(recipe.cover.name).suffix, ".jpg")
         self.assertTrue(Path(recipe.steps.get().image.name).stem.startswith("step"))
+
+    @patch("recipes.importing.pipeline._prepare_images")
+    @patch("django.core.files.storage.FileSystemStorage.delete")
+    @patch("django.core.files.storage.FileSystemStorage._save")
+    def test_reprocess_deletes_replaced_images_after_commit(
+        self, storage_save, storage_delete, prepare_images
+    ):
+        storage_save.side_effect = lambda name, content: name
+        prepare_images.return_value = [
+            (
+                DownloadedImage("new-cover.jpg", b"new-cover"),
+                [DownloadedImage("new-step.jpg", b"new-step")],
+            )
+        ]
+        user = get_user_model().objects.create_user("image-reprocess")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/reprocess-images",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        draft = save_draft(job, self.recipe_data("Старый рецепт"))[0]
+        draft.cover.name = "recipes/covers/old-cover.jpg"
+        draft.save(update_fields=["cover"])
+        old_step = draft.steps.get()
+        old_step.image.name = "recipes/steps/old-step.jpg"
+        old_step.save(update_fields=["image"])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            save_draft(
+                job,
+                self.recipe_data("Новый рецепт"),
+                document=SourceDocument("website", "Рецепт", "Описание приготовления"),
+            )
+
+        deleted_names = [call.args[-1] for call in storage_delete.call_args_list]
+        self.assertIn("recipes/covers/old-cover.jpg", deleted_names)
+        self.assertIn("recipes/steps/old-step.jpg", deleted_names)
+
+    @patch("recipes.importing.pipeline._prepare_images")
+    @patch("django.core.files.storage.FileSystemStorage.delete")
+    @patch("django.core.files.storage.FileSystemStorage._save")
+    def test_reprocess_deletes_new_images_after_database_rollback(
+        self, storage_save, storage_delete, prepare_images
+    ):
+        storage_save.side_effect = lambda name, content: name
+        prepare_images.return_value = [
+            (
+                DownloadedImage("rollback-cover.jpg", b"new-cover"),
+                [DownloadedImage("rollback-step.jpg", b"new-step")],
+            )
+        ]
+        user = get_user_model().objects.create_user("image-rollback")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/rollback-images",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        draft = save_draft(job, self.recipe_data("Старый рецепт"))[0]
+        draft.cover.name = "recipes/covers/keep-cover.jpg"
+        draft.save(update_fields=["cover"])
+
+        with patch(
+            "recipes.importing.pipeline.RecipeIngredient.objects.bulk_create",
+            side_effect=RuntimeError("database failure"),
+        ), self.assertRaises(RuntimeError):
+            save_draft(
+                job,
+                self.recipe_data("Не сохранится"),
+                document=SourceDocument("website", "Рецепт", "Описание приготовления"),
+            )
+
+        deleted_names = [call.args[-1] for call in storage_delete.call_args_list]
+        self.assertTrue(any(name.endswith("rollback-cover.jpg") for name in deleted_names))
+        self.assertNotIn("recipes/covers/keep-cover.jpg", deleted_names)

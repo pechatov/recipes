@@ -25,7 +25,7 @@ def _integer(value: Any, default: int, maximum: int) -> int:
 
 
 def _quantity(value: Any) -> str | None:
-    if value in {None, ""}:
+    if value is None or value == "":
         return None
     try:
         number = Decimal(str(value).replace(",", "."))
@@ -37,16 +37,22 @@ def _quantity(value: Any) -> str | None:
 
 
 def _calories(value: Any) -> str | None:
-    if value in {None, ""}:
+    if value is None or value == "":
         return None
-    match = re.search(r"\d+(?:[.,]\d+)?", str(value))
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return None
+    match = re.fullmatch(
+        r"\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:ккал|kcal)?\s*",
+        str(value),
+        re.IGNORECASE,
+    )
     if not match:
         return None
     try:
-        number = Decimal(match.group().replace(",", "."))
+        number = Decimal(match.group(1).replace(",", "."))
     except InvalidOperation:
         return None
-    if number < 0 or number >= Decimal("1000000"):
+    if not number.is_finite() or number < 0 or number >= Decimal("1000000"):
         return None
     return str(number.quantize(Decimal("0.1")))
 

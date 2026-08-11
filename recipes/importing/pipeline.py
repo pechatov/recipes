@@ -4,6 +4,7 @@ import hashlib
 import io
 import logging
 from dataclasses import dataclass, field, replace
+from typing import Any
 from urllib.parse import urljoin
 
 import httpx
@@ -235,8 +236,35 @@ def _recipe_values(job: ImportJob, data: dict) -> dict:
         "cook_minutes": data["cook_minutes"],
         "calories_per_serving": data.get("calories_per_serving"),
         "calories_per_100g": data.get("calories_per_100g"),
+        "calories_estimated": True,
         "source_url": job.source_url,
     }
+
+
+def _stored_file(field_file) -> tuple[Any, str] | None:
+    name = str(field_file.name or "")
+    return (field_file.storage, name) if name else None
+
+
+def _delete_stored_files(files: list[tuple[Any, str]]) -> None:
+    seen = set()
+    for storage, name in files:
+        key = (id(storage), name)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            storage.delete(name)
+        except Exception:
+            logger.warning("Could not delete obsolete imported image %s", name, exc_info=True)
+
+
+def _step_stored_files(recipe: Recipe) -> list[tuple[Any, str]]:
+    return [
+        stored
+        for step in recipe.steps.exclude(image="").only("image")
+        if (stored := _stored_file(step.image))
+    ]
 
 
 def _set_categories(recipe: Recipe, slugs: list[str]) -> None:
@@ -294,76 +322,124 @@ def save_draft(
 ) -> list[Recipe]:
     recipe_data = normalize_recipes(data)
     prepared_images = _prepare_images(document, recipe_data)
-    with transaction.atomic():
-        existing_drafts: list[Recipe] = []
-        if job.recipe and job.recipe.status == Recipe.Status.DRAFT:
-            existing_drafts.append(job.recipe)
-        existing_drafts.extend(
-            job.recipes.filter(status=Recipe.Status.DRAFT)
-            .exclude(pk=job.recipe_id)
-            .order_by("pk")
-        )
-        saved_recipes: list[Recipe] = []
-        for recipe_index, values in enumerate(recipe_data):
-            cover_image, step_images = prepared_images[recipe_index]
-            if recipe_index < len(existing_drafts):
-                recipe = existing_drafts[recipe_index]
-                for field, value in _recipe_values(job, values).items():
-                    setattr(recipe, field, value)
-                if cover_image:
-                    recipe.cover.save(
-                        cover_image.name,
-                        ContentFile(cover_image.content),
-                        save=False,
-                    )
-                recipe.save()
-                recipe.ingredients.all().delete()
-                recipe.steps.all().delete()
-            else:
-                recipe = Recipe(
-                    **_recipe_values(job, values),
-                    status=Recipe.Status.DRAFT,
-                    created_by=job.requested_by,
-                )
-                if cover_image:
-                    recipe.cover.save(
-                        cover_image.name,
-                        ContentFile(cover_image.content),
-                        save=False,
-                    )
-                recipe.save()
-
-            RecipeIngredient.objects.bulk_create(
-                [
-                    RecipeIngredient(recipe=recipe, order=index, **ingredient)
-                    for index, ingredient in enumerate(values["ingredients"])
-                ]
+    new_files: list[tuple[Any, str]] = []
+    old_files: list[tuple[Any, str]] = []
+    try:
+        with transaction.atomic():
+            existing_drafts: list[Recipe] = []
+            if job.recipe and job.recipe.status == Recipe.Status.DRAFT:
+                existing_drafts.append(job.recipe)
+            existing_drafts.extend(
+                job.recipes.filter(status=Recipe.Status.DRAFT)
+                .exclude(pk=job.recipe_id)
+                .order_by("pk")
             )
-            steps = []
-            for index, step in enumerate(values["steps"]):
-                step_values = {key: value for key, value in step.items() if key != "image_url"}
-                recipe_step = RecipeStep(recipe=recipe, order=index, **step_values)
-                step_image = step_images[index]
-                if step_image:
-                    recipe_step.image.save(
-                        step_image.name,
-                        ContentFile(step_image.content),
-                        save=False,
+            saved_recipes: list[Recipe] = []
+            for recipe_index, values in enumerate(recipe_data):
+                cover_image, step_images = prepared_images[recipe_index]
+                if recipe_index < len(existing_drafts):
+                    recipe = existing_drafts[recipe_index]
+                    for field, value in _recipe_values(job, values).items():
+                        setattr(recipe, field, value)
+                    if cover_image:
+                        old_cover = _stored_file(recipe.cover)
+                        if old_cover:
+                            old_files.append(old_cover)
+                        recipe.cover.save(
+                            cover_image.name,
+                            ContentFile(cover_image.content),
+                            save=False,
+                        )
+                        new_cover = _stored_file(recipe.cover)
+                        if new_cover:
+                            new_files.append(new_cover)
+                    old_files.extend(_step_stored_files(recipe))
+                    recipe.save()
+                    recipe.ingredients.all().delete()
+                    recipe.steps.all().delete()
+                else:
+                    recipe = Recipe(
+                        **_recipe_values(job, values),
+                        status=Recipe.Status.DRAFT,
+                        created_by=job.requested_by,
                     )
-                steps.append(recipe_step)
-            RecipeStep.objects.bulk_create(steps)
-            _set_categories(recipe, values.get("categories", []))
-            saved_recipes.append(recipe)
+                    if cover_image:
+                        recipe.cover.save(
+                            cover_image.name,
+                            ContentFile(cover_image.content),
+                            save=False,
+                        )
+                        new_cover = _stored_file(recipe.cover)
+                        if new_cover:
+                            new_files.append(new_cover)
+                    recipe.save()
 
-        stale_draft_ids = [recipe.pk for recipe in existing_drafts[len(saved_recipes):]]
-        if stale_draft_ids:
-            Recipe.objects.filter(pk__in=stale_draft_ids, status=Recipe.Status.DRAFT).delete()
-        job.recipe = saved_recipes[0]
-        job.recipes.set(saved_recipes)
-        job.status = ImportJob.Status.COMPLETED
-        job.finished_at = timezone.now()
-        job.error = ""
-        job.save(update_fields=["recipe", "status", "finished_at", "error"])
+                RecipeIngredient.objects.bulk_create(
+                    [
+                        RecipeIngredient(recipe=recipe, order=index, **ingredient)
+                        for index, ingredient in enumerate(values["ingredients"])
+                    ]
+                )
+                steps = []
+                for index, step in enumerate(values["steps"]):
+                    step_values = {
+                        key: value for key, value in step.items() if key != "image_url"
+                    }
+                    recipe_step = RecipeStep(recipe=recipe, order=index, **step_values)
+                    step_image = step_images[index]
+                    if step_image:
+                        recipe_step.image.save(
+                            step_image.name,
+                            ContentFile(step_image.content),
+                            save=False,
+                        )
+                        new_step = _stored_file(recipe_step.image)
+                        if new_step:
+                            new_files.append(new_step)
+                    steps.append(recipe_step)
+                RecipeStep.objects.bulk_create(steps)
+                _set_categories(recipe, values.get("categories", []))
+                saved_recipes.append(recipe)
+
+            stale_drafts = existing_drafts[len(saved_recipes):]
+            stale_draft_ids = [recipe.pk for recipe in stale_drafts]
+            for stale in stale_drafts:
+                stale_cover = _stored_file(stale.cover)
+                if stale_cover:
+                    old_files.append(stale_cover)
+                old_files.extend(_step_stored_files(stale))
+            if stale_draft_ids:
+                Recipe.objects.filter(
+                    pk__in=stale_draft_ids,
+                    status=Recipe.Status.DRAFT,
+                ).delete()
+            job.recipe = saved_recipes[0]
+            job.recipes.set(saved_recipes)
+            job.status = ImportJob.Status.COMPLETED
+            job.finished_at = timezone.now()
+            job.error = ""
+            job.save(update_fields=["recipe", "status", "finished_at", "error"])
+
+            kept_file_refs = []
+            for recipe in saved_recipes:
+                cover_ref = _stored_file(recipe.cover)
+                if cover_ref:
+                    kept_file_refs.append(cover_ref)
+                kept_file_refs.extend(_step_stored_files(recipe))
+            kept_files = {
+                (id(storage), name) for storage, name in kept_file_refs
+            }
+            obsolete_files = [
+                (storage, name)
+                for storage, name in old_files
+                if (id(storage), name) not in kept_files
+            ]
+            transaction.on_commit(
+                lambda files=obsolete_files: _delete_stored_files(files)
+            )
+    except Exception:
+        _delete_stored_files(new_files)
+        raise
     return saved_recipes
 
 

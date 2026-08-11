@@ -109,6 +109,11 @@ class Recipe(models.Model):
         blank=True,
         validators=[MinValueValidator(Decimal("0"))],
     )
+    calories_estimated = models.BooleanField(
+        "калорийность рассчитана автоматически",
+        default=False,
+        editable=False,
+    )
     cover = models.ImageField(
         "фотография блюда",
         upload_to="recipes/covers/%Y/%m/",
