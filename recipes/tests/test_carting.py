@@ -2,7 +2,7 @@ from unittest.mock import patch
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -15,7 +15,9 @@ from recipes.carting.pipeline import (
 from recipes.carting.client import (
     STORE_INSTRUCTIONS,
     CartAgentError,
+    assemble_store_cart,
     cart_browser_session_key,
+    cleanup_store_cart,
 )
 from recipes.models import (
     CartAttempt,
@@ -289,10 +291,45 @@ class CartPipelineTests(TestCase):
 
     def test_browser_session_key_is_stable_and_user_specific(self):
         self.assertEqual(cart_browser_session_key(self.user.pk), "recipes-cart-user-1")
+        self.assertEqual(
+            cart_browser_session_key(self.user.pk, 3),
+            "recipes-cart-user-1-shard-3",
+        )
         other_user = get_user_model().objects.create_user(username="other")
         self.assertNotEqual(
-            cart_browser_session_key(self.user.pk),
-            cart_browser_session_key(other_user.pk),
+            cart_browser_session_key(self.user.pk, 3),
+            cart_browser_session_key(other_user.pk, 3),
+        )
+
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_single_ingredient_keeps_legacy_agent_call(self, run_task):
+        run = self.make_run()
+        run_task.return_value = {"status": "exact", "items": []}
+
+        self.assertEqual(assemble_store_cart(run, "auchan"), run_task.return_value)
+
+        run_task.assert_called_once_with(run, "auchan", "assemble")
+
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_cleanup_keeps_single_unsharded_agent_call(self, run_task):
+        run = self.make_run()
+        added_items = [{"product_id": "sku-pasta-1", "package_count": 1}]
+        run_task.return_value = {"status": "cleared"}
+
+        result = cleanup_store_cart(
+            run,
+            "auchan",
+            added_items,
+            "https://eda.yandex.ru/cart",
+        )
+
+        self.assertEqual(result, {"status": "cleared"})
+        run_task.assert_called_once_with(
+            run,
+            "auchan",
+            "cleanup",
+            added_items=added_items,
+            cart_url="https://eda.yandex.ru/cart",
         )
 
     @patch("recipes.carting.pipeline.assemble_store_cart")

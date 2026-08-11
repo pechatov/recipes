@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PI_SSH_HOST="${PI_SSH_HOST:-pi}"
-TRUENAS_SSH_HOST="${TRUENAS_SSH_HOST:-truenas}"
-PI_ADDRESS="${PI_ADDRESS:-192.168.1.147}"
-PI_API_PORT="${PI_API_PORT:-8651}"
+: "${PI_SSH_HOST:?Set PI_SSH_HOST}"
+: "${TRUENAS_SSH_HOST:?Set TRUENAS_SSH_HOST}"
+: "${PI_ADDRESS:?Set PI_ADDRESS}"
+: "${PI_API_PORT:?Set PI_API_PORT}"
+: "${TRUENAS_ENV:?Set TRUENAS_ENV}"
+
 HERMES_PROFILE="${HERMES_PROFILE:-recipecart}"
 HERMES_MODEL="${HERMES_MODEL:-gpt-5.6-sol}"
-TRUENAS_ENV="${TRUENAS_ENV:-/mnt/main-pool/config/recipes/.env}"
 
 ssh "$PI_SSH_HOST" "PI_ADDRESS='$PI_ADDRESS' PI_API_PORT='$PI_API_PORT' HERMES_PROFILE='$HERMES_PROFILE' HERMES_MODEL='$HERMES_MODEL' bash -s" <<'REMOTE'
 set -Eeuo pipefail
@@ -103,7 +104,9 @@ PY
 
 # Hermes normally scopes a managed Camofox profile only to the Hermes profile.
 # This cart endpoint serves several recipe-site users, so derive the browser
-# userId from the authenticated X-Hermes-Session-Key instead. The fallback to
+# userId from the authenticated X-Hermes-Session-Key instead. Parallel shard
+# sessions keep distinct gateway conversations but deliberately share the base
+# user's browser profile, login cookies and server-side cart. The fallback to
 # task_id keeps CLI and non-gateway callers working.
 HERMES_ROOT="$HERMES_ROOT" python3 - <<'PY'
 import os
@@ -119,15 +122,30 @@ if import_line not in source:
     source = source.replace(marker, marker + import_line, 1)
 
 old_scope = '    logical_scope = task_id or "default"\n'
-new_scope = (
+previous_scope = (
     '    logical_scope = (\n'
     '        get_session_env("HERMES_SESSION_KEY", "").strip()\n'
     '        or task_id\n'
     '        or "default"\n'
     '    )\n'
 )
+new_scope = (
+    '    session_scope = (\n'
+    '        get_session_env("HERMES_SESSION_KEY", "").strip()\n'
+    '        or task_id\n'
+    '        or "default"\n'
+    '    )\n'
+    '    base_scope, separator, shard = session_scope.rpartition("-shard-")\n'
+    '    logical_scope = (\n'
+    '        base_scope\n'
+    '        if separator and shard in {"1", "2", "3", "4", "5"}\n'
+    '        else session_scope\n'
+    '    )\n'
+)
 if old_scope in source:
     source = source.replace(old_scope, new_scope, 1)
+elif previous_scope in source:
+    source = source.replace(previous_scope, new_scope, 1)
 elif new_scope not in source:
     raise SystemExit("Unsupported Hermes Camofox logical scope implementation")
 
@@ -332,5 +350,5 @@ tmp.chmod(0o600)
 tmp.replace(path)
 '"
 
-echo "Hermes cart profile is ready on pi:${PI_API_PORT}."
+echo "Hermes cart profile is ready."
 echo "For manual login: ./scripts/cart-browser-login-pi.sh start USER_ID"

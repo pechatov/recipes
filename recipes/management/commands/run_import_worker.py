@@ -63,7 +63,7 @@ class Command(BaseCommand):
             job = self.claim_job()
             if job:
                 try:
-                    process_import_job(job)
+                    recipes = process_import_job(job)
                 except ImportPipelineError as error:
                     job.status = ImportJob.Status.FAILED
                     job.error = str(error)[:2000]
@@ -72,13 +72,18 @@ class Command(BaseCommand):
                     self.stderr.write(f"Import {job.pk} failed: {error}")
                 except Exception:
                     job.status = ImportJob.Status.FAILED
-                    job.error = "Внутренняя ошибка импорта. Подробности сохранены в журнале сервера."
+                    job.error = (
+                        "Внутренняя ошибка импорта. "
+                        "Подробности сохранены в журнале сервера."
+                    )
                     job.finished_at = timezone.now()
                     job.save(update_fields=["status", "error", "finished_at"])
                     logger.exception("Import %s failed unexpectedly", job.pk)
                     self.stderr.write(f"Import {job.pk} failed unexpectedly")
                 else:
-                    self.stdout.write(f"Import {job.pk} completed")
+                    self.stdout.write(
+                        f"Import {job.pk} completed: {len(recipes)} recipe(s) created"
+                    )
             if options["once"]:
                 return
             if not job:

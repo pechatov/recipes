@@ -5,6 +5,7 @@
     {% if step.DELETE %}<label class="delete-control">{{ step.DELETE }} Удалить шаг</label>{% endif %}
   </div>
   <div class="form-grid">
+    {% include "recipes/_form_field.html" with field=step.section %}
     {% include "recipes/_form_field.html" with field=step.title %}
     {% include "recipes/_form_field.html" with field=step.instruction %}
     {% include "recipes/_form_field.html" with field=step.image %}

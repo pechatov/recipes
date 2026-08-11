@@ -3,7 +3,13 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import UserCreationForm
 from django.forms import BaseInlineFormSet, inlineformset_factory
 
-from .models import ImportJob, Recipe, RecipeIngredient, RecipeStep
+from .models import (
+    ImportJob,
+    Recipe,
+    RecipeIngredient,
+    RecipeStep,
+    is_water_ingredient_name,
+)
 
 
 class SetupForm(UserCreationForm):
@@ -23,6 +29,8 @@ class RecipeForm(forms.ModelForm):
             "servings",
             "prep_minutes",
             "cook_minutes",
+            "calories_per_serving",
+            "calories_per_100g",
             "cover",
         )
         widgets = {
@@ -36,19 +44,37 @@ class RecipeForm(forms.ModelForm):
             ),
         }
 
+    def save(self, commit=True):
+        recipe = super().save(commit=False)
+        if "cover" in self.changed_data:
+            recipe.cover_imported = False
+        if commit:
+            recipe.save()
+            self._save_m2m()
+        return recipe
+
 
 class ImportRecipeForm(forms.ModelForm):
     class Meta:
         model = ImportJob
-        fields = ("source_url",)
-        labels = {"source_url": "Ссылка на рецепт или видео"}
+        fields = ("source_url", "custom_prompt")
+        labels = {
+            "source_url": "Ссылка на рецепт или видео",
+            "custom_prompt": "Дополнительные пожелания",
+        }
         help_texts = {
             "source_url": "Подойдут страница с текстовым рецептом или видео на YouTube.",
         }
         widgets = {
             "source_url": forms.URLInput(
                 attrs={"placeholder": "https://…", "autocomplete": "url"}
-            )
+            ),
+            "custom_prompt": forms.Textarea(
+                attrs={
+                    "rows": 4,
+                    "placeholder": "Например: без мяса, сохранить авторские названия частей…",
+                }
+            ),
         }
 
 
@@ -62,6 +88,7 @@ class IngredientForm(forms.ModelForm):
             "unit",
             "search_query",
             "optional",
+            "is_pantry",
             "estimated",
         )
         widgets = {
@@ -72,18 +99,37 @@ class IngredientForm(forms.ModelForm):
             "search_query": forms.TextInput(attrs={"placeholder": "сливки 20%"}),
         }
 
+    def clean_name(self):
+        name = self.cleaned_data["name"]
+        unchanged_existing_water = self.instance.pk and "name" not in self.changed_data
+        if is_water_ingredient_name(name) and not unchanged_existing_water:
+            raise forms.ValidationError(
+                "Воду не нужно добавлять в ингредиенты — укажите её только в шагах."
+            )
+        return name
+
 
 class StepForm(forms.ModelForm):
     class Meta:
         model = RecipeStep
-        fields = ("title", "instruction", "image")
+        fields = ("section", "title", "instruction", "image")
         widgets = {
+            "section": forms.TextInput(attrs={"placeholder": "Например, для соуса"}),
             "title": forms.TextInput(attrs={"placeholder": "Например, приготовить соус"}),
             "instruction": forms.Textarea(attrs={"rows": 5, "placeholder": "Подробно опишите действие"}),
             "image": forms.ClearableFileInput(
                 attrs={"accept": "image/jpeg,image/png,image/webp", "data-image-input": ""}
             ),
         }
+
+    def save(self, commit=True):
+        step = super().save(commit=False)
+        if "image" in self.changed_data:
+            step.image_imported = False
+        if commit:
+            step.save()
+            self._save_m2m()
+        return step
 
 
 class OrderedInlineFormSet(BaseInlineFormSet):

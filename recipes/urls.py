@@ -7,6 +7,7 @@ urlpatterns = [
     path("healthz/", views.health, name="health"),
     path("setup/", views.setup_owner, name="setup-owner"),
     path("drafts/", views.draft_list, name="draft-list"),
+    path("tasks/", views.task_list, name="task-list"),
     path("imports/new/", views.import_create, name="import-create"),
     path("imports/<int:pk>/", views.import_detail, name="import-detail"),
     path("imports/<int:pk>/retry/", views.import_retry, name="import-retry"),

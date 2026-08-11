@@ -2,19 +2,40 @@
 set -Eeuo pipefail
 
 REPOSITORY="${REPOSITORY:-pechatov/recipes}"
-RUNNER_HOST="${RUNNER_HOST:-pi}"
-RUNNER_NAME="${RUNNER_NAME:-raspberry-pi-recipes}"
+: "${RUNNER_HOST:?Set RUNNER_HOST}"
+: "${RUNNER_SOURCE_DIR:?Set RUNNER_SOURCE_DIR}"
+: "${RUNNER_TARGET_DIR:?Set RUNNER_TARGET_DIR}"
+RUNNER_NAME="${RUNNER_NAME:-recipes-deploy}"
 RUNNER_LABEL="${RUNNER_LABEL:-recipes-truenas-deploy}"
+
+if [[ ! "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+  || [[ ! "$RUNNER_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] \
+  || [[ ! "$RUNNER_LABEL" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+  echo "Invalid runner identity settings." >&2
+  exit 1
+fi
+for runner_path in "$RUNNER_SOURCE_DIR" "$RUNNER_TARGET_DIR"; do
+  if [[ ! "$runner_path" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || [[ "$runner_path" == *"/../"* || "$runner_path" == *"/./"* ]]; then
+    echo "Invalid runner path." >&2
+    exit 1
+  fi
+done
 
 command -v gh >/dev/null
 gh auth status >/dev/null
 registration_token="$(gh api --method POST "repos/$REPOSITORY/actions/runners/registration-token" --jq .token)"
 
-ssh "$RUNNER_HOST" \
-  "REPOSITORY='$REPOSITORY' RUNNER_NAME='$RUNNER_NAME' RUNNER_LABEL='$RUNNER_LABEL' RUNNER_TOKEN='$registration_token' bash -s" <<'REMOTE'
+ssh "$RUNNER_HOST" bash -s -- \
+  "$REPOSITORY" "$RUNNER_NAME" "$RUNNER_LABEL" "$registration_token" \
+  "$RUNNER_SOURCE_DIR" "$RUNNER_TARGET_DIR" <<'REMOTE'
 set -Eeuo pipefail
-source_runner="$HOME/actions-runner/task-tracker"
-target_runner="$HOME/actions-runner/recipes"
+REPOSITORY="$1"
+RUNNER_NAME="$2"
+RUNNER_LABEL="$3"
+RUNNER_TOKEN="$4"
+source_runner="$5"
+target_runner="$6"
 
 if [[ ! -x "$source_runner/config.sh" ]]; then
   echo "Existing task-tracker Actions runner distribution was not found" >&2

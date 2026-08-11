@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-TRUENAS_HOST="${TRUENAS_HOST:-truenas}"
+: "${TRUENAS_HOST:?Set TRUENAS_HOST}"
+: "${RECIPES_APP_ROOT:?Set RECIPES_APP_ROOT}"
 
-ssh "$TRUENAS_HOST" bash -s <<'REMOTE'
+if [[ ! "$RECIPES_APP_ROOT" =~ ^/mnt/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] \
+  || [[ "${RECIPES_APP_ROOT##*/}" != "recipes" ]] \
+  || [[ "$RECIPES_APP_ROOT" == *"/../"* || "$RECIPES_APP_ROOT" == *"/./"* ]]; then
+  echo "Refusing to back up an unexpected path." >&2
+  exit 1
+fi
+
+ssh "$TRUENAS_HOST" bash -s -- "$RECIPES_APP_ROOT" <<'REMOTE'
 set -Eeuo pipefail
 
-dataset="main-pool/config/recipes/backups"
-backup_root="/mnt/main-pool/config/recipes/backups"
+app_root="$1"
+dataset_root="${app_root#/mnt/}"
+dataset="$dataset_root/backups"
+backup_root="$app_root/backups"
 stamp="$(date +%Y%m%d-%H%M%S)"
 dump_path="$backup_root/recipes-$stamp.dump"
 snapshot="manual-$stamp"
@@ -24,8 +34,8 @@ fi
 
 sudo sh -c "docker exec ix-recipes-db-1 pg_dump -U recipes -Fc recipes > '$dump_path'"
 sudo chmod 0600 "$dump_path"
-sudo zfs snapshot -r "main-pool/config/recipes@$snapshot"
+sudo zfs snapshot -r "$dataset_root@$snapshot"
 
 echo "Database dump: $dump_path"
-echo "Recursive ZFS snapshot: main-pool/config/recipes@$snapshot"
+echo "Recursive ZFS snapshot created."
 REMOTE

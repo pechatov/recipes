@@ -3,21 +3,28 @@ set -Eeuo pipefail
 
 : "${DEPLOY_SSH_TARGET:?Set DEPLOY_SSH_TARGET, for example nas}"
 : "${RECIPES_APP_ROOT:?Set RECIPES_APP_ROOT}"
+: "${RECIPES_BIND_ADDRESS:?Set RECIPES_BIND_ADDRESS}"
+: "${RECIPES_PORT:?Set RECIPES_PORT}"
+: "${RECIPES_HEALTH_URL:?Set RECIPES_HEALTH_URL}"
 : "${RECIPES_IMAGE:?Set RECIPES_IMAGE}"
 : "${RECIPES_TAG:?Set RECIPES_TAG}"
 : "${GHCR_USERNAME:?Set GHCR_USERNAME}"
 : "${GHCR_TOKEN:?Set GHCR_TOKEN}"
 
 APP_NAME="recipes"
-EXPECTED_ROOT="/mnt/main-pool/config/recipes"
-HEALTH_URL="${RECIPES_HEALTH_URL:-http://192.168.31.2:30111/healthz/}"
 IMAGE_REF="${RECIPES_IMAGE}:${RECIPES_TAG}"
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEMPLATE="$SOURCE_ROOT/deploy/compose.truenas.yaml"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
-if [[ "$RECIPES_APP_ROOT" != "$EXPECTED_ROOT" ]]; then
+if [[ ! "$RECIPES_APP_ROOT" =~ ^/mnt/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] \
+  || [[ "${RECIPES_APP_ROOT##*/}" != "recipes" ]] \
+  || [[ "$RECIPES_APP_ROOT" == *"/../"* || "$RECIPES_APP_ROOT" == *"/./"* ]]; then
   echo "Refusing to deploy to unexpected root: $RECIPES_APP_ROOT" >&2
+  exit 1
+fi
+if [[ ! "$RECIPES_HEALTH_URL" =~ ^https?://[A-Za-z0-9.:-]+/ ]]; then
+  echo "Invalid RECIPES_HEALTH_URL" >&2
   exit 1
 fi
 if [[ ! "$GHCR_USERNAME" =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -39,16 +46,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-TEMPLATE="$TEMPLATE" IMAGE_REF="$IMAGE_REF" RENDERED="$rendered_compose" python3 - <<'PY'
-import os
-from pathlib import Path
-
-template = Path(os.environ["TEMPLATE"]).read_text()
-marker = "${RECIPES_IMAGE:-recipes}:${RECIPES_TAG:-local}"
-if marker not in template:
-    raise SystemExit("TrueNAS compose image marker is missing")
-Path(os.environ["RENDERED"]).write_text(template.replace(marker, os.environ["IMAGE_REF"]))
-PY
+RECIPES_IMAGE_REF="$IMAGE_REF" \
+  python3 "$SOURCE_ROOT/scripts/deploy/render-compose.py" \
+  "$TEMPLATE" "$rendered_compose"
 
 remote_compose="$RECIPES_APP_ROOT/source/deploy/compose.truenas.yaml"
 ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" \
@@ -64,14 +64,16 @@ auth_dir="/tmp/recipes-ghcr-$run_id"
 printf '%s' "$GHCR_TOKEN" | ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" \
   "set -eu; trap 'sudo rm -rf -- \"$auth_dir\"' EXIT HUP INT TERM; sudo install -d -m 0700 '$auth_dir'; sudo env DOCKER_CONFIG='$auth_dir' docker login ghcr.io --username '$GHCR_USERNAME' --password-stdin >/dev/null; sudo env DOCKER_CONFIG='$auth_dir' docker pull '$IMAGE_REF' >/dev/null"
 
-ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" bash -s -- "$APP_NAME" "$remote_compose" "$IMAGE_REF" <<'REMOTE'
+ssh "${SSH_OPTS[@]}" "$DEPLOY_SSH_TARGET" bash -s -- \
+  "$APP_NAME" "$remote_compose" "$IMAGE_REF" "$RECIPES_APP_ROOT" <<'REMOTE'
 set -Eeuo pipefail
 app_name="$1"
 compose_path="$2"
 image_ref="$3"
+app_root="$4"
 
 sudo docker image inspect "$image_ref" >/dev/null
-test -f /mnt/main-pool/config/recipes/.env
+test -f "$app_root/.env"
 payload="$(sudo jq -n --rawfile compose "$compose_path" '{custom_compose_config_string: $compose}')"
 job_id="$(sudo midclt call app.update "$app_name" "$payload")"
 
@@ -94,8 +96,8 @@ sudo midclt call app.get_instance "$app_name" | jq -e \
 REMOTE
 
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null; then
-    echo "Recipes $RECIPES_TAG is healthy at $HEALTH_URL"
+  if curl -fsS --max-time 3 "$RECIPES_HEALTH_URL" >/dev/null; then
+    echo "Recipes $RECIPES_TAG is healthy"
     exit 0
   fi
   sleep 2
