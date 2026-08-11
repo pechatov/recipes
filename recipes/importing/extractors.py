@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import re
 import socket
+import ssl
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-import httpx
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import YouTubeTranscriptApiException
@@ -65,7 +67,7 @@ def detect_source_type(url: str) -> str:
     return "youtube" if youtube_video_id(url) else "website"
 
 
-def _validate_public_url(url: str) -> None:
+def _resolve_public_url(url: str):
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise SourceError("Нужна публичная ссылка с адресом http:// или https://.")
@@ -87,41 +89,99 @@ def _validate_public_url(url: str) -> None:
         ip = ipaddress.ip_address(address[4][0])
         if not ip.is_global:
             raise SourceError("Импорт из локальной или служебной сети запрещён.")
+    return parsed, str(ipaddress.ip_address(addresses[0][4][0]))
+
+
+def _validate_public_url(url: str) -> None:
+    _resolve_public_url(url)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, pinned_ip, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port, **kwargs)
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, pinned_ip, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port, **kwargs)
+
+    def connect(self):
+        raw_socket = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+@contextmanager
+def _open_public_url(url: str, *, headers: dict[str, str], timeout: float):
+    parsed, pinned_ip = _resolve_public_url(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme == "https":
+        connection = _PinnedHTTPSConnection(
+            parsed.hostname,
+            port,
+            pinned_ip,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+    else:
+        connection = _PinnedHTTPConnection(
+            parsed.hostname,
+            port,
+            pinned_ip,
+            timeout=timeout,
+        )
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    try:
+        connection.request("GET", target, headers=headers)
+        yield connection.getresponse()
+    finally:
+        connection.close()
 
 
 def _download_html(url: str) -> tuple[str, str]:
     current_url = url
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    with httpx.Client(timeout=20, follow_redirects=False, headers=headers) as client:
-        for _ in range(MAX_REDIRECTS + 1):
-            _validate_public_url(current_url)
-            try:
-                with client.stream("GET", current_url) as response:
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise SourceError("Сайт вернул перенаправление без нового адреса.")
-                        current_url = urljoin(current_url, location)
-                        continue
-                    response.raise_for_status()
-                    content_type = response.headers.get("content-type", "").lower()
-                    if "html" not in content_type:
-                        raise SourceError("По ссылке не найдена HTML-страница с рецептом.")
-                    chunks: list[bytes] = []
-                    size = 0
-                    for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > MAX_SOURCE_BYTES:
-                            raise SourceError("Страница слишком большая для безопасного импорта.")
-                        chunks.append(chunk)
-                    encoding = response.encoding or "utf-8"
-                    return b"".join(chunks).decode(encoding, errors="replace"), str(response.url)
-            except httpx.HTTPStatusError as error:
-                raise SourceError(
-                    f"Сайт вернул ошибку HTTP {error.response.status_code}."
-                ) from error
-            except httpx.HTTPError as error:
-                raise SourceError("Не удалось загрузить страницу с рецептом.") from error
+    for _ in range(MAX_REDIRECTS + 1):
+        try:
+            with _open_public_url(current_url, headers=headers, timeout=20) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise SourceError("Сайт вернул перенаправление без нового адреса.")
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status >= 400:
+                    raise SourceError(f"Сайт вернул ошибку HTTP {response.status}.")
+                content_type = response.headers.get("content-type", "").lower()
+                if "html" not in content_type:
+                    raise SourceError("По ссылке не найдена HTML-страница с рецептом.")
+                chunks: list[bytes] = []
+                size = 0
+                while chunk := response.read(min(65_536, MAX_SOURCE_BYTES + 1 - size)):
+                    size += len(chunk)
+                    if size > MAX_SOURCE_BYTES:
+                        raise SourceError("Страница слишком большая для безопасного импорта.")
+                    chunks.append(chunk)
+                encoding = response.headers.get_content_charset() or "utf-8"
+                return b"".join(chunks).decode(encoding, errors="replace"), current_url
+        except SourceError:
+            raise
+        except (OSError, http.client.HTTPException, ssl.SSLError) as error:
+            raise SourceError("Не удалось загрузить страницу с рецептом.") from error
     raise SourceError("Сайт перенаправляет запрос слишком много раз.")
 
 

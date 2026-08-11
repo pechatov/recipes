@@ -2,6 +2,7 @@ import re
 from decimal import Decimal
 
 from django.conf import settings
+from django.contrib.postgres.indexes import GinIndex
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.urls import reverse
@@ -120,6 +121,7 @@ class Recipe(models.Model):
         blank=True,
         validators=[validate_recipe_image],
     )
+    cover_imported = models.BooleanField(default=False, editable=False)
     status = models.CharField(
         "статус",
         max_length=16,
@@ -146,6 +148,18 @@ class Recipe(models.Model):
 
     class Meta:
         ordering = ["-updated_at", "title"]
+        indexes = [
+            GinIndex(
+                fields=["title"],
+                name="recipe_title_trgm",
+                opclasses=["gin_trgm_ops"],
+            ),
+            GinIndex(
+                fields=["description"],
+                name="recipe_desc_trgm",
+                opclasses=["gin_trgm_ops"],
+            ),
+        ]
         verbose_name = "рецепт"
         verbose_name_plural = "рецепты"
 
@@ -215,6 +229,13 @@ class RecipeIngredient(models.Model):
 
     class Meta:
         ordering = ["order", "pk"]
+        indexes = [
+            GinIndex(
+                fields=["name"],
+                name="ingredient_name_trgm",
+                opclasses=["gin_trgm_ops"],
+            )
+        ]
         verbose_name = "ингредиент"
         verbose_name_plural = "ингредиенты"
 
@@ -246,6 +267,7 @@ class RecipeStep(models.Model):
         blank=True,
         validators=[validate_recipe_image],
     )
+    image_imported = models.BooleanField(default=False, editable=False)
     order = models.PositiveSmallIntegerField(default=0)
 
     class Meta:

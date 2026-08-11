@@ -161,17 +161,17 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, exact.title)
         self.assertContains(response, self.recipe.title)
 
-    def test_fuzzy_search_caps_python_candidate_processing(self):
-        for index in range(8):
-            Recipe.objects.create(title=f"Сливовый рецепт {index}", created_by=self.user)
+    def test_exact_search_match_is_not_lost_outside_ranked_fuzzy_pool(self):
+        exact = Recipe.objects.create(
+            title="СЛВК — точное совпадение",
+            created_by=self.user,
+        )
         self.client.force_login(self.user)
 
-        with patch("recipes.views.SEARCH_CANDIDATE_LIMIT", 5), patch(
-            "recipes.views._recipe_matches_fuzzy_query", return_value=False
-        ) as matcher:
-            self.client.get(reverse("recipe-list"), {"q": "слив"})
+        with patch("recipes.views._ranked_fuzzy_candidates", return_value=[]):
+            response = self.client.get(reverse("recipe-list"), {"q": "слвк"})
 
-        self.assertEqual(matcher.call_count, 5)
+        self.assertContains(response, exact.title)
 
     def test_fuzzy_search_rejects_input_before_building_an_unbounded_query(self):
         self.client.force_login(self.user)

@@ -44,6 +44,15 @@ class RecipeForm(forms.ModelForm):
             ),
         }
 
+    def save(self, commit=True):
+        recipe = super().save(commit=False)
+        if "cover" in self.changed_data:
+            recipe.cover_imported = False
+        if commit:
+            recipe.save()
+            self._save_m2m()
+        return recipe
+
 
 class ImportRecipeForm(forms.ModelForm):
     class Meta:
@@ -112,6 +121,15 @@ class StepForm(forms.ModelForm):
                 attrs={"accept": "image/jpeg,image/png,image/webp", "data-image-input": ""}
             ),
         }
+
+    def save(self, commit=True):
+        step = super().save(commit=False)
+        if "image" in self.changed_data:
+            step.image_imported = False
+        if commit:
+            step.save()
+            self._save_m2m()
+        return step
 
 
 class OrderedInlineFormSet(BaseInlineFormSet):

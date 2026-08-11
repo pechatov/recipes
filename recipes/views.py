@@ -8,8 +8,10 @@ from django.contrib import messages
 from django.contrib.auth import get_user_model, login
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
-from django.db import transaction
-from django.db.models import Q
+from django.contrib.postgres.search import TrigramSimilarity
+from django.db import connection, transaction
+from django.db.models import FloatField, Max, Q, Value
+from django.db.models.functions import Coalesce, Greatest
 from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -28,6 +30,15 @@ from .services import build_shopping_items, get_store_preferences
 SEARCH_CANDIDATE_LIMIT = 500
 MAX_SEARCH_QUERY_LENGTH = 120
 MAX_SEARCH_TOKENS = 8
+SEARCH_FIELDS = (
+    "title",
+    "description",
+    "created_by__username",
+    "created_by__first_name",
+    "created_by__last_name",
+    "categories__name",
+    "ingredients__name",
+)
 
 
 def health(request):
@@ -72,15 +83,6 @@ def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
 
 
 def _search_candidate_filter(query: str) -> Q:
-    fields = (
-        "title",
-        "description",
-        "created_by__username",
-        "created_by__first_name",
-        "created_by__last_name",
-        "categories__name",
-        "ingredients__name",
-    )
     candidate_filter = Q()
     for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
         fragments = {token} if len(token) < 3 else {
@@ -92,10 +94,35 @@ def _search_candidate_filter(query: str) -> Q:
             # keep the portable development database useful; PostgreSQL's
             # ILIKE naturally collapses them.
             for variant in {fragment, fragment.capitalize(), fragment.upper()}:
-                for field in fields:
+                for field in SEARCH_FIELDS:
                     token_filter |= Q(**{f"{field}__icontains": variant})
         candidate_filter &= token_filter
     return candidate_filter
+
+
+def _exact_search_filter(query: str) -> Q:
+    exact_filter = Q()
+    for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
+        token_filter = Q()
+        for variant in {token, token.capitalize(), token.upper()}:
+            for field in SEARCH_FIELDS:
+                token_filter |= Q(**{f"{field}__icontains": variant})
+        exact_filter &= token_filter
+    return exact_filter
+
+
+def _ranked_fuzzy_candidates(recipes, query: str):
+    candidates = recipes.filter(_search_candidate_filter(query)).distinct()
+    if connection.vendor != "postgresql":
+        return candidates
+    zero = Value(0.0, output_field=FloatField())
+    similarities = [
+        Coalesce(Max(TrigramSimilarity(field, query)), zero)
+        for field in SEARCH_FIELDS
+    ]
+    return candidates.annotate(
+        search_similarity=Greatest(*similarities)
+    ).order_by("-search_similarity", "-updated_at")[:SEARCH_CANDIDATE_LIMIT]
 
 
 @require_http_methods(["GET", "POST"])
@@ -137,12 +164,17 @@ def recipe_list(request):
     if selected_author.isdigit():
         recipes = recipes.filter(created_by_id=selected_author)
     if query:
-        recipes = recipes.filter(_search_candidate_filter(query)).distinct()[
-            :SEARCH_CANDIDATE_LIMIT
-        ]
-        recipes = [
-            recipe for recipe in recipes if _recipe_matches_fuzzy_query(recipe, query)
-        ]
+        exact_matches = list(recipes.filter(_exact_search_filter(query)).distinct())
+        fuzzy_candidates = _ranked_fuzzy_candidates(recipes, query)
+        candidate_recipes = exact_matches + list(fuzzy_candidates)
+        seen_recipe_ids = set()
+        recipes = []
+        for recipe in candidate_recipes:
+            if recipe.pk in seen_recipe_ids:
+                continue
+            seen_recipe_ids.add(recipe.pk)
+            if _recipe_matches_fuzzy_query(recipe, query):
+                recipes.append(recipe)
     return render(
         request,
         "recipes/recipe_list.html",

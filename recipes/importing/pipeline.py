@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import logging
+import ssl
 from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import urljoin
 
-import httpx
 from PIL import Image, UnidentifiedImageError
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -23,7 +24,7 @@ from .extractors import (
     MAX_REDIRECTS,
     USER_AGENT,
     SourceDocument,
-    _validate_public_url,
+    _open_public_url,
     extract_source,
 )
 from .llm import adapt_with_ai
@@ -92,62 +93,57 @@ def _download_image(url: str) -> DownloadedImage | None:
     current_url = url
     headers = {"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,image/webp"}
     try:
-        with httpx.Client(
-            timeout=15,
-            follow_redirects=False,
-            headers=headers,
-            trust_env=False,
-        ) as client:
-            for _ in range(MAX_REDIRECTS + 1):
-                _validate_public_url(current_url)
-                with client.stream("GET", current_url) as response:
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        location = response.headers.get("location")
-                        if not location:
-                            return None
-                        current_url = urljoin(current_url, location)
-                        continue
-                    response.raise_for_status()
-                    content_type = (
-                        response.headers.get("content-type", "")
-                        .split(";", 1)[0]
-                        .lower()
-                    )
-                    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        for _ in range(MAX_REDIRECTS + 1):
+            with _open_public_url(current_url, headers=headers, timeout=15) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
                         return None
-                    chunks: list[bytes] = []
-                    size = 0
-                    for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > MAX_IMAGE_BYTES:
-                            return None
-                        chunks.append(chunk)
-                    content = b"".join(chunks)
-                    with Image.open(io.BytesIO(content)) as image:
-                        width, height = image.size
-                        if (
-                            width > MAX_IMAGE_WIDTH
-                            or height > MAX_IMAGE_HEIGHT
-                            or width * height > MAX_IMAGE_PIXELS
-                        ):
-                            return None
-                        image.verify()
-                    if width < 1 or height < 1:
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status >= 400:
+                    return None
+                content_type = (
+                    response.headers.get("content-type", "")
+                    .split(";", 1)[0]
+                    .lower()
+                )
+                if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+                    return None
+                chunks: list[bytes] = []
+                size = 0
+                while chunk := response.read(min(65_536, MAX_IMAGE_BYTES + 1 - size)):
+                    size += len(chunk)
+                    if size > MAX_IMAGE_BYTES:
                         return None
-                    extension = {
-                        "image/jpeg": ".jpg",
-                        "image/png": ".png",
-                        "image/webp": ".webp",
-                    }[content_type]
-                    digest = hashlib.sha256(current_url.encode()).hexdigest()[:16]
-                    return DownloadedImage(
-                        f"import-{digest}{extension}",
-                        content,
-                        width,
-                        height,
-                    )
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                with Image.open(io.BytesIO(content)) as image:
+                    width, height = image.size
+                    if (
+                        width > MAX_IMAGE_WIDTH
+                        or height > MAX_IMAGE_HEIGHT
+                        or width * height > MAX_IMAGE_PIXELS
+                    ):
+                        return None
+                    image.verify()
+                if width < 1 or height < 1:
+                    return None
+                extension = {
+                    "image/jpeg": ".jpg",
+                    "image/png": ".png",
+                    "image/webp": ".webp",
+                }[content_type]
+                digest = hashlib.sha256(current_url.encode()).hexdigest()[:16]
+                return DownloadedImage(
+                    f"import-{digest}{extension}",
+                    content,
+                    width,
+                    height,
+                )
     except (
-        httpx.HTTPError,
+        http.client.HTTPException,
+        ssl.SSLError,
         OSError,
         UnidentifiedImageError,
         Image.DecompressionBombError,
@@ -263,7 +259,7 @@ def _delete_stored_files(files: list[tuple[Any, str]]) -> None:
 def _step_stored_files(recipe: Recipe) -> list[tuple[Any, str]]:
     return [
         stored
-        for step in recipe.steps.exclude(image="").only("image")
+        for step in recipe.steps.filter(image_imported=True).exclude(image="").only("image")
         if (stored := _stored_file(step.image))
     ]
 
@@ -362,6 +358,14 @@ def save_draft(
                     "Черновики изменились во время обработки. Повторный импорт отменён, "
                     "чтобы не потерять пользовательские правки."
                 )
+            if RecipeStep.objects.filter(
+                recipe_id__in=linked_recipe_ids,
+                image_imported=False,
+            ).exclude(image="").exists():
+                raise ImportPipelineError(
+                    "В черновиках есть фотографии шагов, добавленные вручную. "
+                    "Повторный импорт отменён, чтобы не удалить их."
+                )
             existing_drafts: list[Recipe] = []
             primary_recipe = locked_recipes.get(locked_job.recipe_id)
             if primary_recipe:
@@ -378,10 +382,11 @@ def save_draft(
                     recipe = existing_drafts[recipe_index]
                     for field, value in _recipe_values(locked_job, values).items():
                         setattr(recipe, field, value)
-                    if cover_image:
-                        old_cover = _stored_file(recipe.cover)
-                        if old_cover:
-                            old_files.append(old_cover)
+                    if cover_image and (not recipe.cover or recipe.cover_imported):
+                        if recipe.cover_imported:
+                            old_cover = _stored_file(recipe.cover)
+                            if old_cover:
+                                old_files.append(old_cover)
                         recipe.cover.save(
                             cover_image.name,
                             ContentFile(cover_image.content),
@@ -390,6 +395,7 @@ def save_draft(
                         new_cover = _stored_file(recipe.cover)
                         if new_cover:
                             new_files.append(new_cover)
+                        recipe.cover_imported = True
                     old_files.extend(_step_stored_files(recipe))
                     recipe.save()
                     recipe.ingredients.all().delete()
@@ -409,6 +415,7 @@ def save_draft(
                         new_cover = _stored_file(recipe.cover)
                         if new_cover:
                             new_files.append(new_cover)
+                        recipe.cover_imported = True
                     recipe.save()
 
                 RecipeIngredient.objects.bulk_create(
@@ -433,6 +440,7 @@ def save_draft(
                         new_step = _stored_file(recipe_step.image)
                         if new_step:
                             new_files.append(new_step)
+                        recipe_step.image_imported = True
                     steps.append(recipe_step)
                 RecipeStep.objects.bulk_create(steps)
                 _set_categories(recipe, values.get("categories", []))

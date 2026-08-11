@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -12,6 +12,8 @@ from recipes.importing.exceptions import (
 )
 from recipes.importing.extractors import (
     SourceDocument,
+    _PinnedHTTPSConnection,
+    _resolve_public_url,
     _validate_public_url,
     extract_website,
     youtube_video_id,
@@ -45,6 +47,38 @@ class ExtractorTests(TestCase):
         for url in ("http://127.0.0.1/secret", "http://[::1]/", "http://192.168.1.10/"):
             with self.subTest(url=url), self.assertRaises(SourceError):
                 _validate_public_url(url)
+
+    @patch("recipes.importing.extractors.socket.create_connection")
+    @patch("recipes.importing.extractors.socket.getaddrinfo")
+    def test_public_request_connects_to_the_validated_ip_with_original_tls_name(
+        self, getaddrinfo, create_connection
+    ):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        parsed, pinned_ip = _resolve_public_url("https://safe.example/image.jpg")
+        tls_context = Mock()
+        raw_socket = create_connection.return_value
+        wrapped_socket = tls_context.wrap_socket.return_value
+
+        connection = _PinnedHTTPSConnection(
+            parsed.hostname,
+            443,
+            pinned_ip,
+            timeout=15,
+            context=tls_context,
+        )
+        connection.connect()
+
+        getaddrinfo.assert_called_once()
+        create_connection.assert_called_once_with(
+            ("93.184.216.34", 443), 15, None
+        )
+        tls_context.wrap_socket.assert_called_once_with(
+            raw_socket,
+            server_hostname="safe.example",
+        )
+        self.assertIs(connection.sock, wrapped_socket)
 
     @patch("recipes.importing.extractors._download_html")
     def test_extracts_recipe_json_ld_and_readable_text(self, download):
@@ -793,7 +827,10 @@ class PipelineTests(TestCase):
 
         self.assertTrue(Path(recipe.cover.name).stem.startswith("cover"))
         self.assertEqual(Path(recipe.cover.name).suffix, ".jpg")
-        self.assertTrue(Path(recipe.steps.get().image.name).stem.startswith("step"))
+        step = recipe.steps.get()
+        self.assertTrue(Path(step.image.name).stem.startswith("step"))
+        self.assertTrue(recipe.cover_imported)
+        self.assertTrue(step.image_imported)
 
     @patch("recipes.importing.pipeline._prepare_images")
     @patch("django.core.files.storage.FileSystemStorage.delete")
@@ -816,10 +853,12 @@ class PipelineTests(TestCase):
         )
         draft = save_draft(job, self.recipe_data("Старый рецепт"))[0]
         draft.cover.name = "recipes/covers/old-cover.jpg"
-        draft.save(update_fields=["cover"])
+        draft.cover_imported = True
+        draft.save(update_fields=["cover", "cover_imported"])
         old_step = draft.steps.get()
         old_step.image.name = "recipes/steps/old-step.jpg"
-        old_step.save(update_fields=["image"])
+        old_step.image_imported = True
+        old_step.save(update_fields=["image", "image_imported"])
 
         with self.captureOnCommitCallbacks(execute=True):
             save_draft(
@@ -831,6 +870,61 @@ class PipelineTests(TestCase):
         deleted_names = [call.args[-1] for call in storage_delete.call_args_list]
         self.assertIn("recipes/covers/old-cover.jpg", deleted_names)
         self.assertIn("recipes/steps/old-step.jpg", deleted_names)
+
+    @patch("recipes.importing.pipeline._prepare_images")
+    @patch("django.core.files.storage.FileSystemStorage.delete")
+    @patch("django.core.files.storage.FileSystemStorage._save")
+    def test_reprocess_preserves_manual_cover(
+        self, storage_save, storage_delete, prepare_images
+    ):
+        storage_save.side_effect = lambda name, content: name
+        prepare_images.return_value = [
+            (DownloadedImage("replacement.jpg", b"replacement"), [None])
+        ]
+        user = get_user_model().objects.create_user("manual-cover-owner")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/manual-cover",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        draft = save_draft(job, self.recipe_data("Старый рецепт"))[0]
+        draft.cover.name = "recipes/covers/manual-cover.jpg"
+        draft.cover_imported = False
+        draft.save(update_fields=["cover", "cover_imported"])
+
+        save_draft(
+            job,
+            self.recipe_data("Новый рецепт"),
+            document=SourceDocument("website", "Рецепт", "Описание приготовления"),
+        )
+
+        draft.refresh_from_db()
+        self.assertEqual(draft.cover.name, "recipes/covers/manual-cover.jpg")
+        self.assertFalse(draft.cover_imported)
+        self.assertNotIn(
+            "recipes/covers/manual-cover.jpg",
+            [call.args[-1] for call in storage_delete.call_args_list],
+        )
+
+    def test_reprocess_blocks_manual_step_images_without_deleting_them(self):
+        user = get_user_model().objects.create_user("manual-step-owner")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/manual-step",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        draft = save_draft(job, self.recipe_data("Старый рецепт"))[0]
+        step = draft.steps.get()
+        step.image.name = "recipes/steps/manual-step.jpg"
+        step.save(update_fields=["image"])
+
+        with self.assertRaisesRegex(ImportPipelineError, "добавленные вручную"):
+            save_draft(job, self.recipe_data("Новый рецепт"))
+
+        draft.refresh_from_db()
+        step.refresh_from_db()
+        self.assertEqual(draft.title, "Старый рецепт")
+        self.assertEqual(step.image.name, "recipes/steps/manual-step.jpg")
 
     @patch("recipes.importing.pipeline._prepare_images")
     @patch("django.core.files.storage.FileSystemStorage.delete")
@@ -853,7 +947,8 @@ class PipelineTests(TestCase):
         )
         draft = save_draft(job, self.recipe_data("Старый рецепт"))[0]
         draft.cover.name = "recipes/covers/keep-cover.jpg"
-        draft.save(update_fields=["cover"])
+        draft.cover_imported = True
+        draft.save(update_fields=["cover", "cover_imported"])
 
         with patch(
             "recipes.importing.pipeline.RecipeIngredient.objects.bulk_create",
