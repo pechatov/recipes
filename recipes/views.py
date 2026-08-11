@@ -122,7 +122,7 @@ def _search_token_matches(token: str, search_text: str) -> bool:
     words = search_text.split()
     if any(_is_search_subsequence(token, word) for word in words):
         return True
-    maximum_distance = 1 if len(token) <= 5 else 2 if len(token) <= 8 else 3
+    maximum_distance = _search_maximum_distance(token)
     return any(
         abs(len(token) - len(word)) <= maximum_distance
         and _search_edit_distance(token, word) <= maximum_distance
@@ -150,7 +150,32 @@ def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
     )
 
 
+def _search_maximum_distance(token: str) -> int:
+    return 1 if len(token) <= 5 else 2 if len(token) <= 8 else 3
+
+
 def _search_token_fragments(token: str) -> list[str]:
+    """Return a bounded prefilter that cannot reject an allowed fuzzy match.
+
+    A match may remove or replace at most ``maximum_distance`` characters.
+    Selecting one more character than that guarantees at least one selected
+    character remains. Insertions and transpositions preserve the characters.
+    """
+    fragment_count = min(
+        len(token),
+        _search_maximum_distance(token) + 1,
+        MAX_SEARCH_FRAGMENTS_PER_TOKEN,
+    )
+    if fragment_count == 1:
+        return [token[0]]
+    indexes = [
+        round(index * (len(token) - 1) / (fragment_count - 1))
+        for index in range(fragment_count)
+    ]
+    return list(dict.fromkeys(token[index] for index in indexes))
+
+
+def _search_rank_fragments(token: str) -> list[str]:
     bigrams = list(
         dict.fromkeys(
             token[index:index + 2] for index in range(max(0, len(token) - 1))
@@ -194,7 +219,7 @@ def _ranked_fuzzy_candidates(recipes, query: str):
     if connection.vendor != "postgresql":
         fragments = []
         for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
-            fragments.extend(_search_token_fragments(token))
+            fragments.extend(_search_rank_fragments(token))
         fragments = list(dict.fromkeys(fragments))[:MAX_SEARCH_RANK_FRAGMENTS]
         score_parts = []
         for fragment in fragments:

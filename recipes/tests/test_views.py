@@ -204,6 +204,17 @@ class RecipeViewTests(TestCase):
 
                 self.assertContains(response, "Семейная паста")
 
+    def test_fuzzy_prefilter_keeps_match_with_three_replacements(self):
+        fuzzy_match = Recipe.objects.create(
+            title="xbcdxfghx",
+            created_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "abcdefghi"})
+
+        self.assertContains(response, fuzzy_match.title)
+
     def test_fuzzy_search_does_not_drop_an_old_match_after_many_candidates(self):
         Recipe.objects.bulk_create(
             [
