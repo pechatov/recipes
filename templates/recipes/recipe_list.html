@@ -7,11 +7,11 @@
       <p class="eyebrow">Наша семейная коллекция</p>
       <h1>Что приготовим?</h1>
     </div>
-    <form class="search-form" role="search" data-recipe-filters>
+    <form class="search-form" role="search" data-recipe-filters data-server-filtered="{{ query|yesno:'true,false' }}">
       <div class="search-field">
         <label class="sr-only" for="recipe-search">Поиск рецептов</label>
         <input id="recipe-search" type="search" name="q" value="{{ query }}" placeholder="Блюдо или ингредиент" autocomplete="off" data-recipe-search>
-        <span class="search-hint" aria-hidden="true">фильтр сразу</span>
+        <span class="search-hint" aria-hidden="true">{% if query %}Enter — новый поиск{% else %}фильтр сразу{% endif %}</span>
       </div>
       <label class="author-filter">
         <span class="sr-only">Автор рецепта</span>

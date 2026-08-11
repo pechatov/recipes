@@ -108,6 +108,7 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(response, "Семейная паста")
         self.assertNotContains(response, "Яблочный пирог")
+        self.assertContains(response, 'data-server-filtered="true"')
 
     def test_water_is_hidden_without_deleting_historical_quantity(self):
         water = RecipeIngredient.objects.create(
@@ -121,6 +122,7 @@ class RecipeViewTests(TestCase):
         response = self.client.get(self.recipe.get_absolute_url())
 
         self.assertNotContains(response, "Горячая вода")
+        self.assertEqual(str(response.context["recipe"].calories_per_100g), "58.6")
         self.assertTrue(RecipeIngredient.objects.filter(pk=water.pk).exists())
 
     def test_recipe_list_filters_by_category(self):

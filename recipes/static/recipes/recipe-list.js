@@ -5,6 +5,7 @@
   if (!grid || !input || !form) return;
 
   const cards = [...grid.querySelectorAll("[data-recipe-card]")];
+  const serverFiltered = form.dataset.serverFiltered === "true";
   const empty = document.querySelector("[data-live-empty]");
   const categoryLinks = [...document.querySelectorAll(".category-filters a")];
   const normalize = value => value
@@ -51,6 +52,7 @@
     syncCategoryLinks();
   });
   form.addEventListener("submit", event => {
+    if (serverFiltered) return;
     event.preventDefault();
     filterCards();
   });

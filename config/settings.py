@@ -134,10 +134,6 @@ CART_AI_BASE_URL = os.environ.get("CART_AI_BASE_URL", "").strip()
 CART_AI_API_KEY = os.environ.get("CART_AI_API_KEY", "").strip()
 CART_AI_MODEL = os.environ.get("CART_AI_MODEL", "").strip()
 CART_AI_TIMEOUT_SECONDS = int(os.environ.get("CART_AI_TIMEOUT_SECONDS", "900"))
-CART_MAX_PARALLEL_AGENTS = max(
-    1,
-    min(5, int(os.environ.get("CART_MAX_PARALLEL_AGENTS", "5"))),
-)
 CART_CONFIRMATION_MINUTES = max(
     5,
     int(os.environ.get("CART_CONFIRMATION_MINUTES", "180")),

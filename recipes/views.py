@@ -153,8 +153,9 @@ def recipe_detail(request, slug):
         ),
         slug=slug,
     )
-    ingredients = [ingredient for ingredient in recipe.ingredients.all() if not ingredient.is_water]
-    _fill_missing_recipe_calories(recipe, ingredients, save=False)
+    all_ingredients = list(recipe.ingredients.all())
+    _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
+    ingredients = [ingredient for ingredient in all_ingredients if not ingredient.is_water]
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
     )
