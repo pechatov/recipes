@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Домашние рецепты">
+  <rect width="32" height="32" rx="7" fill="#221D19"/>
+  <g fill="none" stroke="#9CB584" stroke-width="1.8" stroke-linecap="round">
+    <path d="M12.9 9.4c0-1.5 1.7-1.5 1.7-3.1"/>
+    <path d="M17.4 9.4c0-1.5 1.7-1.5 1.7-3.1"/>
+  </g>
+  <rect x="5.6" y="12.2" width="20.8" height="2.9" rx="1.45" fill="#E37A4E"/>
+  <path d="M8.4 16.1h15.2v4.6a4.6 4.6 0 0 1-4.6 4.6h-6a4.6 4.6 0 0 1-4.6-4.6z" fill="#E37A4E"/>
+</svg>

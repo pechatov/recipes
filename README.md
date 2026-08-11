@@ -19,6 +19,8 @@
 - фильтр по автору, мгновенный нечёткий поиск и экран фоновых задач;
 - закрытая регистрация: первого владельца создают при первоначальной настройке,
   остальных пользователей добавляет администратор;
+- тёмная тема по умолчанию с переключателем на светлую и локальными шрифтами
+  без внешних CDN;
 - PostgreSQL, Docker health checks и постоянное хранение изображений.
 
 ## Запуск и проверка
@@ -75,6 +77,33 @@ docker compose up --build
 пользователя запустите `scripts/cart-browser-login-pi.sh` и следуйте его
 подсказкам. Адреса automation-сервисов, SSH targets и состояние браузера должны
 оставаться только в локальной конфигурации.
+
+## Оформление
+
+Все цвета живут в CSS-переменных `recipes/static/recipes/app.css`: блок `:root`
+описывает тёмную тему (она по умолчанию), блок `[data-theme="light"]` — светлую.
+Новые стили берут цвета только из переменных, иначе элемент сломается в одной из
+тем.
+
+Выбранная тема хранится в `localStorage` под ключом `theme`. Переключатель — в
+шапке, а начальное значение `data-theme` выставляет инлайн-скрипт в `base.html`
+до первой отрисовки, чтобы тёмная тема не моргала светлой.
+
+Шрифты — Inter (интерфейс) и Literata (заголовки), лежат в
+`recipes/static/recipes/fonts/` как переменные woff2 и подключены через
+`@font-face`. Запросов к внешним CDN нет. Начертания задаются переменными
+`--font-sans` и `--font-display`.
+
+Иконки вкладки и приложения собираются из `recipes/static/recipes/icon.svg`:
+
+```bash
+cd recipes/static/recipes
+rsvg-convert -w 512 -h 512 icon.svg -o icon-512.png
+rsvg-convert -w 192 -h 192 icon.svg -o icon-192.png
+rsvg-convert -w 180 -h 180 icon.svg -o apple-touch-icon.png
+for size in 16 32 48; do rsvg-convert -w $size -h $size icon.svg -o /tmp/icon-$size.png; done
+magick /tmp/icon-16.png /tmp/icon-32.png /tmp/icon-48.png favicon.ico
+```
 
 ## Деплой и резервное копирование
 
