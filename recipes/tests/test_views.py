@@ -299,6 +299,24 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(response, "Семейная паста")
 
+    def test_short_fuzzy_match_outranks_more_than_500_broad_candidates(self):
+        target = Recipe.objects.create(title="Кит", created_by=self.user)
+        Recipe.objects.bulk_create(
+            [
+                Recipe(
+                    title=f"Каша случайная {index}",
+                    slug=f"random-porridge-{index}",
+                    created_by=self.user,
+                )
+                for index in range(510)
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "кот"})
+
+        self.assertContains(response, target.title)
+
     def test_fuzzy_search_keeps_matches_alongside_exact_match(self):
         exact = Recipe.objects.create(title="СЛВК — семейная заметка", created_by=self.user)
         self.client.force_login(self.user)

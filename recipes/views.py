@@ -181,11 +181,33 @@ def _search_rank_fragments(token: str) -> list[str]:
             token[index:index + 2] for index in range(max(0, len(token) - 1))
         )
     )
-    prioritized = []
+    prioritized = list(dict.fromkeys(token))
     if bigrams:
         prioritized.extend((bigrams[0], bigrams[-1], bigrams[len(bigrams) // 2]))
-    prioritized.extend(dict.fromkeys(token))
     return list(dict.fromkeys(prioritized))[:MAX_SEARCH_FRAGMENTS_PER_TOKEN]
+
+
+def _search_fragment_score(query: str):
+    fragments = []
+    for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
+        fragments.extend(_search_rank_fragments(token))
+    fragments = list(dict.fromkeys(fragments))[:MAX_SEARCH_RANK_FRAGMENTS]
+    score_parts = []
+    for fragment in fragments:
+        fragment_filter = Q()
+        for variant in {fragment, fragment.capitalize(), fragment.upper()}:
+            for field in SEARCH_FIELDS:
+                fragment_filter |= Q(**{f"{field}__icontains": variant})
+        score_parts.append(
+            Max(
+                Case(
+                    When(fragment_filter, then=Value(1)),
+                    default=Value(0),
+                    output_field=IntegerField(),
+                )
+            )
+        )
+    return sum(score_parts, Value(0, output_field=IntegerField()))
 
 
 def _search_candidate_filter(query: str) -> Q:
@@ -216,29 +238,10 @@ def _exact_search_filter(query: str) -> Q:
 
 def _ranked_fuzzy_candidates(recipes, query: str):
     candidates = recipes.filter(_search_candidate_filter(query)).distinct()
+    fragment_score = _search_fragment_score(query)
     if connection.vendor != "postgresql":
-        fragments = []
-        for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
-            fragments.extend(_search_rank_fragments(token))
-        fragments = list(dict.fromkeys(fragments))[:MAX_SEARCH_RANK_FRAGMENTS]
-        score_parts = []
-        for fragment in fragments:
-            fragment_filter = Q()
-            for variant in {fragment, fragment.capitalize(), fragment.upper()}:
-                for field in SEARCH_FIELDS:
-                    fragment_filter |= Q(**{f"{field}__icontains": variant})
-            score_parts.append(
-                Max(
-                    Case(
-                        When(fragment_filter, then=Value(1)),
-                        default=Value(0),
-                        output_field=IntegerField(),
-                    )
-                )
-            )
-        score = sum(score_parts, Value(0, output_field=IntegerField()))
-        return candidates.annotate(search_similarity=score).order_by(
-            "-search_similarity", "-updated_at"
+        return candidates.annotate(search_fragment_score=fragment_score).order_by(
+            "-search_fragment_score", "-updated_at"
         )[:SEARCH_CANDIDATE_LIMIT]
     zero = Value(0.0, output_field=FloatField())
     similarities = [
@@ -246,8 +249,11 @@ def _ranked_fuzzy_candidates(recipes, query: str):
         for field in SEARCH_FIELDS
     ]
     return candidates.annotate(
+        search_fragment_score=fragment_score,
         search_similarity=Greatest(*similarities)
-    ).order_by("-search_similarity", "-updated_at")[:SEARCH_CANDIDATE_LIMIT]
+    ).order_by(
+        "-search_fragment_score", "-search_similarity", "-updated_at"
+    )[:SEARCH_CANDIDATE_LIMIT]
 
 
 def _resolve_recipe_slug(slug: str, queryset=None) -> tuple[Recipe, bool]:
