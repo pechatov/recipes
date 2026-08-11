@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from html import unescape
 from typing import Any
 
@@ -91,8 +92,20 @@ def _steps(value: Any, section: str = "") -> list[dict[str, str]]:
 def _nutrition_calories(value: Any) -> str | None:
     if not isinstance(value, dict):
         return None
-    match = re.search(r"\d+(?:[.,]\d+)?", str(value.get("calories") or ""))
-    return match.group().replace(",", ".") if match else None
+    text = _plain(value.get("calories")).casefold().replace("ё", "е")
+    match = re.fullmatch(
+        r"\s*(\d+(?:[.,]\d+)?)\s*(kcal|calories?|ккал|калорий|калория|калории|kj|кдж)\.?\s*",
+        text,
+    )
+    if not match:
+        return None
+    try:
+        calories = Decimal(match.group(1).replace(",", "."))
+    except InvalidOperation:
+        return None
+    if match.group(2) in {"kj", "кдж"}:
+        calories /= Decimal("4.184")
+    return str(calories.quantize(Decimal("0.1")))
 
 
 def adapt_structured_recipe(value: dict[str, Any]) -> dict[str, Any]:

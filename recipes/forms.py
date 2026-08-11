@@ -92,7 +92,8 @@ class IngredientForm(forms.ModelForm):
 
     def clean_name(self):
         name = self.cleaned_data["name"]
-        if is_water_ingredient_name(name):
+        unchanged_existing_water = self.instance.pk and "name" not in self.changed_data
+        if is_water_ingredient_name(name) and not unchanged_existing_water:
             raise forms.ValidationError(
                 "Воду не нужно добавлять в ингредиенты — укажите её только в шагах."
             )

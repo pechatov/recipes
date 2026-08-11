@@ -4,7 +4,12 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 
-from recipes.importing.exceptions import AIResponseError, SourceError, UnsafeSourceError
+from recipes.importing.exceptions import (
+    AIResponseError,
+    ImportPipelineError,
+    SourceError,
+    UnsafeSourceError,
+)
 from recipes.importing.extractors import (
     SourceDocument,
     _validate_public_url,
@@ -20,6 +25,7 @@ from recipes.importing.pipeline import (
     process_import_job,
     save_draft,
 )
+from recipes.importing.structured import _nutrition_calories
 from recipes.models import ImportJob, Recipe
 
 
@@ -88,6 +94,13 @@ class ExtractorTests(TestCase):
 
 
 class NormalizerTests(TestCase):
+    def test_structured_nutrition_converts_kilojoules_and_rejects_unknown_units(self):
+        self.assertEqual(_nutrition_calories({"calories": "1880 kJ"}), "449.3")
+        self.assertEqual(_nutrition_calories({"calories": "450 kcal"}), "450.0")
+        self.assertEqual(_nutrition_calories({"calories": "450 calories"}), "450.0")
+        self.assertIsNone(_nutrition_calories({"calories": "450"}))
+        self.assertIsNone(_nutrition_calories({"calories": "450 watts"}))
+
     def test_calories_reject_compound_and_negative_values(self):
         self.assertIsNone(_calories({"value": 100}))
         self.assertIsNone(_calories([100]))
@@ -524,7 +537,7 @@ class PipelineTests(TestCase):
 
         adapt_with_ai.assert_not_called()
 
-    def test_reprocessing_reuses_linked_drafts_and_removes_only_extra_drafts(self):
+    def test_reprocessing_reuses_linked_drafts_and_detaches_extra_drafts(self):
         user = get_user_model().objects.create_user("re-importer")
         job = ImportJob.objects.create(
             source_url="https://example.com/menu",
@@ -535,8 +548,6 @@ class PipelineTests(TestCase):
             job,
             [self.recipe_data("Первый"), self.recipe_data("Второй"), self.recipe_data("Третий")],
         )
-        published = Recipe.objects.create(title="Опубликованный", status=Recipe.Status.PUBLISHED)
-        job.recipes.add(published)
         initial_ids = [recipe.pk for recipe in initial]
 
         updated = save_draft(
@@ -545,9 +556,30 @@ class PipelineTests(TestCase):
         )
 
         self.assertEqual([recipe.pk for recipe in updated], initial_ids[:2])
-        self.assertFalse(Recipe.objects.filter(pk=initial_ids[2]).exists())
-        self.assertTrue(Recipe.objects.filter(pk=published.pk).exists())
+        stale = Recipe.objects.get(pk=initial_ids[2])
+        self.assertEqual(stale.title, "Третий")
         self.assertCountEqual(job.recipes.all(), updated)
+
+    def test_reprocessing_is_blocked_after_any_linked_recipe_is_published(self):
+        user = get_user_model().objects.create_user("partial-publisher")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/menu",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        initial = save_draft(
+            job,
+            [self.recipe_data("Первый"), self.recipe_data("Второй")],
+        )
+        initial[0].status = Recipe.Status.PUBLISHED
+        initial[0].save(update_fields=["status"])
+
+        with self.assertRaisesRegex(ImportPipelineError, "после публикации"):
+            save_draft(job, [self.recipe_data("Новый")])
+
+        initial[1].refresh_from_db()
+        self.assertEqual(initial[1].title, "Второй")
+        self.assertCountEqual(job.recipes.all(), initial)
 
     @patch("recipes.importing.pipeline._download_image")
     def test_step_images_keep_their_recipe_and_step_positions(self, download_image):

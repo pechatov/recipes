@@ -1,7 +1,10 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 
+from recipes.forms import IngredientForm
 from recipes.models import Category, ImportJob, Recipe, RecipeIngredient, RecipeStep
 from recipes.views import _fill_missing_recipe_calories
 
@@ -158,6 +161,18 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, exact.title)
         self.assertContains(response, self.recipe.title)
 
+    def test_fuzzy_search_caps_python_candidate_processing(self):
+        for index in range(8):
+            Recipe.objects.create(title=f"Сливовый рецепт {index}", created_by=self.user)
+        self.client.force_login(self.user)
+
+        with patch("recipes.views.SEARCH_CANDIDATE_LIMIT", 5), patch(
+            "recipes.views._recipe_matches_fuzzy_query", return_value=False
+        ) as matcher:
+            self.client.get(reverse("recipe-list"), {"q": "слив"})
+
+        self.assertEqual(matcher.call_count, 5)
+
     def test_server_search_excludes_unrelated_recipes_without_javascript(self):
         other = Recipe.objects.create(title="Яблочный пирог", created_by=self.user)
         RecipeIngredient.objects.create(
@@ -188,6 +203,21 @@ class RecipeViewTests(TestCase):
         self.assertNotContains(response, "Горячая вода")
         self.assertEqual(str(response.context["recipe"].calories_per_100g), "58.6")
         self.assertTrue(RecipeIngredient.objects.filter(pk=water.pk).exists())
+
+    def test_unchanged_historical_water_does_not_block_ingredient_edit_form(self):
+        water = RecipeIngredient.objects.create(
+            recipe=self.recipe,
+            name="Горячая вода",
+            quantity=500,
+            unit="мл",
+        )
+        form = IngredientForm(
+            data={"name": "Горячая вода", "quantity": 500, "unit": "мл"},
+            instance=water,
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertFalse(IngredientForm(data={"name": "Горячая вода"}).is_valid())
 
     def test_recipe_list_filters_by_category(self):
         soup_category = Category.objects.get(slug="soup")
@@ -259,6 +289,41 @@ class RecipeViewTests(TestCase):
         self.assertEqual(created.steps.count(), 1)
         self.assertEqual(str(created.calories_per_serving), "96.2")
         self.assertEqual(str(created.calories_per_100g), "77.0")
+
+    def test_create_recipe_does_not_mix_manual_and_estimated_calories(self):
+        self.client.force_login(self.user)
+        response = self.client.post(
+            reverse("recipe-create"),
+            {
+                "title": "Суп с ручной калорийностью",
+                "servings": 4,
+                "prep_minutes": 5,
+                "cook_minutes": 30,
+                "calories_per_serving": "123",
+                "calories_per_100g": "",
+                "ingredients-TOTAL_FORMS": 1,
+                "ingredients-INITIAL_FORMS": 0,
+                "ingredients-MIN_NUM_FORMS": 1,
+                "ingredients-MAX_NUM_FORMS": 1000,
+                "ingredients-0-name": "Картофель",
+                "ingredients-0-quantity": 500,
+                "ingredients-0-unit": "г",
+                "steps-TOTAL_FORMS": 1,
+                "steps-INITIAL_FORMS": 0,
+                "steps-MIN_NUM_FORMS": 1,
+                "steps-MAX_NUM_FORMS": 1000,
+                "steps-0-title": "Варка",
+                "steps-0-instruction": "Сварить до мягкости.",
+            },
+        )
+
+        created = Recipe.objects.get(title="Суп с ручной калорийностью")
+        self.assertRedirects(response, created.get_absolute_url())
+        self.assertEqual(str(created.calories_per_serving), "123.0")
+        self.assertIsNone(created.calories_per_100g)
+        self.assertFalse(created.calories_estimated)
+        detail = self.client.get(created.get_absolute_url())
+        self.assertIsNone(detail.context["recipe"].calories_per_100g)
 
     def test_draft_is_hidden_until_published(self):
         draft = Recipe.objects.create(
@@ -334,6 +399,34 @@ class RecipeViewTests(TestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, ImportJob.Status.PENDING)
         self.assertEqual(job.recipe, draft)
+
+    def test_completed_import_cannot_be_reprocessed_after_partial_publication(self):
+        published = Recipe.objects.create(
+            title="Уже опубликован",
+            status=Recipe.Status.PUBLISHED,
+            created_by=self.user,
+        )
+        draft = Recipe.objects.create(
+            title="Оставшийся черновик",
+            status=Recipe.Status.DRAFT,
+            created_by=self.user,
+        )
+        job = ImportJob.objects.create(
+            source_url="https://example.com/menu",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.COMPLETED,
+            recipe=published,
+            requested_by=self.user,
+        )
+        job.recipes.add(published, draft)
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("import-reprocess", args=[job.pk]), follow=True)
+
+        self.assertRedirects(response, reverse("import-detail", args=[job.pk]))
+        job.refresh_from_db()
+        self.assertEqual(job.status, ImportJob.Status.COMPLETED)
+        self.assertContains(response, "один из рецептов уже опубликован")
 
     def test_import_endpoints_are_private_to_requesting_user(self):
         other = get_user_model().objects.create_user(username="private-importer")

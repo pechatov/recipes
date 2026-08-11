@@ -25,6 +25,9 @@ from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePref
 from .services import build_shopping_items, get_store_preferences
 
 
+SEARCH_CANDIDATE_LIMIT = 500
+
+
 def health(request):
     return JsonResponse({"status": "ok"})
 
@@ -66,6 +69,33 @@ def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
     )
 
 
+def _search_candidate_filter(query: str) -> Q:
+    fields = (
+        "title",
+        "description",
+        "created_by__username",
+        "created_by__first_name",
+        "created_by__last_name",
+        "categories__name",
+        "ingredients__name",
+    )
+    candidate_filter = Q()
+    for token in _normalize_recipe_search(query).split():
+        fragments = {token} if len(token) < 3 else {
+            token[index:index + 2] for index in range(len(token) - 1)
+        }
+        token_filter = Q()
+        for fragment in fragments:
+            # SQLite's LIKE does not case-fold non-ASCII text. These variants
+            # keep the portable development database useful; PostgreSQL's
+            # ILIKE naturally collapses them.
+            for variant in {fragment, fragment.capitalize(), fragment.upper()}:
+                for field in fields:
+                    token_filter |= Q(**{f"{field}__icontains": variant})
+        candidate_filter &= token_filter
+    return candidate_filter
+
+
 @require_http_methods(["GET", "POST"])
 def setup_owner(request):
     if get_user_model().objects.exists():
@@ -99,6 +129,9 @@ def recipe_list(request):
     if selected_author.isdigit():
         recipes = recipes.filter(created_by_id=selected_author)
     if query:
+        recipes = recipes.filter(_search_candidate_filter(query)).distinct()[
+            :SEARCH_CANDIDATE_LIMIT
+        ]
         recipes = [
             recipe for recipe in recipes if _recipe_matches_fuzzy_query(recipe, query)
         ]
@@ -137,7 +170,10 @@ def recipe_detail(request, slug):
         slug=slug,
     )
     all_ingredients = list(recipe.ingredients.all())
-    _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
+    if recipe.calories_estimated or (
+        recipe.calories_per_serving is None and recipe.calories_per_100g is None
+    ):
+        _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
     ingredients = [ingredient for ingredient in all_ingredients if not ingredient.is_water]
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
@@ -233,7 +269,8 @@ def recipe_create(request):
                 form.cleaned_data[field] is not None
                 for field in ("calories_per_serving", "calories_per_100g")
             )
-            _fill_missing_recipe_calories(recipe, save=True)
+            if not manual_calories:
+                _fill_missing_recipe_calories(recipe, save=True)
             recipe.calories_estimated = not manual_calories
             recipe.save(update_fields=["calories_estimated", "updated_at"])
         messages.success(request, "Рецепт добавлен.")
@@ -361,6 +398,16 @@ def import_reprocess(request, pk):
         requested_by=request.user,
         status=ImportJob.Status.COMPLETED,
     )
+    has_published_recipe = (
+        bool(job.recipe_id and job.recipe.status == Recipe.Status.PUBLISHED)
+        or job.recipes.filter(status=Recipe.Status.PUBLISHED).exists()
+    )
+    if has_published_recipe:
+        messages.error(
+            request,
+            "Повторная обработка недоступна: один из рецептов уже опубликован.",
+        )
+        return redirect("import-detail", pk=job.pk)
     drafts = list(job.recipes.filter(status=Recipe.Status.DRAFT))
     if job.recipe and job.recipe.status == Recipe.Status.DRAFT and job.recipe not in drafts:
         drafts.append(job.recipe)

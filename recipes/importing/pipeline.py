@@ -320,6 +320,15 @@ def save_draft(
     *,
     document: SourceDocument | None = None,
 ) -> list[Recipe]:
+    has_published_recipe = (
+        bool(job.recipe_id and job.recipe.status == Recipe.Status.PUBLISHED)
+        or job.recipes.filter(status=Recipe.Status.PUBLISHED).exists()
+    )
+    if has_published_recipe:
+        raise ImportPipelineError(
+            "Нельзя повторно обработать импорт после публикации одного из рецептов. "
+            "Оставшиеся черновики сохранены без изменений."
+        )
     recipe_data = normalize_recipes(data)
     prepared_images = _prepare_images(document, recipe_data)
     new_files: list[tuple[Any, str]] = []
@@ -401,19 +410,9 @@ def save_draft(
                 _set_categories(recipe, values.get("categories", []))
                 saved_recipes.append(recipe)
 
-            stale_drafts = existing_drafts[len(saved_recipes):]
-            stale_draft_ids = [recipe.pk for recipe in stale_drafts]
-            for stale in stale_drafts:
-                stale_cover = _stored_file(stale.cover)
-                if stale_cover:
-                    old_files.append(stale_cover)
-                old_files.extend(_step_stored_files(stale))
-            if stale_draft_ids:
-                Recipe.objects.filter(
-                    pk__in=stale_draft_ids,
-                    status=Recipe.Status.DRAFT,
-                ).delete()
             job.recipe = saved_recipes[0]
+            # A non-deterministic re-import may return fewer recipes. Detach
+            # unmatched drafts from this job instead of deleting user edits.
             job.recipes.set(saved_recipes)
             job.status = ImportJob.Status.COMPLETED
             job.finished_at = timezone.now()
