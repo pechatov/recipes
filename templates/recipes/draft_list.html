@@ -31,7 +31,13 @@
             {% if recipe.categories.all %}<div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}</div>{% endif %}
             <p class="recipe-meta">Черновик · {{ recipe.ingredients.count }} ингредиентов</p>
             <h2><a href="{{ recipe.get_absolute_url }}">{{ recipe.title }}</a></h2>
-            <a class="text-link" href="{% url 'recipe-update' recipe.slug %}">Проверить и изменить →</a>
+            <div class="draft-card-actions">
+              <a class="text-link" href="{% url 'recipe-update' recipe.slug %}">Проверить и изменить →</a>
+              <form method="post" action="{% url 'recipe-delete' recipe.slug %}">
+                {% csrf_token %}
+                <button class="text-link draft-delete-button" type="submit" aria-label="Удалить черновик «{{ recipe.title }}»">Удалить</button>
+              </form>
+            </div>
           </div>
         </article>
       {% endfor %}

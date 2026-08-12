@@ -688,9 +688,10 @@ def recipe_delete(request, slug):
     if used_alias and request.method in {"GET", "HEAD"}:
         return _canonical_recipe_redirect(request, recipe, "recipe-delete")
     if request.method == "POST":
+        redirect_name = "draft-list" if recipe.is_draft else "recipe-list"
         recipe.delete()
         messages.success(request, "Рецепт удалён.")
-        return redirect("recipe-list")
+        return redirect(redirect_name)
     return render(request, "recipes/recipe_confirm_delete.html", {"recipe": recipe})
 
 

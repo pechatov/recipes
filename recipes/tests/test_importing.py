@@ -1,5 +1,7 @@
+import io
+import json
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -13,6 +15,8 @@ from recipes.importing.exceptions import (
 from recipes.importing.extractors import (
     SourceDocument,
     _PinnedHTTPSConnection,
+    _fetch_website_title,
+    _fetch_youtube_title,
     _resolve_public_url,
     _validate_public_url,
     extract_website,
@@ -28,8 +32,13 @@ from recipes.importing.normalizer import (
 )
 from recipes.importing.pipeline import (
     DownloadedImage,
+    ImageImportBudget,
     MAX_IMPORTED_IMAGES,
+    MIN_COVER_LONG_SIDE,
+    MIN_COVER_SHORT_SIDE,
+    _cover_search_queries,
     _prepare_images,
+    _search_cover_image_urls,
     process_import_job,
     save_draft,
 )
@@ -49,12 +58,52 @@ class ExtractorTests(TestCase):
             "dQw4w9WgXcQ",
         )
 
+    @patch(
+        "recipes.importing.extractors._fetch_youtube_title",
+        return_value="Гуляш из говядины с густой подливой",
+    )
     @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
-    def test_youtube_exposes_multiple_thumbnail_fallbacks(self, fetch):
+    def test_youtube_exposes_title_and_multiple_thumbnail_fallbacks(
+        self, fetch, fetch_title
+    ):
         fetch.return_value = [Mock(text="Ингредиенты и подробное приготовление " * 5)]
         document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        self.assertEqual(document.title, "Гуляш из говядины с густой подливой")
         self.assertEqual(len(document.cover_image_urls), 3)
         self.assertTrue(document.cover_image_urls[-1].endswith("/hqdefault.jpg"))
+        fetch_title.assert_called_once_with("dQw4w9WgXcQ")
+
+    @patch("recipes.importing.extractors._open_public_url")
+    def test_fetches_youtube_title_from_oembed(self, open_url):
+        response = MagicMock()
+        response.status = 200
+        response.headers.get.return_value = "application/json; charset=utf-8"
+        response.read.return_value = json.dumps(
+            {"title": "  Лучший   домашний гуляш  "}
+        ).encode()
+        open_url.return_value.__enter__.return_value = response
+
+        title = _fetch_youtube_title("dQw4w9WgXcQ")
+
+        self.assertEqual(title, "Лучший домашний гуляш")
+        requested_url = open_url.call_args.args[0]
+        self.assertIn("youtube.com/oembed?", requested_url)
+        self.assertIn("dQw4w9WgXcQ", requested_url)
+
+    @patch("recipes.importing.extractors._open_public_url")
+    def test_website_title_falls_back_to_utf8_for_unknown_charset(self, open_url):
+        response = MagicMock()
+        response.status = 200
+        response.headers.get.return_value = "text/html; charset=invalid-codec"
+        response.headers.get_content_charset.return_value = "invalid-codec"
+        response.read.return_value = (
+            "<html><head><title>Домашний борщ</title></head></html>".encode()
+        )
+        open_url.return_value.__enter__.return_value = response
+
+        title = _fetch_website_title("https://example.com/borscht")
+
+        self.assertEqual(title, "Домашний борщ")
 
     @patch("recipes.importing.extractors.socket.getaddrinfo")
     def test_public_url_prefers_ipv4_when_ipv6_is_listed_first(self, getaddrinfo):
@@ -304,6 +353,20 @@ class NormalizerTests(TestCase):
         self.assertEqual([item["title"] for item in result], ["Омлет", "Яичница"])
         self.assertEqual(result[0]["steps"][0]["section"], "Омлет")
 
+    def test_preserves_short_cover_image_search_query(self):
+        recipe = normalize_recipe(
+            {
+                "title": "Курица с рисом",
+                "cover_image_search_query": "  chicken   rice bowl  ",
+                "ingredients": [
+                    {"name": "Курица", "quantity": 500, "unit": "г"}
+                ],
+                "steps": [{"instruction": "Запечь курицу с рисом."}],
+            }
+        )
+
+        self.assertEqual(recipe["cover_image_search_query"], "chicken rice bowl")
+
     def test_ai_json_parser_accepts_multiple_independent_recipes(self):
         content = """{"recipes": [
           {"title": "Суп", "categories": ["soup"], "ingredients": [
@@ -316,7 +379,83 @@ class NormalizerTests(TestCase):
         self.assertEqual([item["title"] for item in _parse_json(content)], ["Суп", "Пирог"])
 
 
+class ImageSearchTests(TestCase):
+    def test_cover_search_is_limited_to_precise_and_distinctive_queries(self):
+        queries = _cover_search_queries(
+            {
+                "title": "Гуляш из говядины",
+                "cover_image_search_query": "goulash beef thick gravy",
+                "categories": ["main-course"],
+            }
+        )
+
+        self.assertEqual(
+            queries,
+            [
+                "goulash beef thick gravy",
+                "goulash",
+            ],
+        )
+
+    @patch("recipes.importing.pipeline._open_public_url")
+    def test_openverse_search_keeps_only_public_domain_safe_results(self, open_url):
+        payload = {
+            "results": [
+                {
+                    "license": "cc0",
+                    "mature": False,
+                    "thumbnail": "https://api.openverse.org/safe-thumb.jpg",
+                    "url": "https://images.example/safe.jpg",
+                },
+                {
+                    "license": "by",
+                    "mature": False,
+                    "thumbnail": "https://images.example/attribution-required.jpg",
+                },
+                {
+                    "license": "pdm",
+                    "mature": True,
+                    "thumbnail": "https://images.example/mature.jpg",
+                },
+            ]
+        }
+        response = Mock(
+            status=200,
+            headers={"content-type": "application/json; charset=utf-8"},
+        )
+        response.read = io.BytesIO(json.dumps(payload).encode()).read
+        context = MagicMock()
+        context.__enter__.return_value = response
+        open_url.return_value = context
+
+        urls = _search_cover_image_urls("chicken rice")
+
+        self.assertEqual(
+            urls,
+            [
+                "https://api.openverse.org/safe-thumb.jpg",
+                "https://images.example/safe.jpg",
+            ],
+        )
+        requested_url = open_url.call_args.args[0]
+        self.assertIn("q=chicken+rice", requested_url)
+        self.assertIn("license=cc0%2Cpdm", requested_url)
+        self.assertIn("size=large", requested_url)
+
+
 class PipelineTests(TestCase):
+    def setUp(self):
+        search_patcher = patch(
+            "recipes.importing.pipeline._search_cover_image_urls"
+        )
+        self.search_cover_images = search_patcher.start()
+        self.search_cover_images.return_value = []
+        self.addCleanup(search_patcher.stop)
+        title_patcher = patch("recipes.importing.pipeline.fetch_source_title")
+        self.fetch_source_title = title_patcher.start()
+        self.fetch_source_title.return_value = ""
+        self.addCleanup(title_patcher.stop)
+
     @staticmethod
     def recipe_data(title):
         return {
@@ -441,6 +580,7 @@ class PipelineTests(TestCase):
             requested_by=user,
             custom_prompt="Без молочных продуктов",
         )
+        self.fetch_source_title.return_value = "Два рецепта из картофеля"
 
         recipes = process_import_job(job)
 
@@ -453,6 +593,74 @@ class PipelineTests(TestCase):
             extract_source.return_value,
             custom_prompt="Без молочных продуктов",
         )
+        self.fetch_source_title.assert_called_once_with(job.source_url)
+        extract_source.assert_called_once_with(
+            job.source_url,
+            source_title="Два рецепта из картофеля",
+            fetch_title=False,
+        )
+
+    @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
+    @patch("recipes.importing.pipeline.adapt_with_ai")
+    @patch("recipes.importing.pipeline.extract_source")
+    def test_does_not_retry_failed_youtube_title_lookup(
+        self, extract_source, adapt_with_ai
+    ):
+        extract_source.return_value = SourceDocument(
+            "youtube",
+            "YouTube dQw4w9WgXcQ",
+            (
+                "Ингредиенты: 500 г картофеля, морковь, соль и вода. "
+                "Нарезать овощи, варить 30 минут и подать суп. "
+            )
+            * 3,
+        )
+        adapt_with_ai.return_value = self.recipe_data("Домашний суп")
+        self.fetch_source_title.return_value = ""
+        job = ImportJob.objects.create(
+            source_url="https://youtu.be/dQw4w9WgXcQ",
+            source_type=ImportJob.SourceType.YOUTUBE,
+            requested_by=get_user_model().objects.create_user("untitled-importer"),
+        )
+
+        process_import_job(job)
+
+        self.fetch_source_title.assert_called_once_with(job.source_url)
+        extract_source.assert_called_once_with(
+            job.source_url,
+            source_title="",
+            fetch_title=False,
+        )
+
+    @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
+    @patch("recipes.importing.pipeline.adapt_with_ai")
+    @patch("recipes.importing.pipeline.extract_source")
+    def test_keeps_queued_youtube_title_when_oembed_retry_is_unavailable(
+        self, extract_source, adapt_with_ai
+    ):
+        extract_source.return_value = SourceDocument(
+            "youtube",
+            "YouTube dQw4w9WgXcQ",
+            (
+                "Ингредиенты: 500 г картофеля, 1 морковь, соль и 1 литр воды. "
+                "Нарезать овощи, положить в кастрюлю, варить 30 минут и подать суп. "
+            )
+            * 3,
+        )
+        adapt_with_ai.return_value = self.recipe_data("Домашний суп")
+        job = ImportJob.objects.create(
+            source_url="https://youtu.be/dQw4w9WgXcQ",
+            source_title="Домашний суп из сезонных овощей",
+            source_type=ImportJob.SourceType.YOUTUBE,
+            requested_by=get_user_model().objects.create_user("titled-importer"),
+        )
+
+        process_import_job(job)
+
+        job.refresh_from_db()
+        self.assertEqual(job.source_title, "Домашний суп из сезонных овощей")
+        document = adapt_with_ai.call_args.args[0]
+        self.assertEqual(document.title, "Домашний суп из сезонных овощей")
 
     @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
     @patch("recipes.importing.pipeline.adapt_with_ai")
@@ -693,6 +901,273 @@ class PipelineTests(TestCase):
 
         draft.refresh_from_db()
         self.assertEqual(draft.title, "Правка пользователя")
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    def test_searches_public_image_when_source_cover_cannot_be_downloaded(
+        self, download_image
+    ):
+        source_url = "https://source.example/missing.jpg"
+        thumbnail_url = "https://api.openverse.org/thumbnail.jpg"
+        original_url = "https://images.example/original.jpg"
+        self.search_cover_images.return_value = [thumbnail_url, original_url]
+        images = {
+            thumbnail_url: DownloadedImage(
+                "thumbnail.jpg", b"small", width=600, height=400
+            ),
+            original_url: DownloadedImage(
+                "original.jpg", b"large", width=1_600, height=1_200
+            ),
+        }
+        download_image.side_effect = lambda url, **kwargs: images.get(url)
+        document = SourceDocument(
+            "website",
+            "Курица с рисом",
+            "Описание",
+            cover_image_urls=(source_url,),
+        )
+        data = [
+            {
+                "title": "Курица с рисом",
+                "cover_image_url": "",
+                "cover_image_search_query": "chicken rice",
+                "categories": ["main-course"],
+                "steps": [],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertEqual(prepared[0][0].name, "original.jpg")
+        self.search_cover_images.assert_called_once_with("chicken rice", timeout=ANY)
+        self.assertLessEqual(
+            self.search_cover_images.call_args.kwargs["timeout"],
+            3,
+        )
+        self.assertEqual(
+            [call.args[0] for call in download_image.call_args_list],
+            [source_url, thumbnail_url, original_url],
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    def test_uses_category_query_when_recipe_title_has_no_search_results(
+        self, download_image
+    ):
+        search_url = "https://api.openverse.org/soup.jpg"
+        self.search_cover_images.side_effect = [[], [search_url]]
+        download_image.return_value = DownloadedImage(
+            "soup.jpg", b"soup", width=1_600, height=1_200
+        )
+        document = SourceDocument("website", "Борщ", "Описание")
+        data = [
+            {
+                "title": "Борщ",
+                "cover_image_url": "",
+                "cover_image_search_query": "",
+                "categories": ["soup"],
+                "steps": [],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertEqual(prepared[0][0].name, "soup.jpg")
+        self.assertEqual(
+            [call.args[0] for call in self.search_cover_images.call_args_list],
+            ["Борщ", "soup bowl"],
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    def test_does_not_search_when_image_budget_is_exhausted(self, download_image):
+        document = SourceDocument(
+            "website",
+            "Суп",
+            "Описание",
+            cover_image_urls=tuple(
+                f"https://images.example/{index}.jpg" for index in range(25)
+            ),
+        )
+        data = [
+            {
+                "title": "Суп",
+                "cover_image_url": "",
+                "cover_image_search_query": "soup bowl",
+                "categories": ["soup"],
+                "steps": [],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertIsNone(prepared[0][0])
+        self.assertEqual(download_image.call_count, 25)
+        self.search_cover_images.assert_not_called()
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_reuses_search_results_for_same_query(self, download_image):
+        search_urls = [
+            "https://images.example/first.jpg",
+            "https://images.example/second.jpg",
+        ]
+        self.search_cover_images.return_value = search_urls
+        download_image.side_effect = lambda url, **kwargs: DownloadedImage(
+            url.rsplit("/", 1)[-1], b"image", width=1_600, height=1_200
+        )
+        document = SourceDocument("website", "Суп", "Описание")
+        recipe = {
+            "title": "Суп",
+            "cover_image_url": "",
+            "cover_image_search_query": "soup bowl",
+            "categories": ["soup"],
+            "steps": [],
+        }
+
+        prepared = _prepare_images(document, [recipe, recipe])
+
+        self.assertEqual(self.search_cover_images.call_count, 1)
+        self.assertEqual(
+            [cover.name for cover, _ in prepared],
+            ["first.jpg", "second.jpg"],
+        )
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_searches_each_recipe_with_a_distinct_query(self, download_image):
+        def search(query, **kwargs):
+            return [f"https://images.example/{query}.jpg"]
+
+        self.search_cover_images.side_effect = search
+        download_image.side_effect = lambda url, **kwargs: DownloadedImage(
+            url.rsplit("/", 1)[-1], b"image", width=1_600, height=1_200
+        )
+        document = SourceDocument("website", "Меню", "Описание")
+        recipes = [
+            {
+                "title": "Суп",
+                "cover_image_url": "",
+                "cover_image_search_query": "vegetable soup",
+                "categories": ["soup"],
+                "steps": [],
+            },
+            {
+                "title": "Пирог",
+                "cover_image_url": "",
+                "cover_image_search_query": "apple pie",
+                "categories": ["bakery"],
+                "steps": [],
+            },
+        ]
+
+        prepared = _prepare_images(document, recipes)
+
+        self.assertEqual(
+            [call.args[0] for call in self.search_cover_images.call_args_list],
+            ["vegetable soup", "apple pie"],
+        )
+        self.assertEqual(
+            [cover.name for cover, _ in prepared],
+            ["vegetable soup.jpg", "apple pie.jpg"],
+        )
+
+    @patch("recipes.importing.pipeline.time.monotonic")
+    @patch("recipes.importing.pipeline._download_image")
+    def test_source_download_time_does_not_consume_search_budget(
+        self, download_image, monotonic
+    ):
+        clock = {"now": 0}
+        source_url = "https://source.example/slow.jpg"
+        search_url = "https://images.example/soup.jpg"
+
+        def download(url, **kwargs):
+            if url == source_url:
+                clock["now"] = 20
+                return None
+            return DownloadedImage("soup.jpg", b"image", width=1_600, height=1_200)
+
+        monotonic.side_effect = lambda: clock["now"]
+        download_image.side_effect = download
+        self.search_cover_images.return_value = [search_url]
+        document = SourceDocument(
+            "website",
+            "Суп",
+            "Описание",
+            cover_image_urls=(source_url,),
+        )
+        data = [
+            {
+                "title": "Суп",
+                "cover_image_url": "",
+                "cover_image_search_query": "vegetable soup",
+                "categories": ["soup"],
+                "steps": [],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertEqual(prepared[0][0].name, "soup.jpg")
+        self.search_cover_images.assert_called_once_with(
+            "vegetable soup",
+            timeout=3,
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    @patch("recipes.importing.pipeline.time.monotonic", return_value=10)
+    def test_candidate_download_respects_search_deadline(self, monotonic, download_image):
+        image = ImageImportBudget().select(
+            ["https://images.example/soup.jpg"],
+            cover=True,
+            deadline=12,
+        )
+
+        self.assertIsNone(image)
+        download_image.assert_called_once_with(
+            "https://images.example/soup.jpg",
+            timeout=2,
+            deadline=12,
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    @patch("recipes.importing.pipeline.time.monotonic", return_value=12)
+    def test_candidate_download_stops_at_search_deadline(self, monotonic, download_image):
+        image = ImageImportBudget().select(
+            ["https://images.example/soup.jpg"],
+            cover=True,
+            deadline=12,
+        )
+
+        self.assertIsNone(image)
+        download_image.assert_not_called()
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_cover_requires_at_least_1200_by_800_pixels(self, download_image):
+        urls = [
+            "https://images.example/too-narrow.jpg",
+            "https://images.example/too-short.jpg",
+            "https://images.example/large-enough.jpg",
+        ]
+        download_image.side_effect = [
+            DownloadedImage(
+                "too-narrow.jpg",
+                b"narrow",
+                width=MIN_COVER_LONG_SIDE - 1,
+                height=MIN_COVER_SHORT_SIDE,
+            ),
+            DownloadedImage(
+                "too-short.jpg",
+                b"short",
+                width=MIN_COVER_LONG_SIDE,
+                height=MIN_COVER_SHORT_SIDE - 1,
+            ),
+            DownloadedImage(
+                "large-enough.jpg",
+                b"large",
+                width=MIN_COVER_LONG_SIDE,
+                height=MIN_COVER_SHORT_SIDE,
+            ),
+        ]
+
+        image = ImageImportBudget().select(urls, cover=True)
+
+        self.assertEqual(image.name, "large-enough.jpg")
 
     @patch("recipes.importing.pipeline._download_image")
     def test_step_images_keep_their_recipe_and_step_positions(self, download_image):

@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import http.client
 import io
+import json
 import logging
 import ssl
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 from PIL import Image, UnidentifiedImageError
 from django.conf import settings
@@ -26,6 +28,8 @@ from .extractors import (
     SourceDocument,
     _open_public_url,
     extract_source,
+    fetch_source_title,
+    youtube_video_id,
 )
 from .llm import adapt_with_ai
 from .normalizer import normalize_recipes
@@ -40,14 +44,35 @@ MAX_IMPORTED_IMAGES = 25
 MAX_IMAGE_WIDTH = 8_000
 MAX_IMAGE_HEIGHT = 8_000
 MAX_IMAGE_PIXELS = 32_000_000
+MIN_COVER_SHORT_SIDE = 800
+MIN_COVER_LONG_SIDE = 1_200
+MAX_IMAGE_SEARCH_BYTES = 512 * 1024
+MAX_COVER_SEARCH_QUERIES = 2
+MAX_COVER_SEARCH_SECONDS = 6
+OPENVERSE_REQUEST_TIMEOUT_SECONDS = 3
+OPENVERSE_SEARCH_URL = "https://api.openverse.org/v1/images/"
+CATEGORY_IMAGE_QUERIES = {
+    "breakfast": "breakfast food",
+    "appetizer": "appetizer food",
+    "soup": "soup bowl",
+    "salad": "salad bowl",
+    "main-course": "cooked main dish",
+    "side-dish": "side dish",
+    "bakery": "baked goods",
+    "dessert": "dessert",
+    "drink": "drink",
+    "sauce": "sauce food",
+    "preserve": "fruit preserves",
+    "other": "cooked food",
+}
 
 
 @dataclass(frozen=True)
 class DownloadedImage:
     name: str
     content: bytes
-    width: int = 1_000
-    height: int = 1_000
+    width: int = 1_600
+    height: int = 1_200
 
 
 def _valid_image_dimensions(image: DownloadedImage, *, cover: bool) -> bool:
@@ -57,25 +82,53 @@ def _valid_image_dimensions(image: DownloadedImage, *, cover: bool) -> bool:
         or image.width * image.height > MAX_IMAGE_PIXELS
     ):
         return False
-    min_area = 150_000 if cover else 40_000
-    min_side = 300 if cover else 160
-    return image.width * image.height >= min_area and min(image.width, image.height) >= min_side
+    if cover:
+        return (
+            min(image.width, image.height) >= MIN_COVER_SHORT_SIDE
+            and max(image.width, image.height) >= MIN_COVER_LONG_SIDE
+        )
+    return image.width * image.height >= 40_000 and min(image.width, image.height) >= 160
 
 
 @dataclass
 class ImageImportBudget:
     cache: dict[str, DownloadedImage | None] = field(default_factory=dict)
+    attempted_urls: set[str] = field(default_factory=set)
     total_bytes: int = 0
     assignments: int = 0
 
-    def select(self, urls: list[str], *, cover: bool) -> DownloadedImage | None:
-        if self.assignments >= MAX_IMPORTED_IMAGES:
+    @property
+    def exhausted(self) -> bool:
+        return (
+            self.assignments >= MAX_IMPORTED_IMAGES
+            or len(self.attempted_urls) >= MAX_IMPORTED_IMAGES
+            or self.total_bytes >= MAX_IMAGE_TOTAL_BYTES
+        )
+
+    def select(
+        self,
+        urls: list[str],
+        *,
+        cover: bool,
+        deadline: float | None = None,
+    ) -> DownloadedImage | None:
+        if self.exhausted:
             return None
         for url in dict.fromkeys(urls):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             if url not in self.cache:
-                if len(self.cache) >= MAX_IMPORTED_IMAGES:
+                if len(self.attempted_urls) >= MAX_IMPORTED_IMAGES:
                     continue
-                image = _download_image(url)
+                self.attempted_urls.add(url)
+                if deadline is None:
+                    image = _download_image(url)
+                else:
+                    image = _download_image(
+                        url,
+                        timeout=max(0.001, deadline - time.monotonic()),
+                        deadline=deadline,
+                    )
                 if image and self.total_bytes + len(image.content) <= MAX_IMAGE_TOTAL_BYTES:
                     self.total_bytes += len(image.content)
                     self.cache[url] = image
@@ -88,13 +141,30 @@ class ImageImportBudget:
         return None
 
 
-def _download_image(url: str) -> DownloadedImage | None:
+def _download_image(
+    url: str,
+    *,
+    timeout: float = 15,
+    deadline: float | None = None,
+) -> DownloadedImage | None:
     """Fetch and validate a public source image without making image import fatal."""
     current_url = url
-    headers = {"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,image/webp"}
+    # Some image proxy endpoints reject a narrow Accept header even when they
+    # return JPEG. The response is still restricted by content type and Pillow.
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     try:
         for _ in range(MAX_REDIRECTS + 1):
-            with _open_public_url(current_url, headers=headers, timeout=15) as response:
+            request_timeout = timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                request_timeout = min(request_timeout, remaining)
+            with _open_public_url(
+                current_url,
+                headers=headers,
+                timeout=max(0.001, request_timeout),
+            ) as response:
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
                     if not location:
@@ -112,7 +182,12 @@ def _download_image(url: str) -> DownloadedImage | None:
                     return None
                 chunks: list[bytes] = []
                 size = 0
-                while chunk := response.read(min(65_536, MAX_IMAGE_BYTES + 1 - size)):
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
+                    chunk = response.read(min(65_536, MAX_IMAGE_BYTES + 1 - size))
+                    if not chunk:
+                        break
                     size += len(chunk)
                     if size > MAX_IMAGE_BYTES:
                         return None
@@ -153,6 +228,92 @@ def _download_image(url: str) -> DownloadedImage | None:
     return None
 
 
+def _search_cover_image_urls(
+    query: str,
+    *,
+    timeout: float = OPENVERSE_REQUEST_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Find relevant public-domain cover candidates without making import fatal."""
+    query = " ".join(str(query or "").split())[:200]
+    if not query:
+        return []
+    params = urlencode(
+        {
+            "q": query,
+            "page_size": 5,
+            "license": "cc0,pdm",
+            "mature": "false",
+            "size": "large",
+        }
+    )
+    url = f"{OPENVERSE_SEARCH_URL}?{params}"
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    try:
+        with _open_public_url(url, headers=headers, timeout=timeout) as response:
+            if response.status != 200:
+                return []
+            content_type = (
+                response.headers.get("content-type", "")
+                .split(";", 1)[0]
+                .lower()
+            )
+            if content_type != "application/json":
+                return []
+            content = response.read(MAX_IMAGE_SEARCH_BYTES + 1)
+            if len(content) > MAX_IMAGE_SEARCH_BYTES:
+                return []
+        payload = json.loads(content)
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        candidates = []
+        for result in results if isinstance(results, list) else []:
+            if (
+                not isinstance(result, dict)
+                or result.get("license") not in {"cc0", "pdm"}
+                or result.get("mature") is True
+            ):
+                continue
+            for candidate in (result.get("thumbnail"), result.get("url")):
+                if isinstance(candidate, str) and candidate.startswith(
+                    ("http://", "https://")
+                ):
+                    candidates.append(candidate[:2048])
+        return list(dict.fromkeys(candidates))
+    except (
+        json.JSONDecodeError,
+        http.client.HTTPException,
+        ssl.SSLError,
+        OSError,
+        ImportPipelineError,
+    ):
+        logger.info("Could not search for a cover image using %r", query, exc_info=True)
+        return []
+
+
+def _cover_search_queries(data: dict) -> list[str]:
+    precise_query = " ".join(
+        str(data.get("cover_image_search_query", "") or "").split()
+    )
+    category_query = next(
+        (
+            CATEGORY_IMAGE_QUERIES[slug]
+            for slug in data.get("categories", [])
+            if slug in CATEGORY_IMAGE_QUERIES
+        ),
+        "",
+    )
+    if precise_query:
+        precise_words = precise_query.split()
+        fallback_query = precise_words[0] if len(precise_words) > 1 else category_query
+        queries = [precise_query, fallback_query]
+    else:
+        queries = [data.get("title", ""), category_query]
+    return list(
+        dict.fromkeys(
+            " ".join(str(query or "").split()) for query in queries if query
+        )
+    )[:MAX_COVER_SEARCH_QUERIES]
+
+
 def _prepare_images(
     document: SourceDocument | None,
     recipes: list[dict],
@@ -160,6 +321,8 @@ def _prepare_images(
     if not document:
         return [(None, [None] * len(data["steps"])) for data in recipes]
     budget = ImageImportBudget()
+    search_cache: dict[str, list[str]] = {}
+    search_seconds_remaining = MAX_COVER_SEARCH_SECONDS
     allowed_cover = set(document.cover_image_urls)
     allowed_steps = set(document.step_image_urls)
     structured_cover_urls = {
@@ -191,6 +354,52 @@ def _prepare_images(
         cover_urls.extend(fallback_covers[recipe_index:])
         cover_urls.extend(fallback_covers[:recipe_index])
         cover_image = budget.select(cover_urls, cover=True)
+        if not cover_image and data.get("title") and not budget.exhausted:
+            search_attempts = 0
+            recipe_search_started_at = time.monotonic()
+            remaining_recipes = len(recipes) - recipe_index
+            recipe_search_deadline = recipe_search_started_at + (
+                search_seconds_remaining / max(remaining_recipes, 1)
+            )
+            try:
+                for query in _cover_search_queries(data):
+                    if budget.exhausted:
+                        break
+                    if query not in search_cache:
+                        remaining = recipe_search_deadline - time.monotonic()
+                        if (
+                            search_attempts >= MAX_COVER_SEARCH_QUERIES
+                            or remaining <= 0
+                        ):
+                            break
+                        search_attempts += 1
+                        search_cache[query] = list(
+                            _search_cover_image_urls(
+                                query,
+                                timeout=min(
+                                    OPENVERSE_REQUEST_TIMEOUT_SECONDS,
+                                    remaining,
+                                ),
+                            )
+                            or []
+                        )
+                    search_urls = list(search_cache[query])
+                    if search_urls:
+                        offset = recipe_index % len(search_urls)
+                        search_urls = search_urls[offset:] + search_urls[:offset]
+                    cover_image = budget.select(
+                        search_urls,
+                        cover=True,
+                        deadline=recipe_search_deadline,
+                    )
+                    if cover_image:
+                        break
+            finally:
+                search_seconds_remaining = max(
+                    0,
+                    search_seconds_remaining
+                    - max(0, time.monotonic() - recipe_search_started_at),
+                )
 
         step_images: list[DownloadedImage | None] = []
         fallback_index = 0
@@ -497,10 +706,24 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
             status=Recipe.Status.DRAFT,
         ).distinct()
     }
-    document = extract_source(job.source_url)
+    youtube_title_attempted = False
+    if job.source_type == ImportJob.SourceType.YOUTUBE and not job.source_title:
+        youtube_title_attempted = True
+        job.source_title = fetch_source_title(job.source_url)
+        if job.source_title:
+            job.save(update_fields=["source_title"])
+    document = extract_source(
+        job.source_url,
+        source_title=job.source_title,
+        fetch_title=not youtube_title_attempted,
+    )
+    technical_youtube_title = f"YouTube {youtube_video_id(job.source_url) or ''}".strip()
+    if job.source_title and document.title == technical_youtube_title:
+        document = replace(document, title=job.source_title)
     validate_source_safety(document)
-    job.source_title = document.title
-    job.save(update_fields=["source_title"])
+    if document.title and job.source_title != document.title:
+        job.source_title = document.title
+        job.save(update_fields=["source_title"])
     if settings.RECIPE_AI_BASE_URL and settings.RECIPE_AI_MODEL:
         data = adapt_with_ai(document, custom_prompt=job.custom_prompt)
     elif document.all_structured_recipes:
