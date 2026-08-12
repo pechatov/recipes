@@ -1,3 +1,4 @@
+from datetime import datetime, timezone as datetime_timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -604,7 +605,29 @@ class RecipeViewTests(TestCase):
         draft.refresh_from_db()
         self.assertEqual(draft.status, Recipe.Status.PUBLISHED)
 
-    def test_import_url_creates_queued_job(self):
+    def test_draft_can_be_deleted_directly_from_draft_list(self):
+        draft = Recipe.objects.create(
+            title="Ненужный черновик",
+            status=Recipe.Status.DRAFT,
+            created_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        drafts = self.client.get(reverse("draft-list"))
+        delete_url = reverse("recipe-delete", args=[draft.slug])
+        self.assertContains(drafts, f'action="{delete_url}"')
+        self.assertContains(drafts, "Удалить")
+
+        response = self.client.post(delete_url)
+
+        self.assertRedirects(response, reverse("draft-list"))
+        self.assertFalse(Recipe.objects.filter(pk=draft.pk).exists())
+
+    @patch(
+        "recipes.views.fetch_source_title",
+        return_value="Острый суп за полчаса",
+    )
+    def test_import_url_creates_queued_job_with_source_title(self, fetch_title):
         self.client.force_login(self.user)
         response = self.client.post(
             reverse("import-create"),
@@ -619,6 +642,8 @@ class RecipeViewTests(TestCase):
         self.assertEqual(job.status, ImportJob.Status.PENDING)
         self.assertEqual(job.requested_by, self.user)
         self.assertEqual(job.custom_prompt, "Сохрани острые ингредиенты")
+        self.assertEqual(job.source_title, "Острый суп за полчаса")
+        fetch_title.assert_called_once_with("https://youtu.be/dQw4w9WgXcQ")
 
     def test_task_list_shows_current_users_imports_and_carts(self):
         other = get_user_model().objects.create_user(username="guest")
@@ -638,6 +663,35 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(response, reverse("import-detail", args=[own_job.pk]))
         self.assertNotContains(response, "https://example.com/other")
+
+    def test_task_list_shows_source_title_instead_of_raw_url(self):
+        job = ImportJob.objects.create(
+            source_url="https://example.com/very-long-source-url",
+            source_title="Как приготовить домашний борщ",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("task-list"))
+
+        self.assertContains(response, "Как приготовить домашний борщ")
+        self.assertNotContains(response, job.source_url)
+
+    def test_task_list_displays_dates_in_moscow_time(self):
+        job = ImportJob.objects.create(
+            source_url="https://example.com/moscow-time",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=self.user,
+        )
+        ImportJob.objects.filter(pk=job.pk).update(
+            created_at=datetime(2026, 8, 12, 0, 29, tzinfo=datetime_timezone.utc)
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("task-list"))
+
+        self.assertContains(response, "12.08.2026 03:29")
 
     def test_completed_draft_can_be_queued_for_reprocessing(self):
         draft = Recipe.objects.create(

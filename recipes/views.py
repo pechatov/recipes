@@ -22,7 +22,7 @@ from django.views.decorators.http import require_http_methods, require_POST
 
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
-from .importing.extractors import detect_source_type
+from .importing.extractors import detect_source_type, fetch_source_title
 from .importing.normalizer import estimate_nutrition
 from .models import (
     CartAttempt,
@@ -595,6 +595,7 @@ def import_create(request):
     if request.method == "POST" and form.is_valid():
         job = form.save(commit=False)
         job.source_type = detect_source_type(job.source_url)
+        job.source_title = fetch_source_title(job.source_url)
         job.requested_by = request.user
         job.save()
         messages.success(request, "Ссылка добавлена в очередь. Можно закрыть эту страницу.")
@@ -688,9 +689,10 @@ def recipe_delete(request, slug):
     if used_alias and request.method in {"GET", "HEAD"}:
         return _canonical_recipe_redirect(request, recipe, "recipe-delete")
     if request.method == "POST":
+        redirect_name = "draft-list" if recipe.is_draft else "recipe-list"
         recipe.delete()
         messages.success(request, "Рецепт удалён.")
-        return redirect("recipe-list")
+        return redirect(redirect_name)
     return render(request, "recipes/recipe_confirm_delete.html", {"recipe": recipe})
 
 

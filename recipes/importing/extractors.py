@@ -9,7 +9,7 @@ import ssl
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -20,6 +20,7 @@ from .exceptions import SourceError
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CHARS = 60_000
+MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
 
@@ -190,6 +191,90 @@ def _download_html(url: str) -> tuple[str, str]:
     raise SourceError("Сайт перенаправляет запрос слишком много раз.")
 
 
+def _page_title(soup: BeautifulSoup) -> str:
+    heading = soup.find("h1")
+    if heading:
+        title = heading.get_text(" ", strip=True)
+        if title:
+            return title[:300]
+    for selector in ('meta[property="og:title"]', 'meta[name="twitter:title"]'):
+        element = soup.select_one(selector)
+        title = str(element.get("content") or "").strip() if element else ""
+        if title:
+            return title[:300]
+    if soup.title:
+        title = soup.title.get_text(" ", strip=True)
+        if title:
+            return title[:300]
+    return ""
+
+
+def _fetch_website_title(url: str) -> str:
+    """Fetch only enough of a page to name a queued import without blocking it for long."""
+    current_url = url
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
+    for _ in range(MAX_REDIRECTS + 1):
+        try:
+            with _open_public_url(current_url, headers=headers, timeout=5) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        return ""
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status >= 400:
+                    return ""
+                if "html" not in response.headers.get("content-type", "").lower():
+                    return ""
+                content = response.read(MAX_TITLE_BYTES)
+                encoding = response.headers.get_content_charset() or "utf-8"
+                return _page_title(
+                    BeautifulSoup(content.decode(encoding, errors="replace"), "html.parser")
+                )
+        except (OSError, http.client.HTTPException, ssl.SSLError, SourceError):
+            return ""
+    return ""
+
+
+def _fetch_youtube_title(video_id: str) -> str:
+    params = urlencode(
+        {
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "format": "json",
+        }
+    )
+    url = f"https://www.youtube.com/oembed?{params}"
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    try:
+        with _open_public_url(url, headers=headers, timeout=5) as response:
+            if response.status != 200:
+                return ""
+            if "json" not in response.headers.get("content-type", "").lower():
+                return ""
+            content = response.read(MAX_TITLE_BYTES + 1)
+            if len(content) > MAX_TITLE_BYTES:
+                return ""
+        payload = json.loads(content)
+        title = payload.get("title", "") if isinstance(payload, dict) else ""
+        return " ".join(str(title).split())[:300]
+    except (
+        json.JSONDecodeError,
+        OSError,
+        http.client.HTTPException,
+        ssl.SSLError,
+        SourceError,
+    ):
+        return ""
+
+
+def fetch_source_title(url: str) -> str:
+    """Return a best-effort video or article title for task-list presentation."""
+    video_id = youtube_video_id(url)
+    if video_id:
+        return _fetch_youtube_title(video_id)
+    return _fetch_website_title(url)
+
+
 def _find_recipe_jsons(value: Any) -> list[dict[str, Any]]:
     recipes: list[dict[str, Any]] = []
     if isinstance(value, dict):
@@ -337,12 +422,7 @@ def extract_website(url: str) -> SourceDocument:
     cover_image_urls, step_image_urls = _source_images(soup, recipes, final_url)
     for element in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
         element.decompose()
-    title = ""
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-    heading = soup.find("h1")
-    if heading:
-        title = heading.get_text(" ", strip=True) or title
+    title = _page_title(soup)
     text = "\n".join(
         line.strip()
         for line in soup.get_text("\n").splitlines()
@@ -385,7 +465,7 @@ def extract_youtube(url: str) -> SourceDocument:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
     return SourceDocument(
         "youtube",
-        f"YouTube {video_id}",
+        _fetch_youtube_title(video_id) or f"YouTube {video_id}",
         text[:MAX_SOURCE_CHARS],
         cover_image_urls=(
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",

@@ -343,6 +343,9 @@ def normalize_recipe(
             )
         },
         "cover_image_url": _text(value.get("cover_image_url"), 2048),
+        "cover_image_search_query": _text(
+            value.get("cover_image_search_query"), 200
+        ),
         "ingredients": ingredients,
         "steps": steps,
     }

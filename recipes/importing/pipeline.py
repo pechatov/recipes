@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import http.client
 import io
+import json
 import logging
 import ssl
 from dataclasses import dataclass, field, replace
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 from PIL import Image, UnidentifiedImageError
 from django.conf import settings
@@ -26,6 +27,7 @@ from .extractors import (
     SourceDocument,
     _open_public_url,
     extract_source,
+    youtube_video_id,
 )
 from .llm import adapt_with_ai
 from .normalizer import normalize_recipes
@@ -40,14 +42,32 @@ MAX_IMPORTED_IMAGES = 25
 MAX_IMAGE_WIDTH = 8_000
 MAX_IMAGE_HEIGHT = 8_000
 MAX_IMAGE_PIXELS = 32_000_000
+MIN_COVER_SHORT_SIDE = 800
+MIN_COVER_LONG_SIDE = 1_200
+MAX_IMAGE_SEARCH_BYTES = 512 * 1024
+OPENVERSE_SEARCH_URL = "https://api.openverse.org/v1/images/"
+CATEGORY_IMAGE_QUERIES = {
+    "breakfast": "breakfast food",
+    "appetizer": "appetizer food",
+    "soup": "soup bowl",
+    "salad": "salad bowl",
+    "main-course": "cooked main dish",
+    "side-dish": "side dish",
+    "bakery": "baked goods",
+    "dessert": "dessert",
+    "drink": "drink",
+    "sauce": "sauce food",
+    "preserve": "fruit preserves",
+    "other": "cooked food",
+}
 
 
 @dataclass(frozen=True)
 class DownloadedImage:
     name: str
     content: bytes
-    width: int = 1_000
-    height: int = 1_000
+    width: int = 1_600
+    height: int = 1_200
 
 
 def _valid_image_dimensions(image: DownloadedImage, *, cover: bool) -> bool:
@@ -57,9 +77,12 @@ def _valid_image_dimensions(image: DownloadedImage, *, cover: bool) -> bool:
         or image.width * image.height > MAX_IMAGE_PIXELS
     ):
         return False
-    min_area = 150_000 if cover else 40_000
-    min_side = 300 if cover else 160
-    return image.width * image.height >= min_area and min(image.width, image.height) >= min_side
+    if cover:
+        return (
+            min(image.width, image.height) >= MIN_COVER_SHORT_SIDE
+            and max(image.width, image.height) >= MIN_COVER_LONG_SIDE
+        )
+    return image.width * image.height >= 40_000 and min(image.width, image.height) >= 160
 
 
 @dataclass
@@ -91,7 +114,9 @@ class ImageImportBudget:
 def _download_image(url: str) -> DownloadedImage | None:
     """Fetch and validate a public source image without making image import fatal."""
     current_url = url
-    headers = {"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,image/webp"}
+    # Some image proxy endpoints reject a narrow Accept header even when they
+    # return JPEG. The response is still restricted by content type and Pillow.
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     try:
         for _ in range(MAX_REDIRECTS + 1):
             with _open_public_url(current_url, headers=headers, timeout=15) as response:
@@ -153,6 +178,86 @@ def _download_image(url: str) -> DownloadedImage | None:
     return None
 
 
+def _search_cover_image_urls(query: str) -> list[str]:
+    """Find relevant public-domain cover candidates without making import fatal."""
+    query = " ".join(str(query or "").split())[:200]
+    if not query:
+        return []
+    params = urlencode(
+        {
+            "q": query,
+            "page_size": 5,
+            "license": "cc0,pdm",
+            "mature": "false",
+            "size": "large",
+        }
+    )
+    url = f"{OPENVERSE_SEARCH_URL}?{params}"
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    try:
+        with _open_public_url(url, headers=headers, timeout=10) as response:
+            if response.status != 200:
+                return []
+            content_type = (
+                response.headers.get("content-type", "")
+                .split(";", 1)[0]
+                .lower()
+            )
+            if content_type != "application/json":
+                return []
+            content = response.read(MAX_IMAGE_SEARCH_BYTES + 1)
+            if len(content) > MAX_IMAGE_SEARCH_BYTES:
+                return []
+        payload = json.loads(content)
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        candidates = []
+        for result in results if isinstance(results, list) else []:
+            if (
+                not isinstance(result, dict)
+                or result.get("license") not in {"cc0", "pdm"}
+                or result.get("mature") is True
+            ):
+                continue
+            for candidate in (result.get("thumbnail"), result.get("url")):
+                if isinstance(candidate, str) and candidate.startswith(
+                    ("http://", "https://")
+                ):
+                    candidates.append(candidate[:2048])
+        return list(dict.fromkeys(candidates))
+    except (
+        json.JSONDecodeError,
+        http.client.HTTPException,
+        ssl.SSLError,
+        OSError,
+        ImportPipelineError,
+    ):
+        logger.info("Could not search for a cover image using %r", query, exc_info=True)
+        return []
+
+
+def _cover_search_queries(data: dict) -> list[str]:
+    precise_query = " ".join(
+        str(data.get("cover_image_search_query", "") or "").split()
+    )
+    precise_words = precise_query.split()
+    queries = [precise_query]
+    queries.extend(
+        " ".join(precise_words[:length])
+        for length in range(len(precise_words) - 1, 0, -1)
+    )
+    queries.append(data.get("title", ""))
+    queries.extend(
+        CATEGORY_IMAGE_QUERIES[slug]
+        for slug in data.get("categories", [])
+        if slug in CATEGORY_IMAGE_QUERIES
+    )
+    return list(
+        dict.fromkeys(
+            " ".join(str(query or "").split()) for query in queries if query
+        )
+    )
+
+
 def _prepare_images(
     document: SourceDocument | None,
     recipes: list[dict],
@@ -191,6 +296,15 @@ def _prepare_images(
         cover_urls.extend(fallback_covers[recipe_index:])
         cover_urls.extend(fallback_covers[:recipe_index])
         cover_image = budget.select(cover_urls, cover=True)
+        if not cover_image and data.get("title"):
+            for query in _cover_search_queries(data):
+                search_urls = list(_search_cover_image_urls(query) or [])
+                if search_urls:
+                    offset = recipe_index % len(search_urls)
+                    search_urls = search_urls[offset:] + search_urls[:offset]
+                cover_image = budget.select(search_urls, cover=True)
+                if cover_image:
+                    break
 
         step_images: list[DownloadedImage | None] = []
         fallback_index = 0
@@ -498,9 +612,13 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
         ).distinct()
     }
     document = extract_source(job.source_url)
+    technical_youtube_title = f"YouTube {youtube_video_id(job.source_url) or ''}".strip()
+    if job.source_title and document.title == technical_youtube_title:
+        document = replace(document, title=job.source_title)
     validate_source_safety(document)
-    job.source_title = document.title
-    job.save(update_fields=["source_title"])
+    if document.title and job.source_title != document.title:
+        job.source_title = document.title
+        job.save(update_fields=["source_title"])
     if settings.RECIPE_AI_BASE_URL and settings.RECIPE_AI_MODEL:
         data = adapt_with_ai(document, custom_prompt=job.custom_prompt)
     elif document.all_structured_recipes:
