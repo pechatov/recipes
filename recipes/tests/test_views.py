@@ -623,11 +623,7 @@ class RecipeViewTests(TestCase):
         self.assertRedirects(response, reverse("draft-list"))
         self.assertFalse(Recipe.objects.filter(pk=draft.pk).exists())
 
-    @patch(
-        "recipes.views.fetch_source_title",
-        return_value="Острый суп за полчаса",
-    )
-    def test_import_url_creates_queued_job_with_source_title(self, fetch_title):
+    def test_import_url_creates_queued_job_without_fetching_source(self):
         self.client.force_login(self.user)
         response = self.client.post(
             reverse("import-create"),
@@ -642,8 +638,7 @@ class RecipeViewTests(TestCase):
         self.assertEqual(job.status, ImportJob.Status.PENDING)
         self.assertEqual(job.requested_by, self.user)
         self.assertEqual(job.custom_prompt, "Сохрани острые ингредиенты")
-        self.assertEqual(job.source_title, "Острый суп за полчаса")
-        fetch_title.assert_called_once_with("https://youtu.be/dQw4w9WgXcQ")
+        self.assertEqual(job.source_title, "")
 
     def test_task_list_shows_current_users_imports_and_carts(self):
         other = get_user_model().objects.create_user(username="guest")

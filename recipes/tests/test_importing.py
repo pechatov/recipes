@@ -15,6 +15,7 @@ from recipes.importing.exceptions import (
 from recipes.importing.extractors import (
     SourceDocument,
     _PinnedHTTPSConnection,
+    _fetch_website_title,
     _fetch_youtube_title,
     _resolve_public_url,
     _validate_public_url,
@@ -88,6 +89,21 @@ class ExtractorTests(TestCase):
         requested_url = open_url.call_args.args[0]
         self.assertIn("youtube.com/oembed?", requested_url)
         self.assertIn("dQw4w9WgXcQ", requested_url)
+
+    @patch("recipes.importing.extractors._open_public_url")
+    def test_website_title_falls_back_to_utf8_for_unknown_charset(self, open_url):
+        response = MagicMock()
+        response.status = 200
+        response.headers.get.return_value = "text/html; charset=invalid-codec"
+        response.headers.get_content_charset.return_value = "invalid-codec"
+        response.read.return_value = (
+            "<html><head><title>Домашний борщ</title></head></html>".encode()
+        )
+        open_url.return_value.__enter__.return_value = response
+
+        title = _fetch_website_title("https://example.com/borscht")
+
+        self.assertEqual(title, "Домашний борщ")
 
     @patch("recipes.importing.extractors.socket.getaddrinfo")
     def test_public_url_prefers_ipv4_when_ipv6_is_listed_first(self, getaddrinfo):
@@ -439,6 +455,10 @@ class PipelineTests(TestCase):
         self.search_cover_images = search_patcher.start()
         self.search_cover_images.return_value = []
         self.addCleanup(search_patcher.stop)
+        title_patcher = patch("recipes.importing.pipeline.fetch_source_title")
+        self.fetch_source_title = title_patcher.start()
+        self.fetch_source_title.return_value = ""
+        self.addCleanup(title_patcher.stop)
 
     @staticmethod
     def recipe_data(title):
@@ -564,6 +584,7 @@ class PipelineTests(TestCase):
             requested_by=user,
             custom_prompt="Без молочных продуктов",
         )
+        self.fetch_source_title.return_value = "Два рецепта из картофеля"
 
         recipes = process_import_job(job)
 
@@ -575,6 +596,11 @@ class PipelineTests(TestCase):
         adapt_with_ai.assert_called_once_with(
             extract_source.return_value,
             custom_prompt="Без молочных продуктов",
+        )
+        self.fetch_source_title.assert_called_once_with(job.source_url)
+        extract_source.assert_called_once_with(
+            job.source_url,
+            source_title="Два рецепта из картофеля",
         )
 
     @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")

@@ -27,6 +27,7 @@ from .extractors import (
     SourceDocument,
     _open_public_url,
     extract_source,
+    fetch_source_title,
     youtube_video_id,
 )
 from .llm import adapt_with_ai
@@ -611,7 +612,11 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
             status=Recipe.Status.DRAFT,
         ).distinct()
     }
-    document = extract_source(job.source_url)
+    if job.source_type == ImportJob.SourceType.YOUTUBE and not job.source_title:
+        job.source_title = fetch_source_title(job.source_url)
+        if job.source_title:
+            job.save(update_fields=["source_title"])
+    document = extract_source(job.source_url, source_title=job.source_title)
     technical_youtube_title = f"YouTube {youtube_video_id(job.source_url) or ''}".strip()
     if job.source_title and document.title == technical_youtube_title:
         document = replace(document, title=job.source_title)

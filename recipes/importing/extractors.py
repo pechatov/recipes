@@ -183,7 +183,12 @@ def _download_html(url: str) -> tuple[str, str]:
                         raise SourceError("Страница слишком большая для безопасного импорта.")
                     chunks.append(chunk)
                 encoding = response.headers.get_content_charset() or "utf-8"
-                return b"".join(chunks).decode(encoding, errors="replace"), current_url
+                content = b"".join(chunks)
+                try:
+                    text = content.decode(encoding, errors="replace")
+                except (LookupError, UnicodeError):
+                    text = content.decode("utf-8", errors="replace")
+                return text, current_url
         except SourceError:
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError) as error:
@@ -228,8 +233,12 @@ def _fetch_website_title(url: str) -> str:
                     return ""
                 content = response.read(MAX_TITLE_BYTES)
                 encoding = response.headers.get_content_charset() or "utf-8"
+                try:
+                    text = content.decode(encoding, errors="replace")
+                except (LookupError, UnicodeError):
+                    text = content.decode("utf-8", errors="replace")
                 return _page_title(
-                    BeautifulSoup(content.decode(encoding, errors="replace"), "html.parser")
+                    BeautifulSoup(text, "html.parser")
                 )
         except (OSError, http.client.HTTPException, ssl.SSLError, SourceError):
             return ""
@@ -449,7 +458,7 @@ def extract_website(url: str) -> SourceDocument:
     )
 
 
-def extract_youtube(url: str) -> SourceDocument:
+def extract_youtube(url: str, *, source_title: str = "") -> SourceDocument:
     video_id = youtube_video_id(url)
     if not video_id:
         raise SourceError("Не удалось распознать ссылку на YouTube-видео.")
@@ -465,7 +474,7 @@ def extract_youtube(url: str) -> SourceDocument:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
     return SourceDocument(
         "youtube",
-        _fetch_youtube_title(video_id) or f"YouTube {video_id}",
+        source_title or _fetch_youtube_title(video_id) or f"YouTube {video_id}",
         text[:MAX_SOURCE_CHARS],
         cover_image_urls=(
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
@@ -475,7 +484,7 @@ def extract_youtube(url: str) -> SourceDocument:
     )
 
 
-def extract_source(url: str) -> SourceDocument:
+def extract_source(url: str, *, source_title: str = "") -> SourceDocument:
     if youtube_video_id(url):
-        return extract_youtube(url)
+        return extract_youtube(url, source_title=source_title)
     return extract_website(url)
