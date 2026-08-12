@@ -104,14 +104,29 @@ class ImageImportBudget:
             or self.total_bytes >= MAX_IMAGE_TOTAL_BYTES
         )
 
-    def select(self, urls: list[str], *, cover: bool) -> DownloadedImage | None:
+    def select(
+        self,
+        urls: list[str],
+        *,
+        cover: bool,
+        deadline: float | None = None,
+    ) -> DownloadedImage | None:
         if self.exhausted:
             return None
         for url in dict.fromkeys(urls):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             if url not in self.cache:
                 if len(self.cache) >= MAX_IMPORTED_IMAGES:
                     continue
-                image = _download_image(url)
+                if deadline is None:
+                    image = _download_image(url)
+                else:
+                    image = _download_image(
+                        url,
+                        timeout=max(0.001, deadline - time.monotonic()),
+                        deadline=deadline,
+                    )
                 if image and self.total_bytes + len(image.content) <= MAX_IMAGE_TOTAL_BYTES:
                     self.total_bytes += len(image.content)
                     self.cache[url] = image
@@ -124,7 +139,12 @@ class ImageImportBudget:
         return None
 
 
-def _download_image(url: str) -> DownloadedImage | None:
+def _download_image(
+    url: str,
+    *,
+    timeout: float = 15,
+    deadline: float | None = None,
+) -> DownloadedImage | None:
     """Fetch and validate a public source image without making image import fatal."""
     current_url = url
     # Some image proxy endpoints reject a narrow Accept header even when they
@@ -132,7 +152,17 @@ def _download_image(url: str) -> DownloadedImage | None:
     headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     try:
         for _ in range(MAX_REDIRECTS + 1):
-            with _open_public_url(current_url, headers=headers, timeout=15) as response:
+            request_timeout = timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                request_timeout = min(request_timeout, remaining)
+            with _open_public_url(
+                current_url,
+                headers=headers,
+                timeout=max(0.001, request_timeout),
+            ) as response:
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
                     if not location:
@@ -150,7 +180,12 @@ def _download_image(url: str) -> DownloadedImage | None:
                     return None
                 chunks: list[bytes] = []
                 size = 0
-                while chunk := response.read(min(65_536, MAX_IMAGE_BYTES + 1 - size)):
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
+                    chunk = response.read(min(65_536, MAX_IMAGE_BYTES + 1 - size))
+                    if not chunk:
+                        break
                     size += len(chunk)
                     if size > MAX_IMAGE_BYTES:
                         return None
@@ -285,8 +320,8 @@ def _prepare_images(
         return [(None, [None] * len(data["steps"])) for data in recipes]
     budget = ImageImportBudget()
     search_cache: dict[str, list[str]] = {}
-    search_attempts = 0
-    search_deadline = time.monotonic() + MAX_COVER_SEARCH_SECONDS
+    search_started_at = time.monotonic()
+    search_slice_seconds = MAX_COVER_SEARCH_SECONDS / max(len(recipes), 1)
     allowed_cover = set(document.cover_image_urls)
     allowed_steps = set(document.step_image_urls)
     structured_cover_urls = {
@@ -319,11 +354,15 @@ def _prepare_images(
         cover_urls.extend(fallback_covers[:recipe_index])
         cover_image = budget.select(cover_urls, cover=True)
         if not cover_image and data.get("title") and not budget.exhausted:
+            search_attempts = 0
+            recipe_search_deadline = search_started_at + search_slice_seconds * (
+                recipe_index + 1
+            )
             for query in _cover_search_queries(data):
                 if budget.exhausted:
                     break
                 if query not in search_cache:
-                    remaining = search_deadline - time.monotonic()
+                    remaining = recipe_search_deadline - time.monotonic()
                     if (
                         search_attempts >= MAX_COVER_SEARCH_QUERIES
                         or remaining <= 0
@@ -341,7 +380,11 @@ def _prepare_images(
                 if search_urls:
                     offset = recipe_index % len(search_urls)
                     search_urls = search_urls[offset:] + search_urls[:offset]
-                cover_image = budget.select(search_urls, cover=True)
+                cover_image = budget.select(
+                    search_urls,
+                    cover=True,
+                    deadline=recipe_search_deadline,
+                )
                 if cover_image:
                     break
 

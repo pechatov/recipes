@@ -869,7 +869,7 @@ class PipelineTests(TestCase):
         draft.refresh_from_db()
         self.assertEqual(draft.title, "Правка пользователя")
 
-    @patch("recipes.importing.pipeline._download_image")
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
     def test_searches_public_image_when_source_cover_cannot_be_downloaded(
         self, download_image
     ):
@@ -885,7 +885,7 @@ class PipelineTests(TestCase):
                 "original.jpg", b"large", width=1_600, height=1_200
             ),
         }
-        download_image.side_effect = lambda url: images.get(url)
+        download_image.side_effect = lambda url, **kwargs: images.get(url)
         document = SourceDocument(
             "website",
             "Курица с рисом",
@@ -915,7 +915,7 @@ class PipelineTests(TestCase):
             [source_url, thumbnail_url, original_url],
         )
 
-    @patch("recipes.importing.pipeline._download_image")
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
     def test_uses_category_query_when_recipe_title_has_no_search_results(
         self, download_image
     ):
@@ -976,7 +976,7 @@ class PipelineTests(TestCase):
             "https://images.example/second.jpg",
         ]
         self.search_cover_images.return_value = search_urls
-        download_image.side_effect = lambda url: DownloadedImage(
+        download_image.side_effect = lambda url, **kwargs: DownloadedImage(
             url.rsplit("/", 1)[-1], b"image", width=1_600, height=1_200
         )
         document = SourceDocument("website", "Суп", "Описание")
@@ -995,6 +995,72 @@ class PipelineTests(TestCase):
             [cover.name for cover, _ in prepared],
             ["first.jpg", "second.jpg"],
         )
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_searches_each_recipe_with_a_distinct_query(self, download_image):
+        def search(query, **kwargs):
+            return [f"https://images.example/{query}.jpg"]
+
+        self.search_cover_images.side_effect = search
+        download_image.side_effect = lambda url, **kwargs: DownloadedImage(
+            url.rsplit("/", 1)[-1], b"image", width=1_600, height=1_200
+        )
+        document = SourceDocument("website", "Меню", "Описание")
+        recipes = [
+            {
+                "title": "Суп",
+                "cover_image_url": "",
+                "cover_image_search_query": "vegetable soup",
+                "categories": ["soup"],
+                "steps": [],
+            },
+            {
+                "title": "Пирог",
+                "cover_image_url": "",
+                "cover_image_search_query": "apple pie",
+                "categories": ["bakery"],
+                "steps": [],
+            },
+        ]
+
+        prepared = _prepare_images(document, recipes)
+
+        self.assertEqual(
+            [call.args[0] for call in self.search_cover_images.call_args_list],
+            ["vegetable soup", "apple pie"],
+        )
+        self.assertEqual(
+            [cover.name for cover, _ in prepared],
+            ["vegetable soup.jpg", "apple pie.jpg"],
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    @patch("recipes.importing.pipeline.time.monotonic", return_value=10)
+    def test_candidate_download_respects_search_deadline(self, monotonic, download_image):
+        image = ImageImportBudget().select(
+            ["https://images.example/soup.jpg"],
+            cover=True,
+            deadline=12,
+        )
+
+        self.assertIsNone(image)
+        download_image.assert_called_once_with(
+            "https://images.example/soup.jpg",
+            timeout=2,
+            deadline=12,
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    @patch("recipes.importing.pipeline.time.monotonic", return_value=12)
+    def test_candidate_download_stops_at_search_deadline(self, monotonic, download_image):
+        image = ImageImportBudget().select(
+            ["https://images.example/soup.jpg"],
+            cover=True,
+            deadline=12,
+        )
+
+        self.assertIsNone(image)
+        download_image.assert_not_called()
 
     @patch("recipes.importing.pipeline._download_image")
     def test_cover_requires_at_least_1200_by_800_pixels(self, download_image):
