@@ -1,7 +1,7 @@
 import io
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
@@ -380,7 +380,7 @@ class NormalizerTests(TestCase):
 
 
 class ImageSearchTests(TestCase):
-    def test_cover_search_progressively_relaxes_precise_query(self):
+    def test_cover_search_is_limited_to_precise_and_distinctive_queries(self):
         queries = _cover_search_queries(
             {
                 "title": "Гуляш из говядины",
@@ -393,11 +393,7 @@ class ImageSearchTests(TestCase):
             queries,
             [
                 "goulash beef thick gravy",
-                "goulash beef thick",
-                "goulash beef",
                 "goulash",
-                "Гуляш из говядины",
-                "cooked main dish",
             ],
         )
 
@@ -909,7 +905,11 @@ class PipelineTests(TestCase):
         prepared = _prepare_images(document, data)
 
         self.assertEqual(prepared[0][0].name, "original.jpg")
-        self.search_cover_images.assert_called_once_with("chicken rice")
+        self.search_cover_images.assert_called_once_with("chicken rice", timeout=ANY)
+        self.assertLessEqual(
+            self.search_cover_images.call_args.kwargs["timeout"],
+            3,
+        )
         self.assertEqual(
             [call.args[0] for call in download_image.call_args_list],
             [source_url, thumbnail_url, original_url],
@@ -941,6 +941,59 @@ class PipelineTests(TestCase):
         self.assertEqual(
             [call.args[0] for call in self.search_cover_images.call_args_list],
             ["Борщ", "soup bowl"],
+        )
+
+    @patch("recipes.importing.pipeline._download_image", return_value=None)
+    def test_does_not_search_when_image_budget_is_exhausted(self, download_image):
+        document = SourceDocument(
+            "website",
+            "Суп",
+            "Описание",
+            cover_image_urls=tuple(
+                f"https://images.example/{index}.jpg" for index in range(25)
+            ),
+        )
+        data = [
+            {
+                "title": "Суп",
+                "cover_image_url": "",
+                "cover_image_search_query": "soup bowl",
+                "categories": ["soup"],
+                "steps": [],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertIsNone(prepared[0][0])
+        self.assertEqual(download_image.call_count, 25)
+        self.search_cover_images.assert_not_called()
+
+    @patch("recipes.importing.pipeline._download_image")
+    def test_reuses_search_results_for_same_query(self, download_image):
+        search_urls = [
+            "https://images.example/first.jpg",
+            "https://images.example/second.jpg",
+        ]
+        self.search_cover_images.return_value = search_urls
+        download_image.side_effect = lambda url: DownloadedImage(
+            url.rsplit("/", 1)[-1], b"image", width=1_600, height=1_200
+        )
+        document = SourceDocument("website", "Суп", "Описание")
+        recipe = {
+            "title": "Суп",
+            "cover_image_url": "",
+            "cover_image_search_query": "soup bowl",
+            "categories": ["soup"],
+            "steps": [],
+        }
+
+        prepared = _prepare_images(document, [recipe, recipe])
+
+        self.assertEqual(self.search_cover_images.call_count, 1)
+        self.assertEqual(
+            [cover.name for cover, _ in prepared],
+            ["first.jpg", "second.jpg"],
         )
 
     @patch("recipes.importing.pipeline._download_image")

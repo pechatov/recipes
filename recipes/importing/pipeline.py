@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import ssl
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import urlencode, urljoin
@@ -46,6 +47,9 @@ MAX_IMAGE_PIXELS = 32_000_000
 MIN_COVER_SHORT_SIDE = 800
 MIN_COVER_LONG_SIDE = 1_200
 MAX_IMAGE_SEARCH_BYTES = 512 * 1024
+MAX_COVER_SEARCH_QUERIES = 2
+MAX_COVER_SEARCH_SECONDS = 6
+OPENVERSE_REQUEST_TIMEOUT_SECONDS = 3
 OPENVERSE_SEARCH_URL = "https://api.openverse.org/v1/images/"
 CATEGORY_IMAGE_QUERIES = {
     "breakfast": "breakfast food",
@@ -92,8 +96,16 @@ class ImageImportBudget:
     total_bytes: int = 0
     assignments: int = 0
 
+    @property
+    def exhausted(self) -> bool:
+        return (
+            self.assignments >= MAX_IMPORTED_IMAGES
+            or len(self.cache) >= MAX_IMPORTED_IMAGES
+            or self.total_bytes >= MAX_IMAGE_TOTAL_BYTES
+        )
+
     def select(self, urls: list[str], *, cover: bool) -> DownloadedImage | None:
-        if self.assignments >= MAX_IMPORTED_IMAGES:
+        if self.exhausted:
             return None
         for url in dict.fromkeys(urls):
             if url not in self.cache:
@@ -179,7 +191,11 @@ def _download_image(url: str) -> DownloadedImage | None:
     return None
 
 
-def _search_cover_image_urls(query: str) -> list[str]:
+def _search_cover_image_urls(
+    query: str,
+    *,
+    timeout: float = OPENVERSE_REQUEST_TIMEOUT_SECONDS,
+) -> list[str]:
     """Find relevant public-domain cover candidates without making import fatal."""
     query = " ".join(str(query or "").split())[:200]
     if not query:
@@ -196,7 +212,7 @@ def _search_cover_image_urls(query: str) -> list[str]:
     url = f"{OPENVERSE_SEARCH_URL}?{params}"
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     try:
-        with _open_public_url(url, headers=headers, timeout=10) as response:
+        with _open_public_url(url, headers=headers, timeout=timeout) as response:
             if response.status != 200:
                 return []
             content_type = (
@@ -240,23 +256,25 @@ def _cover_search_queries(data: dict) -> list[str]:
     precise_query = " ".join(
         str(data.get("cover_image_search_query", "") or "").split()
     )
-    precise_words = precise_query.split()
-    queries = [precise_query]
-    queries.extend(
-        " ".join(precise_words[:length])
-        for length in range(len(precise_words) - 1, 0, -1)
+    category_query = next(
+        (
+            CATEGORY_IMAGE_QUERIES[slug]
+            for slug in data.get("categories", [])
+            if slug in CATEGORY_IMAGE_QUERIES
+        ),
+        "",
     )
-    queries.append(data.get("title", ""))
-    queries.extend(
-        CATEGORY_IMAGE_QUERIES[slug]
-        for slug in data.get("categories", [])
-        if slug in CATEGORY_IMAGE_QUERIES
-    )
+    if precise_query:
+        precise_words = precise_query.split()
+        fallback_query = precise_words[0] if len(precise_words) > 1 else category_query
+        queries = [precise_query, fallback_query]
+    else:
+        queries = [data.get("title", ""), category_query]
     return list(
         dict.fromkeys(
             " ".join(str(query or "").split()) for query in queries if query
         )
-    )
+    )[:MAX_COVER_SEARCH_QUERIES]
 
 
 def _prepare_images(
@@ -266,6 +284,9 @@ def _prepare_images(
     if not document:
         return [(None, [None] * len(data["steps"])) for data in recipes]
     budget = ImageImportBudget()
+    search_cache: dict[str, list[str]] = {}
+    search_attempts = 0
+    search_deadline = time.monotonic() + MAX_COVER_SEARCH_SECONDS
     allowed_cover = set(document.cover_image_urls)
     allowed_steps = set(document.step_image_urls)
     structured_cover_urls = {
@@ -297,9 +318,26 @@ def _prepare_images(
         cover_urls.extend(fallback_covers[recipe_index:])
         cover_urls.extend(fallback_covers[:recipe_index])
         cover_image = budget.select(cover_urls, cover=True)
-        if not cover_image and data.get("title"):
+        if not cover_image and data.get("title") and not budget.exhausted:
             for query in _cover_search_queries(data):
-                search_urls = list(_search_cover_image_urls(query) or [])
+                if budget.exhausted:
+                    break
+                if query not in search_cache:
+                    remaining = search_deadline - time.monotonic()
+                    if (
+                        search_attempts >= MAX_COVER_SEARCH_QUERIES
+                        or remaining <= 0
+                    ):
+                        break
+                    search_attempts += 1
+                    search_cache[query] = list(
+                        _search_cover_image_urls(
+                            query,
+                            timeout=min(OPENVERSE_REQUEST_TIMEOUT_SECONDS, remaining),
+                        )
+                        or []
+                    )
+                search_urls = list(search_cache[query])
                 if search_urls:
                     offset = recipe_index % len(search_urls)
                     search_urls = search_urls[offset:] + search_urls[:offset]
