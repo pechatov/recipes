@@ -102,6 +102,14 @@ def _validate_public_url(url: str) -> None:
     _resolve_public_url(url)
 
 
+def _decode_response_body(content: bytes, headers) -> str:
+    encoding = headers.get_content_charset() or "utf-8"
+    try:
+        return content.decode(encoding, errors="replace")
+    except (LookupError, UnicodeError):
+        return content.decode("utf-8", errors="replace")
+
+
 class _PinnedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host, port, pinned_ip, **kwargs):
         self._pinned_ip = pinned_ip
@@ -182,13 +190,8 @@ def _download_html(url: str) -> tuple[str, str]:
                     if size > MAX_SOURCE_BYTES:
                         raise SourceError("Страница слишком большая для безопасного импорта.")
                     chunks.append(chunk)
-                encoding = response.headers.get_content_charset() or "utf-8"
                 content = b"".join(chunks)
-                try:
-                    text = content.decode(encoding, errors="replace")
-                except (LookupError, UnicodeError):
-                    text = content.decode("utf-8", errors="replace")
-                return text, current_url
+                return _decode_response_body(content, response.headers), current_url
         except SourceError:
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError) as error:
@@ -232,14 +235,8 @@ def _fetch_website_title(url: str) -> str:
                 if "html" not in response.headers.get("content-type", "").lower():
                     return ""
                 content = response.read(MAX_TITLE_BYTES)
-                encoding = response.headers.get_content_charset() or "utf-8"
-                try:
-                    text = content.decode(encoding, errors="replace")
-                except (LookupError, UnicodeError):
-                    text = content.decode("utf-8", errors="replace")
-                return _page_title(
-                    BeautifulSoup(text, "html.parser")
-                )
+                text = _decode_response_body(content, response.headers)
+                return _page_title(BeautifulSoup(text, "html.parser"))
         except (OSError, http.client.HTTPException, ssl.SSLError, SourceError):
             return ""
     return ""
