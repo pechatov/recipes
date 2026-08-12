@@ -5,7 +5,15 @@ from django.test import TestCase
 from django.urls import reverse
 
 from recipes.forms import IngredientForm
-from recipes.models import Category, ImportJob, Recipe, RecipeIngredient, RecipeStep
+from recipes.models import (
+    CartRun,
+    Category,
+    ImportJob,
+    Recipe,
+    RecipeIngredient,
+    RecipeSlugAlias,
+    RecipeStep,
+)
 from recipes.views import _fill_missing_recipe_calories
 
 
@@ -50,6 +58,20 @@ class RecipeViewTests(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("login"), response.url)
 
+    def test_recipe_card_has_a_full_area_link_and_separate_shopping_action(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"))
+
+        self.assertContains(
+            response,
+            f'<a href="{self.recipe.get_absolute_url()}" class="recipe-card-link"',
+        )
+        self.assertContains(
+            response,
+            f'href="{reverse("shopping-list", args=[self.recipe.slug])}"',
+        )
+
     def test_authenticated_user_can_view_recipe(self):
         self.client.force_login(self.user)
         response = self.client.get(self.recipe.get_absolute_url())
@@ -57,6 +79,64 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "Прогреть сливки")
         self.assertEqual(str(response.context["recipe"].calories_per_serving), "205.0")
         self.assertEqual(str(response.context["recipe"].calories_per_100g), "205.0")
+        self.assertEqual(str(response.context["recipe"].proteins_per_serving), "2.8")
+        self.assertEqual(str(response.context["recipe"].fats_per_100g), "20.0")
+
+    def test_recipe_slug_transliterates_russian_title(self):
+        self.assertEqual(self.recipe.slug, "semeynaya-pasta")
+        self.assertTrue(self.recipe.slug.isascii())
+
+    def test_legacy_unicode_slug_permanently_redirects_to_ascii_url(self):
+        RecipeSlugAlias.objects.create(recipe=self.recipe, slug="семейная-паста")
+        self.client.force_login(self.user)
+
+        response = self.client.get("/recipes/семейная-паста/")
+
+        self.assertRedirects(
+            response,
+            self.recipe.get_absolute_url(),
+            status_code=301,
+            fetch_redirect_response=False,
+        )
+
+    def test_legacy_shopping_and_update_urls_redirect_to_canonical_slug(self):
+        RecipeSlugAlias.objects.create(recipe=self.recipe, slug="семейная-паста")
+        self.client.force_login(self.user)
+
+        shopping = self.client.get(
+            "/recipes/семейная-паста/shopping/?servings=4"
+        )
+        update = self.client.get("/recipes/семейная-паста/edit/")
+
+        self.assertRedirects(
+            shopping,
+            f'{reverse("shopping-list", args=[self.recipe.slug])}?servings=4',
+            status_code=301,
+            fetch_redirect_response=False,
+        )
+        self.assertRedirects(
+            update,
+            reverse("recipe-update", args=[self.recipe.slug]),
+            status_code=301,
+            fetch_redirect_response=False,
+        )
+
+    def test_legacy_cart_start_post_uses_canonical_recipe(self):
+        RecipeSlugAlias.objects.create(recipe=self.recipe, slug="семейная-паста")
+        ingredient = self.recipe.ingredients.get()
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            "/recipes/семейная-паста/shopping/start/",
+            {
+                "servings": 2,
+                "ingredients": [str(ingredient.pk)],
+            },
+        )
+
+        run = CartRun.objects.get()
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        self.assertEqual(run.recipe, self.recipe)
 
     def test_estimated_calories_can_be_recalculated_after_ingredient_changes(self):
         _fill_missing_recipe_calories(self.recipe, save=True)
@@ -125,6 +205,33 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(self.recipe.calories_per_100g), "888.0")
         self.assertFalse(self.recipe.calories_estimated)
 
+    def test_detail_fills_missing_macros_around_historical_manual_calories(self):
+        self.recipe.calories_per_serving = 999
+        self.recipe.calories_per_100g = 888
+        self.recipe.calories_estimated = False
+        self.recipe.nutrition_manual_fields = [
+            "calories_per_serving",
+            "calories_per_100g",
+        ]
+        self.recipe.save(
+            update_fields=[
+                "calories_per_serving",
+                "calories_per_100g",
+                "calories_estimated",
+                "nutrition_manual_fields",
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        displayed = response.context["recipe"]
+        self.assertEqual(str(displayed.calories_per_serving), "999.0")
+        self.assertEqual(str(displayed.calories_per_100g), "888.0")
+        self.assertEqual(str(displayed.proteins_per_serving), "2.8")
+        self.assertEqual(str(displayed.fats_per_100g), "20.0")
+        self.assertTrue(displayed.calories_estimated)
+
     def test_edit_form_has_clipboard_zones_for_cover_and_step_images(self):
         self.client.force_login(self.user)
         response = self.client.get(reverse("recipe-update", args=[self.recipe.slug]))
@@ -139,6 +246,9 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "400 мл")
         self.assertContains(response, "https://lavka.yandex.ru/search?text=")
         self.assertContains(response, "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25")
+        self.assertContains(response, "Приоритет магазинов")
+        self.assertContains(response, "Найти в Ашан")
+        self.assertContains(response, "data-store-dialog")
 
     def test_search_finds_recipe_by_ingredient(self):
         self.client.force_login(self.user)
@@ -151,6 +261,61 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("recipe-list"), {"q": "слвк"})
 
         self.assertContains(response, "Семейная паста")
+
+    def test_fuzzy_search_handles_transposed_and_replaced_letters(self):
+        self.client.force_login(self.user)
+
+        for query in ("слвики", "слифки"):
+            with self.subTest(query=query):
+                response = self.client.get(reverse("recipe-list"), {"q": query})
+
+                self.assertContains(response, "Семейная паста")
+
+    def test_fuzzy_prefilter_keeps_match_with_three_replacements(self):
+        fuzzy_match = Recipe.objects.create(
+            title="xbcdxfghx",
+            created_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "abcdefghi"})
+
+        self.assertContains(response, fuzzy_match.title)
+
+    def test_fuzzy_search_does_not_drop_an_old_match_after_many_candidates(self):
+        Recipe.objects.bulk_create(
+            [
+                Recipe(
+                    title=f"Случайный семейный рецепт {index}",
+                    slug=f"random-family-recipe-{index}",
+                    created_by=self.user,
+                )
+                for index in range(510)
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "слвики"})
+
+        self.assertContains(response, "Семейная паста")
+
+    def test_short_fuzzy_match_outranks_more_than_500_broad_candidates(self):
+        target = Recipe.objects.create(title="Кит", created_by=self.user)
+        Recipe.objects.bulk_create(
+            [
+                Recipe(
+                    title=f"Каша случайная {index}",
+                    slug=f"random-porridge-{index}",
+                    created_by=self.user,
+                )
+                for index in range(510)
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-list"), {"q": "кот"})
+
+        self.assertContains(response, target.title)
 
     def test_fuzzy_search_keeps_matches_alongside_exact_match(self):
         exact = Recipe.objects.create(title="СЛВК — семейная заметка", created_by=self.user)
@@ -176,7 +341,12 @@ class RecipeViewTests(TestCase):
     def test_fuzzy_search_rejects_input_before_building_an_unbounded_query(self):
         self.client.force_login(self.user)
 
-        for query in ("а" * 121, "один два три четыре пять шесть семь восемь девять"):
+        for query in (
+            "а" * 121,
+            "а" * 33,
+            "один два три четыре пять шесть семь восемь девять",
+            "---",
+        ):
             with self.subTest(query=query), patch(
                 "recipes.views._search_candidate_filter"
             ) as candidate_filter:
@@ -302,7 +472,7 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(created.calories_per_serving), "96.2")
         self.assertEqual(str(created.calories_per_100g), "77.0")
 
-    def test_create_recipe_does_not_mix_manual_and_estimated_calories(self):
+    def test_create_recipe_tracks_manual_and_estimated_nutrition(self):
         self.client.force_login(self.user)
         response = self.client.post(
             reverse("recipe-create"),
@@ -332,13 +502,15 @@ class RecipeViewTests(TestCase):
         created = Recipe.objects.get(title="Суп с ручной калорийностью")
         self.assertRedirects(response, created.get_absolute_url())
         self.assertEqual(str(created.calories_per_serving), "123.0")
-        self.assertIsNone(created.calories_per_100g)
-        self.assertFalse(created.calories_estimated)
+        self.assertEqual(str(created.calories_per_100g), "77.0")
+        self.assertTrue(created.calories_estimated)
+        self.assertEqual(created.nutrition_manual_fields, ["calories_per_serving"])
         detail = self.client.get(created.get_absolute_url())
-        self.assertIsNone(detail.context["recipe"].calories_per_100g)
+        self.assertEqual(str(detail.context["recipe"].calories_per_100g), "77.0")
 
-    def test_manual_calorie_edit_clears_unchanged_estimated_pair(self):
+    def test_manual_nutrition_edit_preserves_unchanged_values(self):
         _fill_missing_recipe_calories(self.recipe, save=True)
+        original_per_100g = str(self.recipe.calories_per_100g)
         self.recipe.calories_estimated = True
         self.recipe.save(update_fields=["calories_estimated", "updated_at"])
         ingredient = self.recipe.ingredients.get()
@@ -377,8 +549,40 @@ class RecipeViewTests(TestCase):
         self.assertRedirects(response, self.recipe.get_absolute_url())
         self.recipe.refresh_from_db()
         self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
-        self.assertIsNone(self.recipe.calories_per_100g)
-        self.assertFalse(self.recipe.calories_estimated)
+        self.assertEqual(str(self.recipe.calories_per_100g), original_per_100g)
+        self.assertTrue(self.recipe.calories_estimated)
+        self.assertEqual(
+            self.recipe.nutrition_manual_fields, ["calories_per_serving"]
+        )
+        detail = self.client.get(self.recipe.get_absolute_url())
+        self.assertEqual(
+            str(detail.context["recipe"].calories_per_serving), "999.0"
+        )
+        self.assertEqual(
+            str(detail.context["recipe"].calories_per_100g), original_per_100g
+        )
+
+    def test_detail_renders_partial_nutrition_without_empty_labels(self):
+        ingredient = self.recipe.ingredients.get()
+        ingredient.name = "Ксантановая камедь"
+        ingredient.save(update_fields=["name"])
+        self.recipe.calories_per_serving = None
+        self.recipe.calories_per_100g = None
+        self.recipe.proteins_per_serving = 7
+        self.recipe.save(
+            update_fields=[
+                "calories_per_serving",
+                "calories_per_100g",
+                "proteins_per_serving",
+            ]
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertContains(response, "Б 7,0 г")
+        self.assertNotContains(response, "К  ккал")
+        self.assertNotContains(response, "Ж  г")
 
     def test_draft_is_hidden_until_published(self):
         draft = Recipe.objects.create(

@@ -85,11 +85,16 @@ def _resolve_public_url(url: str):
         raise SourceError("Не удалось найти сайт по указанному адресу.") from error
     if not addresses:
         raise SourceError("Не удалось найти сайт по указанному адресу.")
+    public_ips = []
     for address in addresses:
         ip = ipaddress.ip_address(address[4][0])
         if not ip.is_global:
             raise SourceError("Импорт из локальной или служебной сети запрещён.")
-    return parsed, str(ipaddress.ip_address(addresses[0][4][0]))
+        public_ips.append(ip)
+    # Many hosts publish IPv6 first even on machines without a working IPv6
+    # route. Prefer the validated IPv4 address and retain IPv6-only support.
+    pinned_ip = next((ip for ip in public_ips if ip.version == 4), public_ips[0])
+    return parsed, str(pinned_ip)
 
 
 def _validate_public_url(url: str) -> None:
@@ -384,6 +389,7 @@ def extract_youtube(url: str) -> SourceDocument:
         text[:MAX_SOURCE_CHARS],
         cover_image_urls=(
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
             f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         ),
     )

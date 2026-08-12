@@ -16,10 +16,16 @@ from recipes.importing.extractors import (
     _resolve_public_url,
     _validate_public_url,
     extract_website,
+    extract_youtube,
     youtube_video_id,
 )
 from recipes.importing.llm import _parse_json
-from recipes.importing.normalizer import _calories, normalize_recipe, normalize_recipes
+from recipes.importing.normalizer import (
+    _calories,
+    _nutrient,
+    normalize_recipe,
+    normalize_recipes,
+)
 from recipes.importing.pipeline import (
     DownloadedImage,
     MAX_IMPORTED_IMAGES,
@@ -42,6 +48,22 @@ class ExtractorTests(TestCase):
             youtube_video_id("https://youtube.com/shorts/dQw4w9WgXcQ"),
             "dQw4w9WgXcQ",
         )
+
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_exposes_multiple_thumbnail_fallbacks(self, fetch):
+        fetch.return_value = [Mock(text="Ингредиенты и подробное приготовление " * 5)]
+        document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        self.assertEqual(len(document.cover_image_urls), 3)
+        self.assertTrue(document.cover_image_urls[-1].endswith("/hqdefault.jpg"))
+
+    @patch("recipes.importing.extractors.socket.getaddrinfo")
+    def test_public_url_prefers_ipv4_when_ipv6_is_listed_first(self, getaddrinfo):
+        getaddrinfo.return_value = [
+            (10, 1, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 443, 0, 0)),
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        _, pinned_ip = _resolve_public_url("https://safe.example/image.jpg")
+        self.assertEqual(pinned_ip, "93.184.216.34")
 
     def test_rejects_local_source_addresses(self):
         for url in ("http://127.0.0.1/secret", "http://[::1]/", "http://192.168.1.10/"):
@@ -140,6 +162,12 @@ class NormalizerTests(TestCase):
         self.assertIsNone(_calories([100]))
         self.assertIsNone(_calories("-100 kcal"))
         self.assertEqual(_calories("450 ккал"), "450.0")
+
+    def test_nutrients_reject_signed_and_out_of_range_values(self):
+        self.assertIsNone(_nutrient("-5 г"))
+        self.assertIsNone(_nutrient("+5 г"))
+        self.assertIsNone(_nutrient("1000000 г"))
+        self.assertEqual(_nutrient("5,25 г"), "5.2")
 
     def test_normalizes_limits_and_decimal_quantity(self):
         recipe = normalize_recipe(

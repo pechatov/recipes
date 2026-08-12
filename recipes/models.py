@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from decimal import Decimal
 
 from django.conf import settings
@@ -9,6 +10,27 @@ from django.urls import reverse
 from django.utils.text import slugify
 
 from .validators import validate_recipe_image
+
+
+RUSSIAN_TRANSLITERATION = str.maketrans(
+    {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+        "ё": "yo", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
+        "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+        "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+        "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+        "э": "e", "ю": "yu", "я": "ya",
+    }
+)
+
+
+def recipe_slug_base(title: str) -> str:
+    """Build a stable ASCII URL component from Russian or Latin recipe titles."""
+    transliterated = str(title or "").casefold().translate(RUSSIAN_TRANSLITERATION)
+    ascii_title = unicodedata.normalize("NFKD", transliterated).encode(
+        "ascii", "ignore"
+    ).decode()
+    return (slugify(ascii_title) or "recipe")[:210].rstrip("-")
 
 
 def is_water_ingredient_name(name: str) -> bool:
@@ -89,7 +111,7 @@ class Recipe(models.Model):
         PUBLISHED = "published", "Опубликован"
 
     title = models.CharField("название", max_length=180)
-    slug = models.SlugField(max_length=220, unique=True, blank=True, allow_unicode=True)
+    slug = models.SlugField(max_length=220, unique=True, blank=True)
     description = models.TextField("описание", blank=True)
     servings = models.PositiveSmallIntegerField("порций", default=2)
     prep_minutes = models.PositiveSmallIntegerField("подготовка, минут", default=0)
@@ -110,11 +132,36 @@ class Recipe(models.Model):
         blank=True,
         validators=[MinValueValidator(Decimal("0"))],
     )
+    proteins_per_serving = models.DecimalField(
+        "белки на порцию, г", max_digits=8, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    fats_per_serving = models.DecimalField(
+        "жиры на порцию, г", max_digits=8, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    carbohydrates_per_serving = models.DecimalField(
+        "углеводы на порцию, г", max_digits=8, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    proteins_per_100g = models.DecimalField(
+        "белки на 100 г", max_digits=8, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    fats_per_100g = models.DecimalField(
+        "жиры на 100 г", max_digits=8, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    carbohydrates_per_100g = models.DecimalField(
+        "углеводы на 100 г", max_digits=8, decimal_places=1, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
     calories_estimated = models.BooleanField(
         "калорийность рассчитана автоматически",
         default=False,
         editable=False,
     )
+    nutrition_manual_fields = models.JSONField(default=list, editable=False)
     cover = models.ImageField(
         "фотография блюда",
         upload_to="recipes/covers/%Y/%m/",
@@ -167,8 +214,8 @@ class Recipe(models.Model):
         return self.title
 
     def save(self, *args, **kwargs):
-        if not self.slug:
-            base = slugify(self.title, allow_unicode=True) or "recipe"
+        if not self.slug or not self.slug.isascii():
+            base = recipe_slug_base(self.title)
             candidate = base
             suffix = 2
             while Recipe.objects.exclude(pk=self.pk).filter(slug=candidate).exists():
@@ -187,6 +234,16 @@ class Recipe(models.Model):
     @property
     def is_draft(self):
         return self.status == self.Status.DRAFT
+
+
+class RecipeSlugAlias(models.Model):
+    recipe = models.ForeignKey(
+        Recipe, on_delete=models.CASCADE, related_name="slug_aliases"
+    )
+    slug = models.SlugField(max_length=220, unique=True, allow_unicode=True)
+
+    def __str__(self):
+        return self.slug
 
 
 class RecipeIngredient(models.Model):

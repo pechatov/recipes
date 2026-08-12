@@ -30,7 +30,13 @@ class RecipeForm(forms.ModelForm):
             "prep_minutes",
             "cook_minutes",
             "calories_per_serving",
+            "proteins_per_serving",
+            "fats_per_serving",
+            "carbohydrates_per_serving",
             "calories_per_100g",
+            "proteins_per_100g",
+            "fats_per_100g",
+            "carbohydrates_per_100g",
             "cover",
         )
         widgets = {

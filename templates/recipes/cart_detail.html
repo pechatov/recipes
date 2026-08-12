@@ -125,16 +125,20 @@
     </section>
   {% endif %}
 
-  {% if run.attempts.all %}
-    <section class="attempt-history">
-      <h2>Проверенные магазины</h2>
-      <div class="attempt-list">
-        {% for attempt in run.attempts.all %}
-          <div class="attempt-summary">
-            <strong>{{ attempt.get_store_display }}</strong>
-            <span class="attempt-status status-{{ attempt.status }}">{{ attempt.get_status_display }}</span>
-            {% if attempt.summary %}<p>{{ attempt.summary }}</p>{% endif %}
-          </div>
+  {% if cart_item_statuses %}
+    <section class="cart-item-progress">
+      <h2>Статус товаров</h2>
+      <div class="cart-item-status-list">
+        {% for item in cart_item_statuses %}
+          <article class="cart-item-status quality-{{ item.quality }}">
+            <span class="item-status-dot" aria-hidden="true"></span>
+            <div>
+              <strong>{{ item.name }}</strong>
+              {% if item.quantity %}<small>{{ item.quantity }}</small>{% endif %}
+              {% if item.match.product_name %}<span>{{ item.match.product_name }}</span>{% endif %}
+            </div>
+            <span class="item-status-label">{{ item.label }}</span>
+          </article>
         {% endfor %}
       </div>
     </section>

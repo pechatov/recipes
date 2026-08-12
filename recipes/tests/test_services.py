@@ -4,7 +4,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from recipes.models import Recipe, RecipeIngredient
-from recipes.services import build_lavka_search_url, build_shopping_items
+from recipes.services import build_lavka_search_url, build_shopping_items, build_store_search_url
 
 
 class ShoppingServiceTests(TestCase):
@@ -17,6 +17,12 @@ class ShoppingServiceTests(TestCase):
         self.assertEqual(
             url,
             "https://lavka.yandex.ru/search?text=%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
+        )
+
+    def test_priority_store_url_uses_encoded_search_query(self):
+        self.assertEqual(
+            build_store_search_url("auchan", "сливки 20%"),
+            "https://www.auchan.ru/catalog/?q=%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
         )
 
     def test_shopping_items_scale_quantities(self):
@@ -34,6 +40,23 @@ class ShoppingServiceTests(TestCase):
         self.assertEqual(item.quantity, Decimal("500"))
         self.assertEqual(item.display_quantity, "500")
         self.assertIn("%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25", item.search_url)
+
+    def test_lavka_priority_does_not_duplicate_the_default_search_link(self):
+        RecipeIngredient.objects.create(
+            recipe=self.recipe,
+            name="Сливки",
+            quantity=Decimal("200"),
+            unit="мл",
+        )
+
+        item = build_shopping_items(
+            self.recipe,
+            servings=2,
+            preferred_store="lavka",
+        )[0]
+
+        self.assertTrue(item.search_url)
+        self.assertEqual(item.priority_search_url, "")
 
     def test_missing_quantity_remains_unquantified(self):
         RecipeIngredient.objects.create(recipe=self.recipe, name="Соль")

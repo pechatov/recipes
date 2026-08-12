@@ -8,27 +8,39 @@ from django.contrib import messages
 from django.contrib.auth import get_user_model, login
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
-from django.contrib.postgres.search import TrigramSimilarity
+from django.contrib.postgres.search import TrigramWordSimilarity
 from django.db import connection, transaction
-from django.db.models import FloatField, Max, Q, Value
+from django.db.models import Case, FloatField, IntegerField, Max, Q, Value, When
 from django.db.models.functions import Coalesce, Greatest
 from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils._os import safe_join
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_http_methods, require_POST
 
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
 from .importing.extractors import detect_source_type
-from .importing.normalizer import estimate_calories
-from .models import CartAttempt, CartRun, Category, ImportJob, Recipe, StorePreference
+from .importing.normalizer import estimate_nutrition
+from .models import (
+    CartAttempt,
+    CartRun,
+    Category,
+    ImportJob,
+    Recipe,
+    RecipeSlugAlias,
+    StorePreference,
+)
 from .services import build_shopping_items, get_store_preferences
 
 
 SEARCH_CANDIDATE_LIMIT = 500
+MAX_SEARCH_RANK_FRAGMENTS = 32
+MAX_SEARCH_FRAGMENTS_PER_TOKEN = 4
 MAX_SEARCH_QUERY_LENGTH = 120
+MAX_SEARCH_TOKEN_LENGTH = 32
 MAX_SEARCH_TOKENS = 8
 SEARCH_FIELDS = (
     "title",
@@ -38,6 +50,16 @@ SEARCH_FIELDS = (
     "created_by__last_name",
     "categories__name",
     "ingredients__name",
+)
+NUTRITION_FIELDS = (
+    "calories_per_serving",
+    "proteins_per_serving",
+    "fats_per_serving",
+    "carbohydrates_per_serving",
+    "calories_per_100g",
+    "proteins_per_100g",
+    "fats_per_100g",
+    "carbohydrates_per_100g",
 )
 
 
@@ -61,6 +83,53 @@ def _is_search_subsequence(needle: str, haystack: str) -> bool:
     return all(character in iterator for character in needle)
 
 
+def _search_edit_distance(left: str, right: str) -> int:
+    """Return Damerau-Levenshtein distance for short normalized search words."""
+    if left == right:
+        return 0
+    previous_previous = None
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1]
+                    + (left_character != right_character),
+                )
+            )
+            if (
+                previous_previous is not None
+                and left_index > 1
+                and right_index > 1
+                and left_character == right[right_index - 2]
+                and left[left_index - 2] == right_character
+            ):
+                current[-1] = min(
+                    current[-1], previous_previous[right_index - 2] + 1
+                )
+        previous_previous, previous = previous, current
+    return previous[-1]
+
+
+def _search_token_matches(token: str, search_text: str) -> bool:
+    if token in search_text:
+        return True
+    if len(token) <= 2:
+        return False
+    words = search_text.split()
+    if any(_is_search_subsequence(token, word) for word in words):
+        return True
+    maximum_distance = _search_maximum_distance(token)
+    return any(
+        abs(len(token) - len(word)) <= maximum_distance
+        and _search_edit_distance(token, word) <= maximum_distance
+        for word in words
+    )
+
+
 def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
     author = recipe.created_by
     search_text = _normalize_recipe_search(
@@ -76,20 +145,76 @@ def _recipe_matches_fuzzy_query(recipe: Recipe, query: str) -> bool:
         )
     )
     return all(
-        token in search_text
-        or (len(token) > 2 and _is_search_subsequence(token, search_text))
+        _search_token_matches(token, search_text)
         for token in _normalize_recipe_search(query).split()
     )
+
+
+def _search_maximum_distance(token: str) -> int:
+    return 1 if len(token) <= 5 else 2 if len(token) <= 8 else 3
+
+
+def _search_token_fragments(token: str) -> list[str]:
+    """Return a bounded prefilter that cannot reject an allowed fuzzy match.
+
+    A match may remove or replace at most ``maximum_distance`` characters.
+    Selecting one more character than that guarantees at least one selected
+    character remains. Insertions and transpositions preserve the characters.
+    """
+    fragment_count = min(
+        len(token),
+        _search_maximum_distance(token) + 1,
+        MAX_SEARCH_FRAGMENTS_PER_TOKEN,
+    )
+    if fragment_count == 1:
+        return [token[0]]
+    indexes = [
+        round(index * (len(token) - 1) / (fragment_count - 1))
+        for index in range(fragment_count)
+    ]
+    return list(dict.fromkeys(token[index] for index in indexes))
+
+
+def _search_rank_fragments(token: str) -> list[str]:
+    bigrams = list(
+        dict.fromkeys(
+            token[index:index + 2] for index in range(max(0, len(token) - 1))
+        )
+    )
+    prioritized = list(dict.fromkeys(token))
+    if bigrams:
+        prioritized.extend((bigrams[0], bigrams[-1], bigrams[len(bigrams) // 2]))
+    return list(dict.fromkeys(prioritized))[:MAX_SEARCH_FRAGMENTS_PER_TOKEN]
+
+
+def _search_fragment_score(query: str):
+    fragments = []
+    for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
+        fragments.extend(_search_rank_fragments(token))
+    fragments = list(dict.fromkeys(fragments))[:MAX_SEARCH_RANK_FRAGMENTS]
+    score_parts = []
+    for fragment in fragments:
+        fragment_filter = Q()
+        for variant in {fragment, fragment.capitalize(), fragment.upper()}:
+            for field in SEARCH_FIELDS:
+                fragment_filter |= Q(**{f"{field}__icontains": variant})
+        score_parts.append(
+            Max(
+                Case(
+                    When(fragment_filter, then=Value(1)),
+                    default=Value(0),
+                    output_field=IntegerField(),
+                )
+            )
+        )
+    return sum(score_parts, Value(0, output_field=IntegerField()))
 
 
 def _search_candidate_filter(query: str) -> Q:
     candidate_filter = Q()
     for token in _normalize_recipe_search(query).split()[:MAX_SEARCH_TOKENS]:
-        fragments = {token} if len(token) < 3 else {
-            token[index:index + 2] for index in range(len(token) - 1)
-        }
         token_filter = Q()
-        for fragment in fragments:
+        for fragment in _search_token_fragments(token):
             # SQLite's LIKE does not case-fold non-ASCII text. These variants
             # keep the portable development database useful; PostgreSQL's
             # ILIKE naturally collapses them.
@@ -114,15 +239,53 @@ def _exact_search_filter(query: str) -> Q:
 def _ranked_fuzzy_candidates(recipes, query: str):
     candidates = recipes.filter(_search_candidate_filter(query)).distinct()
     if connection.vendor != "postgresql":
-        return candidates
+        # SQLite is the small development fallback. Avoid a coarse top-N cut
+        # before the exact Python matcher because it has no word-similarity
+        # function equivalent to PostgreSQL's pg_trgm implementation.
+        return candidates.order_by("-updated_at")
+    fragment_score = _search_fragment_score(query)
     zero = Value(0.0, output_field=FloatField())
     similarities = [
-        Coalesce(Max(TrigramSimilarity(field, query)), zero)
+        Coalesce(Max(TrigramWordSimilarity(query, field)), zero)
         for field in SEARCH_FIELDS
     ]
-    return candidates.annotate(
+    ranked = candidates.annotate(
+        search_fragment_score=fragment_score,
         search_similarity=Greatest(*similarities)
-    ).order_by("-search_similarity", "-updated_at")[:SEARCH_CANDIDATE_LIMIT]
+    )
+    word_similarity_pool = list(ranked.order_by(
+        "-search_similarity", "-search_fragment_score", "-updated_at"
+    )[:SEARCH_CANDIDATE_LIMIT])
+    fragment_fallback_pool = list(ranked.order_by(
+        "-search_fragment_score", "-search_similarity", "-updated_at"
+    )[:SEARCH_CANDIDATE_LIMIT])
+    return word_similarity_pool + fragment_fallback_pool
+
+
+def _resolve_recipe_slug(slug: str, queryset=None) -> tuple[Recipe, bool]:
+    queryset = queryset if queryset is not None else Recipe.objects.all()
+    recipe = queryset.filter(slug=slug).first()
+    if recipe is not None:
+        return recipe, False
+    recipe_id = (
+        RecipeSlugAlias.objects.filter(slug=slug)
+        .values_list("recipe_id", flat=True)
+        .first()
+    )
+    if recipe_id is None:
+        raise Http404
+    recipe = queryset.filter(pk=recipe_id).first()
+    if recipe is None:
+        raise Http404
+    return recipe, True
+
+
+def _canonical_recipe_redirect(request, recipe: Recipe, view_name: str):
+    url = reverse(view_name, args=[recipe.slug])
+    query_string = request.META.get("QUERY_STRING", "")
+    if query_string:
+        url = f"{url}?{query_string}"
+    return redirect(url, permanent=True)
 
 
 @require_http_methods(["GET", "POST"])
@@ -147,9 +310,14 @@ def setup_owner(request):
 def recipe_list(request):
     query = request.GET.get("q", "").strip()
     normalized_tokens = _normalize_recipe_search(query).split()
-    if len(query) > MAX_SEARCH_QUERY_LENGTH or len(normalized_tokens) > MAX_SEARCH_TOKENS:
+    if (
+        len(query) > MAX_SEARCH_QUERY_LENGTH
+        or len(normalized_tokens) > MAX_SEARCH_TOKENS
+        or any(len(token) > MAX_SEARCH_TOKEN_LENGTH for token in normalized_tokens)
+        or (query and not normalized_tokens)
+    ):
         return JsonResponse(
-            {"error": "Поисковый запрос слишком длинный."},
+            {"error": "Поисковый запрос некорректный или слишком длинный."},
             status=400,
         )
     selected_category = request.GET.get("category", "").strip()
@@ -203,17 +371,18 @@ def draft_list(request):
 
 @login_required
 def recipe_detail(request, slug):
-    recipe = get_object_or_404(
-        Recipe.objects.select_related("created_by").prefetch_related(
-            "ingredients", "steps", "import_jobs"
-        ),
-        slug=slug,
+    recipes = Recipe.objects.select_related("created_by").prefetch_related(
+        "ingredients", "steps", "import_jobs"
     )
+    recipe, used_alias = _resolve_recipe_slug(slug, recipes)
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, recipe, "recipe-detail")
     all_ingredients = list(recipe.ingredients.all())
-    if recipe.calories_estimated or (
-        recipe.calories_per_serving is None and recipe.calories_per_100g is None
-    ):
+    if any(getattr(recipe, field) is None for field in NUTRITION_FIELDS):
         _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
+        recipe.calories_estimated = _nutrition_has_estimated_values(
+            recipe, set(recipe.nutrition_manual_fields or [])
+        )
     ingredients = [ingredient for ingredient in all_ingredients if not ingredient.is_water]
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
@@ -238,15 +407,17 @@ def _fill_missing_recipe_calories(
     overwrite: bool = False,
     preserve_fields: set[str] | None = None,
 ) -> None:
-    preserve_fields = preserve_fields or set()
+    if preserve_fields is None:
+        preserve_fields = set(recipe.nutrition_manual_fields or [])
+    else:
+        preserve_fields = set(preserve_fields)
     if (
         not overwrite
-        and recipe.calories_per_serving is not None
-        and recipe.calories_per_100g is not None
+        and all(getattr(recipe, field) is not None for field in NUTRITION_FIELDS)
     ):
         return
     ingredients = list(ingredients if ingredients is not None else recipe.ingredients.all())
-    per_serving, per_100g = estimate_calories(
+    nutrition = estimate_nutrition(
         [
             {
                 "name": ingredient.name,
@@ -260,10 +431,7 @@ def _fill_missing_recipe_calories(
         recipe.servings,
     )
     changed = []
-    for field, value in (
-        ("calories_per_serving", per_serving),
-        ("calories_per_100g", per_100g),
-    ):
+    for field, value in nutrition.items():
         if field in preserve_fields:
             continue
         if overwrite or getattr(recipe, field) is None:
@@ -271,6 +439,13 @@ def _fill_missing_recipe_calories(
             changed.append(field)
     if save and changed:
         recipe.save(update_fields=changed + ["updated_at"])
+
+
+def _nutrition_has_estimated_values(recipe, manual_fields: set[str]) -> bool:
+    return any(
+        field not in manual_fields and getattr(recipe, field) is not None
+        for field in NUTRITION_FIELDS
+    )
 
 
 def _recipe_form_context(request, instance=None):
@@ -305,14 +480,25 @@ def recipe_create(request):
             ingredient_formset.save()
             step_formset.instance = recipe
             step_formset.save()
-            manual_calories = any(
-                form.cleaned_data[field] is not None
-                for field in ("calories_per_serving", "calories_per_100g")
+            manual_fields = {
+                field
+                for field in NUTRITION_FIELDS
+                if form.cleaned_data[field] is not None
+            }
+            _fill_missing_recipe_calories(
+                recipe, save=True, preserve_fields=manual_fields
             )
-            if not manual_calories:
-                _fill_missing_recipe_calories(recipe, save=True)
-            recipe.calories_estimated = not manual_calories
-            recipe.save(update_fields=["calories_estimated", "updated_at"])
+            recipe.nutrition_manual_fields = sorted(manual_fields)
+            recipe.calories_estimated = _nutrition_has_estimated_values(
+                recipe, manual_fields
+            )
+            recipe.save(
+                update_fields=[
+                    "nutrition_manual_fields",
+                    "calories_estimated",
+                    "updated_at",
+                ]
+            )
         messages.success(request, "Рецепт добавлен.")
         return redirect(recipe)
 
@@ -332,15 +518,17 @@ def recipe_create(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_update(request, slug):
-    instance = get_object_or_404(Recipe, slug=slug)
-    calories_were_estimated = instance.calories_estimated
+    instance, used_alias = _resolve_recipe_slug(slug)
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, instance, "recipe-update")
+    manual_fields = set(instance.nutrition_manual_fields or [])
     recipe, form, ingredient_formset, step_formset = _recipe_form_context(request, instance)
     if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
         with transaction.atomic():
             recipe = form.save()
             ingredient_formset.save()
             step_formset.save()
-            calorie_fields = {"calories_per_serving", "calories_per_100g"}
+            calorie_fields = set(NUTRITION_FIELDS)
             manual_calorie_change = bool(calorie_fields.intersection(form.changed_data))
             ingredient_energy_fields = {"name", "quantity", "unit", "DELETE"}
             ingredients_changed = any(
@@ -349,27 +537,29 @@ def recipe_update(request, slug):
             )
             recalculate = "servings" in form.changed_data or ingredients_changed
             if manual_calorie_change:
-                changed_calorie_fields = calorie_fields.intersection(form.changed_data)
-                cleared_fields = []
-                if calories_were_estimated and len(changed_calorie_fields) == 1:
-                    unchanged_field = (calorie_fields - changed_calorie_fields).pop()
-                    setattr(recipe, unchanged_field, None)
-                    cleared_fields.append(unchanged_field)
-                recipe.calories_estimated = False
+                for field in calorie_fields.intersection(form.changed_data):
+                    if form.cleaned_data[field] is None:
+                        manual_fields.discard(field)
+                    else:
+                        manual_fields.add(field)
+            if manual_calorie_change or recalculate:
+                _fill_missing_recipe_calories(
+                    recipe,
+                    save=True,
+                    overwrite=True,
+                    preserve_fields=manual_fields,
+                )
+                recipe.nutrition_manual_fields = sorted(manual_fields)
+                recipe.calories_estimated = _nutrition_has_estimated_values(
+                    recipe, manual_fields
+                )
                 recipe.save(
-                    update_fields=cleared_fields
-                    + ["calories_estimated", "updated_at"]
+                    update_fields=[
+                        "nutrition_manual_fields",
+                        "calories_estimated",
+                        "updated_at",
+                    ]
                 )
-            elif recalculate and (
-                calories_were_estimated
-                or (
-                    recipe.calories_per_serving is None
-                    and recipe.calories_per_100g is None
-                )
-            ):
-                _fill_missing_recipe_calories(recipe, save=True, overwrite=True)
-                recipe.calories_estimated = True
-                recipe.save(update_fields=["calories_estimated", "updated_at"])
         messages.success(request, "Изменения сохранены.")
         return redirect(recipe)
 
@@ -389,7 +579,9 @@ def recipe_update(request, slug):
 @login_required
 @require_POST
 def recipe_publish(request, slug):
-    recipe = get_object_or_404(Recipe, slug=slug, status=Recipe.Status.DRAFT)
+    recipe, _ = _resolve_recipe_slug(
+        slug, Recipe.objects.filter(status=Recipe.Status.DRAFT)
+    )
     recipe.status = Recipe.Status.PUBLISHED
     recipe.save(update_fields=["status", "updated_at"])
     messages.success(request, "Рецепт опубликован и появился в общей книге.")
@@ -492,7 +684,9 @@ def task_list(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_delete(request, slug):
-    recipe = get_object_or_404(Recipe, slug=slug)
+    recipe, used_alias = _resolve_recipe_slug(slug)
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, recipe, "recipe-delete")
     if request.method == "POST":
         recipe.delete()
         messages.success(request, "Рецепт удалён.")
@@ -502,13 +696,21 @@ def recipe_delete(request, slug):
 
 @login_required
 def shopping_list(request, slug):
-    recipe = get_object_or_404(Recipe.objects.prefetch_related("ingredients"), slug=slug)
+    recipe, used_alias = _resolve_recipe_slug(
+        slug, Recipe.objects.prefetch_related("ingredients")
+    )
+    if used_alias and request.method in {"GET", "HEAD"}:
+        return _canonical_recipe_redirect(request, recipe, "shopping-list")
     try:
         servings = int(request.GET.get("servings", recipe.servings))
     except (TypeError, ValueError):
         servings = recipe.servings
     servings = max(1, min(servings, 100))
-    items = build_shopping_items(recipe, servings)
+    preferences = get_store_preferences(request.user)
+    primary_store = next((item for item in preferences if item.enabled), None)
+    items = build_shopping_items(
+        recipe, servings, primary_store.store if primary_store else None
+    )
     latest_cart_run = (
         CartRun.objects.filter(recipe=recipe, requested_by=request.user)
         .select_related("selected_attempt")
@@ -521,6 +723,10 @@ def shopping_list(request, slug):
             "recipe": recipe,
             "servings": servings,
             "items": items,
+            "has_pantry_items": any(item.ingredient.is_pantry for item in items),
+            "store_preferences": preferences,
+            "primary_store": primary_store,
+            "preferences_return_url": request.get_full_path(),
             "latest_cart_run": latest_cart_run,
         },
     )
@@ -531,17 +737,38 @@ def shopping_list(request, slug):
 def store_preferences(request):
     preferences = get_store_preferences(request.user)
     if request.method == "POST":
+        posted_order = request.POST.getlist("store_order")
+        valid_stores = {preference.store for preference in preferences}
+        ordered_stores = [
+            store for store in posted_order if store in valid_stores
+        ]
+        ordered_stores.extend(
+            preference.store
+            for preference in preferences
+            if preference.store not in ordered_stores
+        )
+        position_by_store = {
+            store: position for position, store in enumerate(ordered_stores)
+        }
         updates = []
         for preference in preferences:
-            try:
-                position = int(request.POST.get(f"position_{preference.store}", preference.position))
-            except (TypeError, ValueError):
-                position = preference.position
-            preference.position = max(0, min(position, 99))
+            if posted_order:
+                preference.position = position_by_store[preference.store]
+            else:
+                try:
+                    position = int(request.POST.get(f"position_{preference.store}", preference.position))
+                except (TypeError, ValueError):
+                    position = preference.position
+                preference.position = max(0, min(position, 99))
             preference.enabled = f"enabled_{preference.store}" in request.POST
             updates.append(preference)
         StorePreference.objects.bulk_update(updates, ["position", "enabled"])
         messages.success(request, "Приоритет магазинов сохранён.")
+        next_url = request.POST.get("next", "")
+        if next_url and url_has_allowed_host_and_scheme(
+            next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()
+        ):
+            return redirect(next_url)
         return redirect("store-preferences")
     return render(request, "recipes/store_preferences.html", {"preferences": preferences})
 
@@ -549,7 +776,9 @@ def store_preferences(request):
 @login_required
 @require_POST
 def cart_start(request, slug):
-    recipe = get_object_or_404(Recipe.objects.prefetch_related("ingredients"), slug=slug)
+    recipe, _ = _resolve_recipe_slug(
+        slug, Recipe.objects.prefetch_related("ingredients")
+    )
     try:
         servings = max(1, min(int(request.POST.get("servings", recipe.servings)), 100))
     except (TypeError, ValueError):
@@ -586,7 +815,9 @@ def cart_start(request, slug):
     priority = [item.store for item in get_store_preferences(request.user) if item.enabled]
     if not priority:
         messages.error(request, "Включите хотя бы один магазин.")
-        return redirect("store-preferences")
+        return redirect(
+            f"{reverse('shopping-list', args=[recipe.slug])}?servings={servings}"
+        )
 
     snapshot = [
         {
@@ -620,7 +851,55 @@ def cart_detail(request, pk):
         pk=pk,
         requested_by=request.user,
     )
-    return render(request, "recipes/cart_detail.html", {"run": run})
+    attempts = list(run.attempts.all())
+    status_attempt = run.selected_attempt or (attempts[-1] if attempts else None)
+    matches_by_name = {}
+    for match in status_attempt.matches.all() if status_attempt else []:
+        matches_by_name.setdefault(match.ingredient_name.casefold(), []).append(match)
+    quality_labels = {
+        "exact": "Найдено полное совпадение",
+        "substitute": "Найдена альтернатива",
+        "missing": "Ничего не найдено",
+        "queued": "В очереди",
+        "unchecked": "Не проверено",
+    }
+    item_statuses = []
+    is_waiting = run.status in {CartRun.Status.PENDING, CartRun.Status.PROCESSING}
+    attempt_completed = status_attempt and status_attempt.status in {
+        CartAttempt.Status.EXACT,
+        CartAttempt.Status.SUBSTITUTIONS,
+        CartAttempt.Status.INCOMPLETE,
+    }
+    for item in run.ingredient_snapshot:
+        name = str(item.get("name", "")).strip()
+        matching_items = matches_by_name.get(name.casefold(), [])
+        match = matching_items.pop(0) if matching_items else None
+        if match:
+            quality = match.quality
+        elif is_waiting:
+            quality = "queued"
+        elif attempt_completed:
+            quality = "missing"
+        else:
+            quality = "unchecked"
+        item_statuses.append(
+            {
+                "name": name,
+                "quantity": " ".join(
+                    part
+                    for part in (str(item.get("quantity", "")), str(item.get("unit", "")))
+                    if part
+                ),
+                "quality": quality,
+                "label": quality_labels[quality],
+                "match": match,
+            }
+        )
+    return render(
+        request,
+        "recipes/cart_detail.html",
+        {"run": run, "cart_item_statuses": item_statuses},
+    )
 
 
 @login_required

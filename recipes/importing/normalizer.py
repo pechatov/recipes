@@ -36,13 +36,13 @@ def _quantity(value: Any) -> str | None:
     return str(number.quantize(Decimal("0.01")))
 
 
-def _calories(value: Any) -> str | None:
+def _nutrient(value: Any, units: str = r"г|g") -> str | None:
     if value is None or value == "":
         return None
     if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
         return None
     match = re.fullmatch(
-        r"\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:ккал|kcal)?\s*",
+        rf"\s*(\d+(?:[.,]\d+)?)\s*(?:{units})?\s*",
         str(value),
         re.IGNORECASE,
     )
@@ -55,6 +55,10 @@ def _calories(value: Any) -> str | None:
     if not number.is_finite() or number < 0 or number >= Decimal("1000000"):
         return None
     return str(number.quantize(Decimal("0.1")))
+
+
+def _calories(value: Any) -> str | None:
+    return _nutrient(value, r"ккал|kcal")
 
 
 PANTRY_PATTERN = re.compile(
@@ -104,42 +108,42 @@ def _is_pantry(item: dict[str, Any], name: str, quantity: str | None, unit: str)
     return normalized_unit in {"щепотка", "щепотки", "ч.л.", "чл", "tsp"} and amount <= 3
 
 
-ENERGY_PROFILES: tuple[tuple[re.Pattern[str], Decimal], ...] = tuple(
-    (re.compile(pattern, re.IGNORECASE), Decimal(kcal))
-    for pattern, kcal in (
-        (r"масло (?:растительн|оливков|подсолнечн)", "884"),
-        (r"масло сливочн", "748"),
-        (r"мука", "334"),
-        (r"сахар", "387"),
-        (r"мед", "304"),
-        (r"макарон|паста|спагетти", "350"),
-        (r"рис", "344"),
-        (r"греч", "343"),
-        (r"овсян", "370"),
-        (r"картоф", "77"),
-        (r"морков", "41"),
-        (r"лук", "40"),
-        (r"чеснок", "149"),
-        (r"томат|помидор", "18"),
-        (r"огур", "15"),
-        (r"капуст", "25"),
-        (r"гриб|шампиньон", "27"),
-        (r"горох|чечевиц|фасол", "330"),
-        (r"куриц|индейк", "165"),
-        (r"говядин", "250"),
-        (r"свинин", "242"),
-        (r"рыб|лосос|семг|треск", "160"),
-        (r"яйц", "155"),
-        (r"молок", "60"),
-        (r"сливк", "205"),
-        (r"сметан", "200"),
-        (r"творог", "121"),
-        (r"сыр", "350"),
-        (r"хлеб|батон|булк", "255"),
-        (r"яблок", "52"),
-        (r"банан", "89"),
-        (r"орех", "620"),
-        (r"шоколад", "540"),
+NUTRITION_PROFILES: tuple[tuple[re.Pattern[str], tuple[Decimal, ...]], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), tuple(Decimal(item) for item in values))
+    for pattern, values in (
+        (r"масло (?:растительн|оливков|подсолнечн)", ("884", "0", "100", "0")),
+        (r"масло сливочн", ("748", "0.5", "82", "0.8")),
+        (r"мука", ("334", "10.3", "1.1", "70.6")),
+        (r"сахар", ("387", "0", "0", "100")),
+        (r"мед", ("304", "0.3", "0", "82.4")),
+        (r"макарон|паста|спагетти", ("350", "12", "1.5", "72")),
+        (r"рис", ("344", "6.7", "0.7", "78.9")),
+        (r"греч", ("343", "13.3", "3.4", "71.5")),
+        (r"овсян", ("370", "13", "6.5", "62")),
+        (r"картоф", ("77", "2", "0.4", "16.3")),
+        (r"морков", ("41", "0.9", "0.2", "9.6")),
+        (r"лук", ("40", "1.1", "0.1", "9.3")),
+        (r"чеснок", ("149", "6.4", "0.5", "33.1")),
+        (r"томат|помидор", ("18", "0.9", "0.2", "3.9")),
+        (r"огур", ("15", "0.7", "0.1", "3.6")),
+        (r"капуст", ("25", "1.3", "0.1", "5.8")),
+        (r"гриб|шампиньон", ("27", "4.3", "1", "0.1")),
+        (r"горох|чечевиц|фасол", ("330", "23", "1.5", "57")),
+        (r"куриц|индейк", ("165", "31", "3.6", "0")),
+        (r"говядин", ("250", "26", "17", "0")),
+        (r"свинин", ("242", "27", "14", "0")),
+        (r"рыб|лосос|семг|треск", ("160", "22", "8", "0")),
+        (r"яйц", ("155", "12.6", "10.6", "1.1")),
+        (r"молок", ("60", "3.2", "3.2", "4.7")),
+        (r"сливк", ("205", "2.8", "20", "3.2")),
+        (r"сметан", ("200", "2.5", "20", "3.4")),
+        (r"творог", ("121", "17", "5", "1.8")),
+        (r"сыр", ("350", "25", "27", "2")),
+        (r"хлеб|батон|булк", ("255", "8", "3", "49")),
+        (r"яблок", ("52", "0.3", "0.2", "13.8")),
+        (r"банан", ("89", "1.1", "0.3", "22.8")),
+        (r"орех", ("620", "18", "59", "18")),
+        (r"шоколад", ("540", "7", "32", "59")),
     )
 )
 
@@ -178,13 +182,11 @@ def _ingredient_grams(name: str, quantity: str | None, unit: str) -> Decimal | N
     return None
 
 
-def estimate_calories(
-    ingredients: list[dict[str, Any]], servings: int
-) -> tuple[str | None, str | None]:
+def estimate_nutrition(ingredients: list[dict[str, Any]], servings: int) -> dict[str, str | None]:
     total_grams = Decimal("0")
     food_grams = Decimal("0")
     recognized_grams = Decimal("0")
-    total_kcal = Decimal("0")
+    totals = [Decimal("0") for _ in range(4)]
     for ingredient in ingredients:
         grams = _ingredient_grams(
             ingredient["name"], ingredient["quantity"], ingredient["unit"]
@@ -195,19 +197,33 @@ def estimate_calories(
         if is_water_ingredient_name(ingredient["name"]):
             continue
         food_grams += grams
-        for pattern, kcal_per_100g in ENERGY_PROFILES:
+        for pattern, profile in NUTRITION_PROFILES:
             if pattern.search(ingredient["name"]):
                 recognized_grams += grams
-                total_kcal += grams * kcal_per_100g / 100
+                for index, value_per_100g in enumerate(profile):
+                    totals[index] += grams * value_per_100g / 100
                 break
-    if total_kcal <= 0 or food_grams <= 0 or recognized_grams / food_grams < Decimal("0.5"):
-        return None, None
-    per_serving = total_kcal / max(1, servings)
-    per_100g = total_kcal * 100 / total_grams if total_grams else None
-    return (
-        str(per_serving.quantize(Decimal("0.1"))),
-        str(per_100g.quantize(Decimal("0.1"))) if per_100g is not None else None,
-    )
+    names = ("calories", "proteins", "fats", "carbohydrates")
+    result = {f"{name}_per_serving": None for name in names}
+    result.update({f"{name}_per_100g": None for name in names})
+    if totals[0] <= 0 or food_grams <= 0 or recognized_grams / food_grams < Decimal("0.5"):
+        return result
+    for name, total in zip(names, totals):
+        result[f"{name}_per_serving"] = str(
+            (total / max(1, servings)).quantize(Decimal("0.1"))
+        )
+        if total_grams:
+            result[f"{name}_per_100g"] = str(
+                (total * 100 / total_grams).quantize(Decimal("0.1"))
+            )
+    return result
+
+
+def estimate_calories(
+    ingredients: list[dict[str, Any]], servings: int
+) -> tuple[str | None, str | None]:
+    nutrition = estimate_nutrition(ingredients, servings)
+    return nutrition["calories_per_serving"], nutrition["calories_per_100g"]
 
 
 def normalize_recipe(
@@ -302,7 +318,7 @@ def normalize_recipe(
     if require_categories and not categories:
         raise AIResponseError("Модель не выбрала ни одной допустимой категории рецепта.")
     servings = max(1, _integer(value.get("servings"), 2, 100))
-    estimated_per_serving, estimated_per_100g = estimate_calories(all_ingredients, servings)
+    estimated_nutrition = estimate_nutrition(all_ingredients, servings)
     return {
         "title": title,
         "description": _text(value.get("description"), 2000),
@@ -311,9 +327,21 @@ def normalize_recipe(
         "cook_minutes": _integer(value.get("cook_minutes"), 0, 10080),
         "categories": categories,
         "calories_per_serving": (
-            _calories(value.get("calories_per_serving")) or estimated_per_serving
+            _calories(value.get("calories_per_serving"))
+            or estimated_nutrition["calories_per_serving"]
         ),
-        "calories_per_100g": _calories(value.get("calories_per_100g")) or estimated_per_100g,
+        "calories_per_100g": (
+            _calories(value.get("calories_per_100g"))
+            or estimated_nutrition["calories_per_100g"]
+        ),
+        **{
+            field: _nutrient(value.get(field)) or estimated_nutrition[field]
+            for field in (
+                "proteins_per_serving", "fats_per_serving",
+                "carbohydrates_per_serving", "proteins_per_100g", "fats_per_100g",
+                "carbohydrates_per_100g",
+            )
+        },
         "cover_image_url": _text(value.get("cover_image_url"), 2048),
         "ingredients": ingredients,
         "steps": steps,

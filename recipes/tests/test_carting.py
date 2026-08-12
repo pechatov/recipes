@@ -70,7 +70,9 @@ class CartViewTests(TestCase):
         self.assertEqual(run.store_priority[0], StorePreference.Store.AUCHAN)
         self.assertEqual(run.ingredient_snapshot[0]["name"], "Картофель")
         self.assertEqual(run.ingredient_snapshot[0]["quantity"], "800")
-        self.assertNotContains(self.client.get(reverse("cart-detail", args=[run.pk])), "Соль")
+        detail = self.client.get(reverse("cart-detail", args=[run.pk]))
+        self.assertNotContains(detail, "Соль")
+        self.assertContains(detail, "В очереди")
 
     def test_cart_run_is_private_to_requesting_user(self):
         run = CartRun.objects.create(
@@ -122,6 +124,123 @@ class CartViewTests(TestCase):
             self.user.store_preferences.filter(enabled=True).values_list("store", flat=True)
         )
         self.assertEqual(enabled, ["lavka"])
+
+    def test_inline_store_preferences_follow_dragged_order_and_return(self):
+        get_store_preferences(self.user)
+        return_url = reverse("shopping-list", args=[self.recipe.slug])
+        response = self.client.post(
+            reverse("store-preferences"),
+            {
+                "store_order": ["magnit", "auchan", "lavka", "perekrestok", "pyaterochka"],
+                "enabled_magnit": "on",
+                "enabled_auchan": "on",
+                "next": return_url,
+            },
+        )
+        self.assertRedirects(response, return_url)
+        preferences = get_store_preferences(self.user)
+        self.assertEqual([item.store for item in preferences[:2]], ["magnit", "auchan"])
+
+    def test_cart_detail_shows_per_item_status_instead_of_checked_stores(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.REVIEW,
+            store_priority=["auchan"],
+            ingredient_snapshot=[
+                {"name": "Картофель", "quantity": "400", "unit": "г"},
+                {"name": "Соль", "quantity": "5", "unit": "г"},
+            ],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run, store="auchan", status=CartAttempt.Status.SUBSTITUTIONS
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+        CartItemMatch.objects.create(
+            attempt=attempt,
+            ingredient_name="Картофель",
+            product_name="Картофель молодой",
+            quality=CartItemMatch.MatchQuality.SUBSTITUTE,
+        )
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Найдена альтернатива")
+        self.assertContains(response, "Ничего не найдено")
+        self.assertNotContains(response, "В очереди")
+        self.assertNotContains(response, "Проверенные магазины")
+
+    def test_cart_detail_marks_items_unchecked_after_failed_attempt(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[
+                {"name": "Картофель", "quantity": "400", "unit": "г"},
+            ],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.BLOCKED,
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Не проверено")
+        self.assertNotContains(response, "Ничего не найдено")
+
+    def test_cart_detail_keeps_separate_matches_for_duplicate_ingredient_names(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.REVIEW,
+            store_priority=["auchan"],
+            ingredient_snapshot=[
+                {"name": "Масло", "quantity": "20", "unit": "г"},
+                {"name": "Масло", "quantity": "10", "unit": "г"},
+            ],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.SUBSTITUTIONS,
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+        CartItemMatch.objects.create(
+            attempt=attempt,
+            ingredient_name="Масло",
+            product_name="Масло первое",
+            quality=CartItemMatch.MatchQuality.EXACT,
+            order=0,
+        )
+        CartItemMatch.objects.create(
+            attempt=attempt,
+            ingredient_name="Масло",
+            product_name="Масло второе",
+            quality=CartItemMatch.MatchQuality.SUBSTITUTE,
+            order=1,
+        )
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        statuses = response.context["cart_item_statuses"]
+        self.assertEqual(
+            [item["match"].product_name for item in statuses],
+            ["Масло первое", "Масло второе"],
+        )
+        self.assertEqual(
+            [item["quality"] for item in statuses],
+            ["exact", "substitute"],
+        )
 
     def test_retry_of_old_captcha_failure_resumes_blocked_store(self):
         run = CartRun.objects.create(
