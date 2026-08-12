@@ -597,6 +597,39 @@ class PipelineTests(TestCase):
         extract_source.assert_called_once_with(
             job.source_url,
             source_title="Два рецепта из картофеля",
+            fetch_title=False,
+        )
+
+    @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
+    @patch("recipes.importing.pipeline.adapt_with_ai")
+    @patch("recipes.importing.pipeline.extract_source")
+    def test_does_not_retry_failed_youtube_title_lookup(
+        self, extract_source, adapt_with_ai
+    ):
+        extract_source.return_value = SourceDocument(
+            "youtube",
+            "YouTube dQw4w9WgXcQ",
+            (
+                "Ингредиенты: 500 г картофеля, морковь, соль и вода. "
+                "Нарезать овощи, варить 30 минут и подать суп. "
+            )
+            * 3,
+        )
+        adapt_with_ai.return_value = self.recipe_data("Домашний суп")
+        self.fetch_source_title.return_value = ""
+        job = ImportJob.objects.create(
+            source_url="https://youtu.be/dQw4w9WgXcQ",
+            source_type=ImportJob.SourceType.YOUTUBE,
+            requested_by=get_user_model().objects.create_user("untitled-importer"),
+        )
+
+        process_import_job(job)
+
+        self.fetch_source_title.assert_called_once_with(job.source_url)
+        extract_source.assert_called_once_with(
+            job.source_url,
+            source_title="",
+            fetch_title=False,
         )
 
     @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")

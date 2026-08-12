@@ -93,6 +93,7 @@ def _valid_image_dimensions(image: DownloadedImage, *, cover: bool) -> bool:
 @dataclass
 class ImageImportBudget:
     cache: dict[str, DownloadedImage | None] = field(default_factory=dict)
+    attempted_urls: set[str] = field(default_factory=set)
     total_bytes: int = 0
     assignments: int = 0
 
@@ -100,7 +101,7 @@ class ImageImportBudget:
     def exhausted(self) -> bool:
         return (
             self.assignments >= MAX_IMPORTED_IMAGES
-            or len(self.cache) >= MAX_IMPORTED_IMAGES
+            or len(self.attempted_urls) >= MAX_IMPORTED_IMAGES
             or self.total_bytes >= MAX_IMAGE_TOTAL_BYTES
         )
 
@@ -117,8 +118,9 @@ class ImageImportBudget:
             if deadline is not None and time.monotonic() >= deadline:
                 break
             if url not in self.cache:
-                if len(self.cache) >= MAX_IMPORTED_IMAGES:
+                if len(self.attempted_urls) >= MAX_IMPORTED_IMAGES:
                     continue
+                self.attempted_urls.add(url)
                 if deadline is None:
                     image = _download_image(url)
                 else:
@@ -704,11 +706,17 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
             status=Recipe.Status.DRAFT,
         ).distinct()
     }
+    youtube_title_attempted = False
     if job.source_type == ImportJob.SourceType.YOUTUBE and not job.source_title:
+        youtube_title_attempted = True
         job.source_title = fetch_source_title(job.source_url)
         if job.source_title:
             job.save(update_fields=["source_title"])
-    document = extract_source(job.source_url, source_title=job.source_title)
+    document = extract_source(
+        job.source_url,
+        source_title=job.source_title,
+        fetch_title=not youtube_title_attempted,
+    )
     technical_youtube_title = f"YouTube {youtube_video_id(job.source_url) or ''}".strip()
     if job.source_title and document.title == technical_youtube_title:
         document = replace(document, title=job.source_title)

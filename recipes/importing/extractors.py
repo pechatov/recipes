@@ -455,7 +455,12 @@ def extract_website(url: str) -> SourceDocument:
     )
 
 
-def extract_youtube(url: str, *, source_title: str = "") -> SourceDocument:
+def extract_youtube(
+    url: str,
+    *,
+    source_title: str = "",
+    fetch_title: bool = True,
+) -> SourceDocument:
     video_id = youtube_video_id(url)
     if not video_id:
         raise SourceError("Не удалось распознать ссылку на YouTube-видео.")
@@ -471,7 +476,9 @@ def extract_youtube(url: str, *, source_title: str = "") -> SourceDocument:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
     return SourceDocument(
         "youtube",
-        source_title or _fetch_youtube_title(video_id) or f"YouTube {video_id}",
+        source_title
+        or (_fetch_youtube_title(video_id) if fetch_title else "")
+        or f"YouTube {video_id}",
         text[:MAX_SOURCE_CHARS],
         cover_image_urls=(
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
@@ -481,7 +488,16 @@ def extract_youtube(url: str, *, source_title: str = "") -> SourceDocument:
     )
 
 
-def extract_source(url: str, *, source_title: str = "") -> SourceDocument:
+def extract_source(
+    url: str,
+    *,
+    source_title: str = "",
+    fetch_title: bool = True,
+) -> SourceDocument:
     if youtube_video_id(url):
-        return extract_youtube(url, source_title=source_title)
+        return extract_youtube(
+            url,
+            source_title=source_title,
+            fetch_title=fetch_title,
+        )
     return extract_website(url)
