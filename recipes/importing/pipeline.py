@@ -320,8 +320,7 @@ def _prepare_images(
         return [(None, [None] * len(data["steps"])) for data in recipes]
     budget = ImageImportBudget()
     search_cache: dict[str, list[str]] = {}
-    search_started_at = time.monotonic()
-    search_slice_seconds = MAX_COVER_SEARCH_SECONDS / max(len(recipes), 1)
+    search_seconds_remaining = MAX_COVER_SEARCH_SECONDS
     allowed_cover = set(document.cover_image_urls)
     allowed_steps = set(document.step_image_urls)
     structured_cover_urls = {
@@ -355,38 +354,50 @@ def _prepare_images(
         cover_image = budget.select(cover_urls, cover=True)
         if not cover_image and data.get("title") and not budget.exhausted:
             search_attempts = 0
-            recipe_search_deadline = search_started_at + search_slice_seconds * (
-                recipe_index + 1
+            recipe_search_started_at = time.monotonic()
+            remaining_recipes = len(recipes) - recipe_index
+            recipe_search_deadline = recipe_search_started_at + (
+                search_seconds_remaining / max(remaining_recipes, 1)
             )
-            for query in _cover_search_queries(data):
-                if budget.exhausted:
-                    break
-                if query not in search_cache:
-                    remaining = recipe_search_deadline - time.monotonic()
-                    if (
-                        search_attempts >= MAX_COVER_SEARCH_QUERIES
-                        or remaining <= 0
-                    ):
+            try:
+                for query in _cover_search_queries(data):
+                    if budget.exhausted:
                         break
-                    search_attempts += 1
-                    search_cache[query] = list(
-                        _search_cover_image_urls(
-                            query,
-                            timeout=min(OPENVERSE_REQUEST_TIMEOUT_SECONDS, remaining),
+                    if query not in search_cache:
+                        remaining = recipe_search_deadline - time.monotonic()
+                        if (
+                            search_attempts >= MAX_COVER_SEARCH_QUERIES
+                            or remaining <= 0
+                        ):
+                            break
+                        search_attempts += 1
+                        search_cache[query] = list(
+                            _search_cover_image_urls(
+                                query,
+                                timeout=min(
+                                    OPENVERSE_REQUEST_TIMEOUT_SECONDS,
+                                    remaining,
+                                ),
+                            )
+                            or []
                         )
-                        or []
+                    search_urls = list(search_cache[query])
+                    if search_urls:
+                        offset = recipe_index % len(search_urls)
+                        search_urls = search_urls[offset:] + search_urls[:offset]
+                    cover_image = budget.select(
+                        search_urls,
+                        cover=True,
+                        deadline=recipe_search_deadline,
                     )
-                search_urls = list(search_cache[query])
-                if search_urls:
-                    offset = recipe_index % len(search_urls)
-                    search_urls = search_urls[offset:] + search_urls[:offset]
-                cover_image = budget.select(
-                    search_urls,
-                    cover=True,
-                    deadline=recipe_search_deadline,
+                    if cover_image:
+                        break
+            finally:
+                search_seconds_remaining = max(
+                    0,
+                    search_seconds_remaining
+                    - max(0, time.monotonic() - recipe_search_started_at),
                 )
-                if cover_image:
-                    break
 
         step_images: list[DownloadedImage | None] = []
         fallback_index = 0

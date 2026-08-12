@@ -1034,6 +1034,48 @@ class PipelineTests(TestCase):
             ["vegetable soup.jpg", "apple pie.jpg"],
         )
 
+    @patch("recipes.importing.pipeline.time.monotonic")
+    @patch("recipes.importing.pipeline._download_image")
+    def test_source_download_time_does_not_consume_search_budget(
+        self, download_image, monotonic
+    ):
+        clock = {"now": 0}
+        source_url = "https://source.example/slow.jpg"
+        search_url = "https://images.example/soup.jpg"
+
+        def download(url, **kwargs):
+            if url == source_url:
+                clock["now"] = 20
+                return None
+            return DownloadedImage("soup.jpg", b"image", width=1_600, height=1_200)
+
+        monotonic.side_effect = lambda: clock["now"]
+        download_image.side_effect = download
+        self.search_cover_images.return_value = [search_url]
+        document = SourceDocument(
+            "website",
+            "Суп",
+            "Описание",
+            cover_image_urls=(source_url,),
+        )
+        data = [
+            {
+                "title": "Суп",
+                "cover_image_url": "",
+                "cover_image_search_query": "vegetable soup",
+                "categories": ["soup"],
+                "steps": [],
+            }
+        ]
+
+        prepared = _prepare_images(document, data)
+
+        self.assertEqual(prepared[0][0].name, "soup.jpg")
+        self.search_cover_images.assert_called_once_with(
+            "vegetable soup",
+            timeout=3,
+        )
+
     @patch("recipes.importing.pipeline._download_image", return_value=None)
     @patch("recipes.importing.pipeline.time.monotonic", return_value=10)
     def test_candidate_download_respects_search_deadline(self, monotonic, download_image):
