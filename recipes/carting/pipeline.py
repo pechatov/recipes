@@ -9,7 +9,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from recipes.models import CartAttempt, CartItemMatch, CartRun
+from recipes.models import BrowserLoginSession, CartAttempt, CartItemMatch, CartRun
 
 from .client import CartAgentError, assemble_store_cart, cleanup_store_cart
 
@@ -478,6 +478,14 @@ def claim_cleanup_run():
         )
         if not run:
             return None
+        if BrowserLoginSession.objects.filter(
+            status__in=[
+                BrowserLoginSession.Status.STARTING,
+                BrowserLoginSession.Status.ACTIVE,
+            ],
+            expires_at__gt=timezone.now(),
+        ).exists():
+            return None
         if CartRun.objects.filter(
             status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING]
         ).exclude(pk=run.pk).exists():
@@ -535,6 +543,16 @@ def claim_cart_run():
             .first()
         )
         if not run:
+            return None
+        # A human and the agent must never drive the shared Camofox process at
+        # the same time. Expired controller sessions no longer hold this lock.
+        if BrowserLoginSession.objects.filter(
+            status__in=[
+                BrowserLoginSession.Status.STARTING,
+                BrowserLoginSession.Status.ACTIVE,
+            ],
+            expires_at__gt=timezone.now(),
+        ).exists():
             return None
         # One persistent browser profile must not be shared by concurrent jobs.
         if CartRun.objects.filter(

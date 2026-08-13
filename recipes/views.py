@@ -1,13 +1,15 @@
 import mimetypes
 import re
+import secrets
 import unicodedata
+from datetime import timedelta
 from pathlib import Path
 
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import get_user_model, login
 from django.contrib.auth import views as auth_views
-from django.contrib.auth.decorators import login_required
+from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.postgres.search import TrigramWordSimilarity
 from django.db import connection, transaction
 from django.db.models import Case, FloatField, IntegerField, Max, Q, Value, When
@@ -20,17 +22,34 @@ from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_http_methods, require_POST
 
+from .carting.browser_login import (
+    BrowserLoginError,
+    is_configured as browser_login_is_configured,
+    issue_access as issue_browser_login_access,
+    start_session as start_browser_login_session,
+    stop_session as stop_browser_login_session,
+)
+from .carting.client import cart_browser_session_key
 from .carting.pipeline import attempt_needs_cleanup
-from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
+from .forms import (
+    ImportRecipeForm,
+    IngredientFormSet,
+    RecipeForm,
+    RegistrationForm,
+    SetupForm,
+    StepFormSet,
+)
 from .importing.extractors import detect_source_type
 from .importing.normalizer import estimate_nutrition
 from .models import (
+    BrowserLoginSession,
     CartAttempt,
     CartRun,
     Category,
     ImportJob,
     Recipe,
     RecipeSlugAlias,
+    RegistrationInvite,
     StorePreference,
 )
 from .services import build_shopping_items, get_store_preferences
@@ -304,6 +323,108 @@ def setup_owner(request):
         return redirect("recipe-list")
 
     return render(request, "recipes/setup.html", {"form": form})
+
+
+@login_required
+@user_passes_test(lambda user: user.is_superuser)
+@require_http_methods(["GET", "POST"])
+def registration_access(request):
+    now = timezone.now()
+    active = RegistrationInvite.objects.filter(
+        used_at__isnull=True,
+        closed_at__isnull=True,
+        expires_at__gt=now,
+    ).first()
+    if request.method == "POST":
+        action = request.POST.get("action")
+        if action == "open":
+            RegistrationInvite.objects.filter(
+                used_at__isnull=True,
+                closed_at__isnull=True,
+            ).update(closed_at=now)
+            token = secrets.token_urlsafe(32)
+            active = RegistrationInvite.objects.create(
+                token_digest=RegistrationInvite.digest_token(token),
+                created_by=request.user,
+                expires_at=now + timedelta(hours=24),
+            )
+            request.session["registration_invite_token"] = token
+            messages.success(request, "Одноразовая ссылка создана на 24 часа.")
+        elif action == "close" and active:
+            active.closed_at = now
+            active.save(update_fields=["closed_at"])
+            request.session.pop("registration_invite_token", None)
+            messages.success(request, "Регистрация закрыта.")
+        return redirect("registration-access")
+
+    token = request.session.get("registration_invite_token", "")
+    invite_url = ""
+    if active and token and RegistrationInvite.digest_token(token) == active.token_digest:
+        invite_url = request.build_absolute_uri(reverse("register-invite", args=[token]))
+    latest = RegistrationInvite.objects.select_related("registered_user").first()
+    return render(
+        request,
+        "registration/access.html",
+        {"active_invite": active, "invite_url": invite_url, "latest_invite": latest},
+    )
+
+
+@require_http_methods(["GET", "POST"])
+def register_invite(request, token):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token):
+        raise Http404
+    digest = RegistrationInvite.digest_token(token)
+    invite = RegistrationInvite.objects.filter(
+        token_digest=digest,
+        used_at__isnull=True,
+        closed_at__isnull=True,
+        expires_at__gt=timezone.now(),
+    ).first()
+    if not invite:
+        return render(request, "registration/invite_closed.html", status=410)
+    form = RegistrationForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        with transaction.atomic():
+            invite = RegistrationInvite.objects.select_for_update().filter(
+                pk=invite.pk,
+                used_at__isnull=True,
+                closed_at__isnull=True,
+                expires_at__gt=timezone.now(),
+            ).first()
+            if not invite:
+                return render(request, "registration/invite_closed.html", status=410)
+            user = form.save()
+            invite.registered_user = user
+            invite.used_at = timezone.now()
+            invite.save(update_fields=["registered_user", "used_at"])
+        login(request, user)
+        messages.success(request, "Аккаунт создан. Одноразовая регистрация закрыта.")
+        return redirect("recipe-list")
+    return render(request, "registration/register.html", {"form": form})
+
+
+def _resume_cart_run_after_login(run: CartRun) -> None:
+    if run.status not in {CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED}:
+        return
+    if run.cleanup_requested_at and not run.cleaned_at:
+        run.status = CartRun.Status.CLEANUP_PENDING
+        fields = ["status", "finished_at", "error"]
+    else:
+        if run.status == CartRun.Status.FAILED:
+            blocked_stores = set(
+                run.attempts.filter(status=CartAttempt.Status.BLOCKED).values_list(
+                    "store", flat=True
+                )
+            )
+            for index, store in enumerate(run.store_priority):
+                if store in blocked_stores:
+                    run.next_store_index = index
+                    break
+        run.status = CartRun.Status.PENDING
+        fields = ["status", "next_store_index", "finished_at", "error"]
+    run.finished_at = None
+    run.error = ""
+    run.save(update_fields=fields)
 
 
 @login_required
@@ -1063,29 +1184,134 @@ def cart_retry(request, pk):
         requested_by=request.user,
         status__in=[CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED],
     )
-    if run.cleanup_requested_at and not run.cleaned_at:
-        run.status = CartRun.Status.CLEANUP_PENDING
-        run.finished_at = None
-        run.error = ""
-        run.save(update_fields=["status", "finished_at", "error"])
+    cleanup_pending = bool(run.cleanup_requested_at and not run.cleaned_at)
+    _resume_cart_run_after_login(run)
+    if cleanup_pending:
         messages.success(request, "Очистка снова поставлена в очередь.")
         return redirect("cart-detail", pk=run.pk)
-    if run.status == CartRun.Status.FAILED:
-        blocked_stores = set(
-            run.attempts.filter(status=CartAttempt.Status.BLOCKED).values_list(
-                "store", flat=True
-            )
-        )
-        for index, store in enumerate(run.store_priority):
-            if store in blocked_stores:
-                run.next_store_index = index
-                break
-    run.status = CartRun.Status.PENDING
-    run.finished_at = None
-    run.error = ""
-    run.save(update_fields=["status", "next_store_index", "finished_at", "error"])
     messages.success(request, "Попытка снова поставлена в очередь.")
     return redirect("cart-detail", pk=run.pk)
+
+
+@login_required
+@require_POST
+def browser_login_start(request, pk=None):
+    run = None
+    if pk is not None:
+        run = get_object_or_404(
+            CartRun,
+            pk=pk,
+            requested_by=request.user,
+            status__in=[CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED],
+        )
+    if not browser_login_is_configured():
+        messages.error(request, "Удалённый вход в Яндекс Еду ещё не настроен.")
+        return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
+
+    now = timezone.now()
+    BrowserLoginSession.objects.filter(
+        status__in=[BrowserLoginSession.Status.STARTING, BrowserLoginSession.Status.ACTIVE],
+        expires_at__lte=now,
+    ).update(status=BrowserLoginSession.Status.EXPIRED, finished_at=now)
+    active = BrowserLoginSession.objects.filter(
+        status__in=[BrowserLoginSession.Status.STARTING, BrowserLoginSession.Status.ACTIVE],
+        expires_at__gt=now,
+    ).first()
+    if active:
+        if active.user_id == request.user.id:
+            messages.info(request, "У вас уже открыто окно входа в Яндекс Еду.")
+            return redirect("browser-login", pk=active.pk)
+        messages.error(request, "Браузер сейчас занят. Попробуйте ещё раз чуть позже.")
+        return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
+    if CartRun.objects.filter(
+        status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING]
+    ).exists():
+        messages.error(request, "Дождитесь завершения текущей операции с корзиной.")
+        return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
+
+    expires_at = now + timedelta(minutes=settings.CART_BROWSER_LOGIN_MINUTES)
+    login_session = BrowserLoginSession.objects.create(
+        user=request.user,
+        run=run,
+        expires_at=expires_at,
+    )
+    try:
+        login_session.remote_session_id = start_browser_login_session(
+            cart_browser_session_key(request.user.id),
+            settings.CART_BROWSER_LOGIN_MINUTES,
+        )
+    except BrowserLoginError as error:
+        login_session.status = BrowserLoginSession.Status.FAILED
+        login_session.error = str(error)[:500]
+        login_session.finished_at = timezone.now()
+        login_session.save(update_fields=["status", "error", "finished_at"])
+        messages.error(request, str(error))
+        return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
+    login_session.status = BrowserLoginSession.Status.ACTIVE
+    login_session.save(update_fields=["remote_session_id", "status"])
+    return redirect("browser-login", pk=login_session.pk)
+
+
+@login_required
+def browser_login(request, pk):
+    login_session = get_object_or_404(
+        BrowserLoginSession.objects.select_related("run"),
+        pk=pk,
+        user=request.user,
+    )
+    if login_session.status != BrowserLoginSession.Status.ACTIVE:
+        messages.error(request, "Это окно входа уже закрыто.")
+        return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
+    if login_session.expires_at <= timezone.now():
+        login_session.status = BrowserLoginSession.Status.EXPIRED
+        login_session.finished_at = timezone.now()
+        login_session.save(update_fields=["status", "finished_at"])
+        messages.error(request, "Время ручного входа истекло. Запустите его ещё раз.")
+        return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
+    try:
+        browser_url = issue_browser_login_access(login_session.remote_session_id)
+    except BrowserLoginError as error:
+        messages.error(request, str(error))
+        return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
+    return render(
+        request,
+        "recipes/browser_login.html",
+        {"login_session": login_session, "browser_url": browser_url},
+    )
+
+
+@login_required
+@require_POST
+def browser_login_complete(request, pk):
+    login_session = get_object_or_404(
+        BrowserLoginSession.objects.select_related("run"),
+        pk=pk,
+        user=request.user,
+        status=BrowserLoginSession.Status.ACTIVE,
+    )
+    try:
+        stop_browser_login_session(login_session.remote_session_id)
+    except BrowserLoginError as error:
+        messages.error(request, f"Не удалось сохранить сессию: {error}")
+        return redirect("browser-login", pk=login_session.pk)
+
+    now = timezone.now()
+    with transaction.atomic():
+        login_session.status = BrowserLoginSession.Status.COMPLETED
+        login_session.finished_at = now
+        login_session.error = ""
+        login_session.save(update_fields=["status", "finished_at", "error"])
+        if login_session.run_id:
+            run = CartRun.objects.select_for_update().get(
+                pk=login_session.run_id,
+                requested_by=request.user,
+            )
+            _resume_cart_run_after_login(run)
+    if login_session.run_id:
+        messages.success(request, "Сессия Яндекса сохранена; сборка снова поставлена в очередь.")
+        return redirect("cart-detail", pk=login_session.run_id)
+    messages.success(request, "Сессия Яндекса сохранена для будущих сборок.")
+    return redirect("store-preferences")
 
 
 @login_required

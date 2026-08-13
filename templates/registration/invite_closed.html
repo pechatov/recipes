@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Регистрация закрыта · Домашние рецепты{% endblock %}
+{% block content %}
+  <section class="auth-card">
+    <p class="eyebrow">Семейная книга</p>
+    <h1>Регистрация закрыта</h1>
+    <p class="muted">Эта ссылка уже использована, закрыта владельцем или устарела.</p>
+    <a class="button button-wide" href="{% url 'login' %}">Перейти ко входу</a>
+  </section>
+{% endblock %}

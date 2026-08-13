@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Вход в Яндекс Еду · Домашние рецепты{% endblock %}
+{% block content %}
+  <header class="page-heading browser-login-heading">
+    <p class="eyebrow">Защищённое окно · {{ login_session.expires_at|date:"H:i" }}</p>
+    <h1>Войдите в Яндекс Еду</h1>
+    <p class="lead">Войдите по телефону, QR или SMS и выберите адрес доставки. Пароль и код подтверждения видит только Яндекс.</p>
+  </header>
+
+  <section class="browser-login-card">
+    <iframe
+      class="browser-login-frame"
+      src="{{ browser_url }}"
+      title="Удалённый браузер Яндекс Еды"
+      allow="clipboard-read; clipboard-write"
+    ></iframe>
+    <div class="browser-login-actions">
+      <p><small>Когда Яндекс Еда откроет витрину с выбранным адресом, сохраните профиль. Окно автоматически закроется через {{ login_session.expires_at|timeuntil }}.</small></p>
+      <form method="post" action="{% url 'browser-login-complete' login_session.pk %}">
+        {% csrf_token %}
+        <button class="button" type="submit">Сохранить сессию и продолжить</button>
+      </form>
+    </div>
+  </section>
+{% endblock %}

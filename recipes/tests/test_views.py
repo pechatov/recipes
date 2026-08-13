@@ -2,7 +2,7 @@ from datetime import datetime, timezone as datetime_timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import Client, TestCase
 from django.urls import reverse
 
 from recipes.forms import IngredientForm
@@ -14,6 +14,7 @@ from recipes.models import (
     RecipeIngredient,
     RecipeSlugAlias,
     RecipeStep,
+    RegistrationInvite,
 )
 from recipes.views import _fill_missing_recipe_calories
 
@@ -39,6 +40,57 @@ class FirstRunTests(TestCase):
 
         second_attempt = self.client.get(reverse("setup-owner"))
         self.assertRedirects(second_attempt, reverse("recipe-list"))
+
+
+class RegistrationAccessTests(TestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_superuser(
+            username="owner",
+            password="safe-owner-pass",
+        )
+        self.client.force_login(self.owner)
+
+    def test_one_time_invite_registers_exactly_one_user(self):
+        response = self.client.post(reverse("registration-access"), {"action": "open"})
+        self.assertRedirects(response, reverse("registration-access"))
+        token = self.client.session["registration_invite_token"]
+        invite_url = reverse("register-invite", args=[token])
+
+        guest = Client()
+        registration = guest.post(
+            invite_url,
+            {
+                "username": "wife",
+                "first_name": "Анна",
+                "password1": "A-long-family-password-482!",
+                "password2": "A-long-family-password-482!",
+            },
+        )
+
+        self.assertRedirects(registration, reverse("recipe-list"))
+        invite = RegistrationInvite.objects.get()
+        self.assertEqual(invite.registered_user.username, "wife")
+        self.assertIsNotNone(invite.used_at)
+        self.assertFalse(invite.registered_user.is_staff)
+        self.assertEqual(guest.get(invite_url).status_code, 410)
+
+    def test_owner_can_close_unused_invite(self):
+        self.client.post(reverse("registration-access"), {"action": "open"})
+        token = self.client.session["registration_invite_token"]
+
+        response = self.client.post(reverse("registration-access"), {"action": "close"})
+
+        self.assertRedirects(response, reverse("registration-access"))
+        self.assertIsNotNone(RegistrationInvite.objects.get().closed_at)
+        self.assertEqual(self.client.get(reverse("register-invite", args=[token])).status_code, 410)
+
+    def test_regular_user_cannot_manage_registration(self):
+        user = get_user_model().objects.create_user(username="cook", password="pass")
+        self.client.force_login(user)
+
+        response = self.client.get(reverse("registration-access"))
+
+        self.assertEqual(response.status_code, 302)
 
 
 class RecipeViewTests(TestCase):

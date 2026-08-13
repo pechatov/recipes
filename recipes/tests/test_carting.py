@@ -20,6 +20,7 @@ from recipes.carting.client import (
     cleanup_store_cart,
 )
 from recipes.models import (
+    BrowserLoginSession,
     CartAttempt,
     CartItemMatch,
     CartRun,
@@ -85,7 +86,7 @@ class CartViewTests(TestCase):
         response = self.client.get(reverse("cart-detail", args=[run.pk]))
         self.assertEqual(response.status_code, 404)
 
-    def test_login_instructions_are_scoped_to_requesting_user(self):
+    def test_login_action_is_scoped_to_requesting_user(self):
         run = CartRun.objects.create(
             recipe=self.recipe,
             requested_by=self.user,
@@ -97,14 +98,86 @@ class CartViewTests(TestCase):
 
         response = self.client.get(reverse("cart-detail", args=[run.pk]))
 
-        self.assertContains(
-            response,
-            f"./scripts/cart-browser-login-pi.sh start {self.user.pk}",
+        self.assertContains(response, reverse("cart-browser-login-start", args=[run.pk]))
+        self.assertNotContains(response, "cart-browser-login-pi.sh")
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+        CART_BROWSER_LOGIN_MINUTES=15,
+    )
+    @patch("recipes.views.start_browser_login_session")
+    def test_browser_login_starts_user_profile(self, start_session):
+        start_session.return_value = "remote-session-id-1234567890"
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
         )
-        self.assertNotContains(
+
+        response = self.client.post(reverse("cart-browser-login-start", args=[run.pk]))
+
+        login_session = BrowserLoginSession.objects.get()
+        self.assertRedirects(
             response,
-            f"./scripts/cart-browser-login-pi.sh start {self.other_user.pk}",
+            reverse("browser-login", args=[login_session.pk]),
+            fetch_redirect_response=False,
         )
+        self.assertEqual(login_session.user, self.user)
+        self.assertEqual(login_session.run, run)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.ACTIVE)
+        start_session.assert_called_once_with(
+            cart_browser_session_key(self.user.pk),
+            15,
+        )
+
+    @patch("recipes.views.issue_browser_login_access")
+    def test_browser_login_page_embeds_one_time_access_path(self, issue_access):
+        issue_access.return_value = "/browser-login/access/abcdefghijklmnopqrstuvwxyz123456"
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.get(reverse("browser-login", args=[login_session.pk]))
+
+        self.assertContains(response, issue_access.return_value)
+        self.assertContains(response, "Сохранить сессию и продолжить")
+        issue_access.assert_called_once_with(login_session.remote_session_id)
+
+    @patch("recipes.views.stop_browser_login_session")
+    def test_browser_login_completion_saves_and_resumes_run(self, stop_session):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            run=run,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.post(
+            reverse("browser-login-complete", args=[login_session.pk])
+        )
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        login_session.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.COMPLETED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
 
     def test_store_preferences_can_disable_and_reorder_stores(self):
         get_store_preferences(self.user)
@@ -419,6 +492,26 @@ class CartPipelineTests(TestCase):
             cart_browser_session_key(self.user.pk, 3),
             cart_browser_session_key(other_user.pk, 3),
         )
+
+    def test_manual_browser_login_blocks_worker_claim(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        self.assertIsNone(claim_cart_run())
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
 
     @patch("recipes.carting.client.run_store_cart_task")
     def test_single_ingredient_keeps_legacy_agent_call(self, run_task):

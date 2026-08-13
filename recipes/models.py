@@ -1,3 +1,4 @@
+import hashlib
 import re
 import unicodedata
 from decimal import Decimal
@@ -492,6 +493,80 @@ class CartRun(models.Model):
             self.Status.CLEANING,
             self.Status.MANUAL_CHECK,
         }
+
+
+class BrowserLoginSession(models.Model):
+    class Status(models.TextChoices):
+        STARTING = "starting", "Запускается"
+        ACTIVE = "active", "Открыта"
+        COMPLETED = "completed", "Сохранена"
+        EXPIRED = "expired", "Истекла"
+        FAILED = "failed", "Ошибка"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="browser_login_sessions",
+    )
+    run = models.ForeignKey(
+        CartRun,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="browser_login_sessions",
+    )
+    remote_session_id = models.CharField(max_length=128, blank=True, unique=True, null=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.STARTING,
+        db_index=True,
+    )
+    error = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "ручной вход в браузер"
+        verbose_name_plural = "ручные входы в браузер"
+
+    def __str__(self):
+        return f"{self.user}: {self.get_status_display()}"
+
+
+class RegistrationInvite(models.Model):
+    token_digest = models.CharField(max_length=64, unique=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="created_registration_invites",
+    )
+    registered_user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="registration_invite",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "приглашение в семейную книгу"
+        verbose_name_plural = "приглашения в семейную книгу"
+
+    @staticmethod
+    def digest_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def __str__(self):
+        return f"Приглашение от {self.created_by or 'владельца'}"
 
 
 class CartAttempt(models.Model):

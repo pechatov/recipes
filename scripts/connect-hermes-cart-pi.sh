@@ -9,6 +9,10 @@ set -Eeuo pipefail
 
 HERMES_PROFILE="${HERMES_PROFILE:-recipecart}"
 HERMES_MODEL="${HERMES_MODEL:-gpt-5.6-sol}"
+LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+ssh "$PI_SSH_HOST" 'install -d -m 0700 "$HOME/.local/share/recipes-browser-login" && install -m 0600 /dev/stdin "$HOME/.local/share/recipes-browser-login/server.mjs"' \
+  <"$LOCAL_ROOT/scripts/browser-login-server.mjs"
 
 ssh "$PI_SSH_HOST" "PI_ADDRESS='$PI_ADDRESS' PI_API_PORT='$PI_API_PORT' HERMES_PROFILE='$HERMES_PROFILE' HERMES_MODEL='$HERMES_MODEL' bash -s" <<'REMOTE'
 set -Eeuo pipefail
@@ -17,6 +21,7 @@ HERMES_PY="$HERMES_ROOT/venv/bin/python"
 PROFILE_HOME="$HOME/.hermes/profiles/$HERMES_PROFILE"
 CAMOFOX_ROOT="$HOME/.local/share/recipes-camofox"
 CAMOFOX_BIN="$CAMOFOX_ROOT/node_modules/.bin/camofox-browser"
+LOGIN_ROOT="$HOME/.local/share/recipes-browser-login"
 export PATH="$HOME/.hermes/node/bin:$PATH"
 
 if [[ ! -x "$HERMES_PY" || ! -x "$HOME/.hermes/node/bin/node" ]]; then
@@ -43,6 +48,7 @@ fi
 if [[ ! -x "$CAMOFOX_BIN" ]]; then
   npm install --prefix "$CAMOFOX_ROOT" --omit=dev --no-audit --no-fund @askjo/camofox-browser@1.13.1
 fi
+npm install --prefix "$LOGIN_ROOT" --omit=dev --no-audit --no-fund http-proxy@1.18.1
 install -d -m 0700 "$PROFILE_HOME/camofox-profiles"
 
 # The upstream no-proxy defaults identify every context as en-US in Los
@@ -192,6 +198,7 @@ updates = {
     "CAMOFOX_CRASH_REPORT_ENABLED": "false",
     "CAMOFOX_LOCALE": "ru-RU",
     "CAMOFOX_TIMEZONE": "Europe/Moscow",
+    "BROWSER_LOGIN_CONTROL_KEY": values.get("BROWSER_LOGIN_CONTROL_KEY") or secrets.token_urlsafe(48),
 }
 obsolete = {
     "AGENT_BROWSER_PROFILE",
@@ -280,6 +287,35 @@ WantedBy=default.target
 path.chmod(0o600)
 PY
 
+HERMES_PROFILE="$HERMES_PROFILE" python3 - <<'PY'
+import os
+from pathlib import Path
+
+home = Path.home()
+profile = os.environ["HERMES_PROFILE"]
+path = home / ".config/systemd/user/recipes-browser-login.service"
+path.write_text(f"""[Unit]
+Description=One-time browser login gateway for recipes
+Requires=recipes-camofox.service
+After=recipes-camofox.service network-online.target
+
+[Service]
+Environment=PATH={home}/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=BROWSER_LOGIN_BIND_HOST={os.environ['PI_ADDRESS']}
+Environment=BROWSER_LOGIN_PORT=9380
+Environment=HERMES_ROOT={home}/.hermes/hermes-agent
+Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
+EnvironmentFile={home}/.hermes/profiles/{profile}/.env
+ExecStart={home}/.hermes/node/bin/node {home}/.local/share/recipes-browser-login/server.mjs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+""")
+path.chmod(0o600)
+PY
+
 printf 'y\ny\n' | "$HERMES_PY" -m hermes_cli.main -p "$HERMES_PROFILE" gateway install --force >/dev/null
 install -d -m 0700 "$HOME/.config/systemd/user/hermes-gateway-$HERMES_PROFILE.service.d"
 HERMES_PROFILE="$HERMES_PROFILE" python3 - <<'PY'
@@ -301,12 +337,15 @@ PY
 systemctl --user daemon-reload
 systemctl --user disable --now recipes-xvfb.service >/dev/null 2>&1 || true
 systemctl --user enable recipes-camofox.service >/dev/null
+systemctl --user enable recipes-browser-login.service >/dev/null
 systemctl --user restart recipes-camofox.service
+systemctl --user restart recipes-browser-login.service
 systemctl --user restart "hermes-gateway-$HERMES_PROFILE.service"
 
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:9377/health" >/dev/null 2>&1 \
-    && curl -fsS "http://$PI_ADDRESS:$PI_API_PORT/health" >/dev/null 2>&1; then
+    && curl -fsS "http://$PI_ADDRESS:$PI_API_PORT/health" >/dev/null 2>&1 \
+    && curl -fsS "http://$PI_ADDRESS:9380/healthz" >/dev/null 2>&1; then
     exit 0
   fi
   sleep 1
@@ -315,22 +354,26 @@ echo "Hermes cart API did not become healthy" >&2
 exit 1
 REMOTE
 
-# Pass the bearer key directly from Pi to the root-owned TrueNAS env file.
-ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import os; from pathlib import Path; print(next(line.split('=',1)[1].strip() for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if line.startswith('API_SERVER_KEY=')))\"" \
+# Pass both bearer keys directly from Pi to the root-owned TrueNAS env file.
+ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY']}))\"" \
   | ssh "$TRUENAS_SSH_HOST" "sudo env TRUENAS_ENV='$TRUENAS_ENV' CART_BASE_URL='http://$PI_ADDRESS:$PI_API_PORT/v1' python3 -c '
+import json
 import os
 import sys
 from pathlib import Path
 
 path = Path(os.environ[\"TRUENAS_ENV\"])
-key = sys.stdin.read().strip()
-if not key or not path.is_file():
+keys = json.loads(sys.stdin.read())
+if not keys.get(\"cart\") or not keys.get(\"browser\") or not path.is_file():
     raise SystemExit(\"Missing Hermes key or TrueNAS application .env\")
 values = {
     \"CART_AI_BASE_URL\": os.environ[\"CART_BASE_URL\"],
-    \"CART_AI_API_KEY\": key,
+    \"CART_AI_API_KEY\": keys[\"cart\"],
     \"CART_AI_MODEL\": \"recipes-cart-sol\",
     \"CART_AI_TIMEOUT_SECONDS\": \"900\",
+    \"CART_BROWSER_CONTROL_URL\": \"http://$PI_ADDRESS:9380\",
+    \"CART_BROWSER_CONTROL_KEY\": keys[\"browser\"],
+    \"CART_BROWSER_LOGIN_MINUTES\": \"15\",
 }
 seen = set()
 output = []
@@ -351,4 +394,4 @@ tmp.replace(path)
 '"
 
 echo "Hermes cart profile is ready."
-echo "For manual login: ./scripts/cart-browser-login-pi.sh start USER_ID"
+echo "Browser login is available through the recipes site after the HTTPS proxy is updated."

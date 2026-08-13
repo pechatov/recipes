@@ -8,6 +8,8 @@ set -Eeuo pipefail
 : "${RECIPES_ALIAS_DOMAIN:?Set RECIPES_ALIAS_DOMAIN}"
 : "${RECIPES_FORWARD_HOST:?Set RECIPES_FORWARD_HOST}"
 : "${RECIPES_FORWARD_PORT:?Set RECIPES_FORWARD_PORT}"
+: "${RECIPES_BROWSER_LOGIN_HOST:?Set RECIPES_BROWSER_LOGIN_HOST}"
+: "${RECIPES_BROWSER_LOGIN_PORT:=9380}"
 : "${NPM_CONTAINER:?Set NPM_CONTAINER}"
 
 if [[ "$NPM_DATA_DIR" != "$NPM_EXPECTED_DATA_DIR" ]] \
@@ -26,8 +28,14 @@ if [[ "$RECIPES_PRIMARY_DOMAIN" == "$RECIPES_ALIAS_DOMAIN" ]]; then
   echo "Primary and alias domains must differ." >&2
   exit 1
 fi
-if [[ ! "$RECIPES_FORWARD_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+if [[ ! "$RECIPES_FORWARD_HOST" =~ ^[A-Za-z0-9.-]+$ ]] \
+  || [[ ! "$RECIPES_BROWSER_LOGIN_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
   echo "Invalid forward host." >&2
+  exit 1
+fi
+if [[ ! "$RECIPES_BROWSER_LOGIN_PORT" =~ ^[0-9]+$ ]] \
+  || (( RECIPES_BROWSER_LOGIN_PORT < 1 || RECIPES_BROWSER_LOGIN_PORT > 65535 )); then
+  echo "Invalid browser login port." >&2
   exit 1
 fi
 if [[ ! "$RECIPES_FORWARD_PORT" =~ ^[0-9]+$ ]] || (( RECIPES_FORWARD_PORT < 1 || RECIPES_FORWARD_PORT > 65535 )); then
@@ -186,6 +194,23 @@ server {
 
   access_log /data/logs/proxy-host-${proxy_id}_access.log proxy;
   error_log /data/logs/proxy-host-${proxy_id}_error.log warn;
+
+  # The Pi gateway validates a one-time URL and then an HttpOnly cookie before
+  # it proxies noVNC. Its control API lives under /v1 and is never exposed here.
+  location /browser-login/ {
+    access_log off;
+    proxy_pass http://$RECIPES_BROWSER_LOGIN_HOST:$RECIPES_BROWSER_LOGIN_PORT;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \"upgrade\";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+  }
 
   location / {
     add_header Strict-Transport-Security \$hsts_header always;
