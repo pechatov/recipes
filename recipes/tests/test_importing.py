@@ -73,22 +73,22 @@ class ExtractorTests(TestCase):
         self.assertTrue(document.cover_image_urls[-1].endswith("/hqdefault.jpg"))
         fetch_title.assert_called_once_with("dQw4w9WgXcQ")
 
-    @patch("recipes.importing.extractors._open_public_url")
-    def test_fetches_youtube_title_from_oembed(self, open_url):
+    @patch("recipes.importing.extractors.urllib.request.urlopen")
+    def test_fetches_youtube_title_from_oembed(self, urlopen):
         response = MagicMock()
         response.status = 200
         response.headers.get.return_value = "application/json; charset=utf-8"
         response.read.return_value = json.dumps(
             {"title": "  Лучший   домашний гуляш  "}
         ).encode()
-        open_url.return_value.__enter__.return_value = response
+        urlopen.return_value.__enter__.return_value = response
 
         title = _fetch_youtube_title("dQw4w9WgXcQ")
 
         self.assertEqual(title, "Лучший домашний гуляш")
-        requested_url = open_url.call_args.args[0]
-        self.assertIn("youtube.com/oembed?", requested_url)
-        self.assertIn("dQw4w9WgXcQ", requested_url)
+        request = urlopen.call_args.args[0]
+        self.assertIn("youtube.com/oembed?", request.full_url)
+        self.assertIn("dQw4w9WgXcQ", request.full_url)
 
     @patch("recipes.importing.extractors._open_public_url")
     def test_website_title_falls_back_to_utf8_for_unknown_charset(self, open_url):

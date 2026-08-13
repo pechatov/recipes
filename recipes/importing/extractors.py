@@ -6,6 +6,8 @@ import json
 import re
 import socket
 import ssl
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -250,11 +252,15 @@ def _fetch_youtube_title(video_id: str) -> str:
         }
     )
     url = f"https://www.youtube.com/oembed?{params}"
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
     try:
-        with _open_public_url(url, headers=headers, timeout=5) as response:
-            if response.status != 200:
-                return ""
+        # The oEmbed host is a fixed application endpoint, not a user-supplied
+        # destination. Use the platform resolver here so DNS proxy/fake-IP
+        # setups can route it; user-provided URLs still use _open_public_url.
+        with urllib.request.urlopen(request, timeout=5) as response:
             if "json" not in response.headers.get("content-type", "").lower():
                 return ""
             content = response.read(MAX_TITLE_BYTES + 1)
@@ -265,10 +271,8 @@ def _fetch_youtube_title(video_id: str) -> str:
         return " ".join(str(title).split())[:300]
     except (
         json.JSONDecodeError,
+        urllib.error.URLError,
         OSError,
-        http.client.HTTPException,
-        ssl.SSLError,
-        SourceError,
     ):
         return ""
 
