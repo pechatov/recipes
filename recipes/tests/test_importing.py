@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 from pathlib import Path
@@ -89,6 +90,17 @@ class ExtractorTests(TestCase):
         request = urlopen.call_args.args[0]
         self.assertIn("youtube.com/oembed?", request.full_url)
         self.assertIn("dQw4w9WgXcQ", request.full_url)
+
+    @patch("recipes.importing.extractors.urllib.request.urlopen")
+    def test_youtube_title_returns_empty_on_incomplete_response(self, urlopen):
+        response = MagicMock()
+        response.headers.get.return_value = "application/json"
+        response.read.side_effect = http.client.IncompleteRead(b'{"title":')
+        urlopen.return_value.__enter__.return_value = response
+
+        title = _fetch_youtube_title("dQw4w9WgXcQ")
+
+        self.assertEqual(title, "")
 
     @patch("recipes.importing.extractors._open_public_url")
     def test_website_title_falls_back_to_utf8_for_unknown_charset(self, open_url):

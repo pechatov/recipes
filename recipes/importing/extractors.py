@@ -25,6 +25,7 @@ MAX_SOURCE_CHARS = 60_000
 MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
+YOUTUBE_OEMBED_PROBE_VIDEO_ID = "dQw4w9WgXcQ"
 
 
 @dataclass(frozen=True)
@@ -270,6 +271,7 @@ def _fetch_youtube_title(video_id: str) -> str:
         title = payload.get("title", "") if isinstance(payload, dict) else ""
         return " ".join(str(title).split())[:300]
     except (
+        http.client.HTTPException,
         json.JSONDecodeError,
         urllib.error.URLError,
         OSError,
