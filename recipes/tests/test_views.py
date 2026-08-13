@@ -172,6 +172,59 @@ class RecipeViewTests(TestCase):
 
         self.assertEqual(response.json()["status"], RecipeRefinement.Status.PROCESSING)
 
+    def test_other_user_cannot_refine_or_poll_private_draft(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        refinement = RecipeRefinement.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            prompt="Сделай быстрее",
+            expected_recipe_updated_at=self.recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+        )
+        other = get_user_model().objects.create_user(username="other-cook")
+        self.client.force_login(other)
+
+        editor = self.client.get(reverse("recipe-update", args=[self.recipe.slug]))
+        create = self.client.post(
+            reverse("recipe-refine", args=[self.recipe.slug]),
+            {"prompt": "Подмени чужой рецепт"},
+        )
+        status = self.client.get(
+            reverse(
+                "recipe-refinement-status",
+                args=[self.recipe.slug, refinement.pk],
+            )
+        )
+
+        self.assertNotContains(editor, "Гермес-редактор")
+        self.assertEqual(create.status_code, 404)
+        self.assertEqual(status.status_code, 404)
+        self.assertEqual(RecipeRefinement.objects.count(), 1)
+
+    def test_admin_can_refine_and_poll_any_draft(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        admin = get_user_model().objects.create_user(
+            username="recipe-admin", is_staff=True
+        )
+        self.client.force_login(admin)
+
+        create = self.client.post(
+            reverse("recipe-refine", args=[self.recipe.slug]),
+            {"prompt": "Уточни рецепт"},
+        )
+        refinement = RecipeRefinement.objects.get()
+        status = self.client.get(
+            reverse(
+                "recipe-refinement-status",
+                args=[self.recipe.slug, refinement.pk],
+            )
+        )
+
+        self.assertEqual(create.status_code, 302)
+        self.assertEqual(status.status_code, 200)
+
     def test_recipe_slug_transliterates_russian_title(self):
         self.assertEqual(self.recipe.slug, "semeynaya-pasta")
         self.assertTrue(self.recipe.slug.isascii())

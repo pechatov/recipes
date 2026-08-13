@@ -72,6 +72,20 @@ class Command(BaseCommand):
             )
             return task
 
+    @staticmethod
+    def fail_owned_task(task, error: str) -> bool:
+        return bool(
+            task.__class__.objects.filter(
+                pk=task.pk,
+                status=task.__class__.Status.PROCESSING,
+                attempts=task.attempts,
+            ).update(
+                status=task.__class__.Status.FAILED,
+                error=error[:2000],
+                finished_at=timezone.now(),
+            )
+        )
+
     def handle(self, *args, **options):
         recovered = self.recover_stale_jobs()
         if recovered:
@@ -89,21 +103,25 @@ class Command(BaseCommand):
                             f"Import {task.pk} completed: {len(recipes)} recipe(s) created"
                         )
                 except ImportPipelineError as error:
-                    task.status = task.__class__.Status.FAILED
-                    task.error = str(error)[:2000]
-                    task.finished_at = timezone.now()
-                    task.save(update_fields=["status", "error", "finished_at"])
-                    self.stderr.write(f"Task {task.pk} failed: {error}")
+                    if self.fail_owned_task(task, str(error)):
+                        self.stderr.write(f"Task {task.pk} failed: {error}")
+                    else:
+                        self.stderr.write(
+                            f"Task {task.pk} lost its lease; stale failure ignored"
+                        )
                 except Exception:
-                    task.status = task.__class__.Status.FAILED
-                    task.error = (
+                    error = (
                         "Внутренняя ошибка обработки рецепта. "
                         "Подробности сохранены в журнале сервера."
                     )
-                    task.finished_at = timezone.now()
-                    task.save(update_fields=["status", "error", "finished_at"])
+                    owned = self.fail_owned_task(task, error)
                     logger.exception("Recipe task %s failed unexpectedly", task.pk)
-                    self.stderr.write(f"Task {task.pk} failed unexpectedly")
+                    if owned:
+                        self.stderr.write(f"Task {task.pk} failed unexpectedly")
+                    else:
+                        self.stderr.write(
+                            f"Task {task.pk} lost its lease; stale failure ignored"
+                        )
                 else:
                     self.stdout.write(result_message)
             if options["once"]:

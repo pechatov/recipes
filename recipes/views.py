@@ -494,6 +494,20 @@ def _recipe_refinement_context(recipe):
     }
 
 
+def _recipes_refinable_by(user):
+    recipes = Recipe.objects.filter(status=Recipe.Status.DRAFT)
+    if user.is_staff or user.is_superuser:
+        return recipes
+    return recipes.filter(created_by=user)
+
+
+def _can_refine_recipe(user, recipe):
+    return bool(
+        recipe.status == Recipe.Status.DRAFT
+        and (user.is_staff or user.is_superuser or recipe.created_by_id == user.pk)
+    )
+
+
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_create(request):
@@ -600,7 +614,12 @@ def recipe_update(request, slug):
             "ingredient_formset": ingredient_formset,
             "step_formset": step_formset,
             "is_create": False,
-            **_recipe_refinement_context(recipe),
+            "can_refine_recipe": _can_refine_recipe(request.user, recipe),
+            **(
+                _recipe_refinement_context(recipe)
+                if _can_refine_recipe(request.user, recipe)
+                else {}
+            ),
         },
     )
 
@@ -608,9 +627,7 @@ def recipe_update(request, slug):
 @login_required
 @require_POST
 def recipe_refine(request, slug):
-    recipe, _ = _resolve_recipe_slug(
-        slug, Recipe.objects.filter(status=Recipe.Status.DRAFT)
-    )
+    recipe, _ = _resolve_recipe_slug(slug, _recipes_refinable_by(request.user))
     form = RecipeRefinementForm(request.POST)
     active_refinement = recipe.refinements.filter(
         status__in=[
@@ -639,7 +656,7 @@ def recipe_refine(request, slug):
 
 @login_required
 def recipe_refinement_status(request, slug, pk):
-    recipe, _ = _resolve_recipe_slug(slug)
+    recipe, _ = _resolve_recipe_slug(slug, _recipes_refinable_by(request.user))
     refinement = get_object_or_404(RecipeRefinement, pk=pk, recipe=recipe)
     return JsonResponse(
         {

@@ -8,7 +8,7 @@
     <h1>{% if is_create %}Добавить блюдо{% else %}{{ recipe.title }}{% endif %}</h1>
   </header>
 
-  {% if not is_create and recipe.is_draft %}
+  {% if not is_create and can_refine_recipe %}
     <section
       class="agent-chat"
       id="agent-chat"
@@ -116,5 +116,5 @@
 {% endblock %}
 {% block scripts %}
   <script src="{% static 'recipes/formsets.js' %}" defer></script>
-  {% if not is_create and recipe.is_draft %}<script src="{% static 'recipes/refinement-chat.js' %}" defer></script>{% endif %}
+  {% if not is_create and can_refine_recipe %}<script src="{% static 'recipes/refinement-chat.js' %}" defer></script>{% endif %}
 {% endblock %}

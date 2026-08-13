@@ -546,6 +546,7 @@ def save_draft(
     *,
     document: SourceDocument | None = None,
     expected_draft_versions: dict[int, Any] | None = None,
+    expected_job_attempt: int | None = None,
 ) -> list[Recipe]:
     if expected_draft_versions is None:
         expected_draft_versions = {
@@ -562,6 +563,13 @@ def save_draft(
     try:
         with transaction.atomic():
             locked_job = ImportJob.objects.select_for_update().get(pk=job.pk)
+            if expected_job_attempt is not None and (
+                locked_job.status != ImportJob.Status.PROCESSING
+                or locked_job.attempts != expected_job_attempt
+            ):
+                raise ImportPipelineError(
+                    "Эта попытка импорта больше не владеет задачей; результат отброшен."
+                )
             linked_recipe_ids = set(locked_job.recipes.values_list("pk", flat=True))
             if locked_job.recipe_id:
                 linked_recipe_ids.add(locked_job.recipe_id)
@@ -712,6 +720,9 @@ def save_draft(
 
 
 def process_import_job(job: ImportJob) -> list[Recipe]:
+    expected_job_attempt = (
+        job.attempts if job.status == ImportJob.Status.PROCESSING else None
+    )
     expected_draft_versions = {
         recipe.pk: recipe.updated_at
         for recipe in Recipe.objects.filter(
@@ -751,6 +762,7 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
         data,
         document=document,
         expected_draft_versions=expected_draft_versions,
+        expected_job_attempt=expected_job_attempt,
     )
 
 
@@ -814,6 +826,13 @@ def save_refined_recipe(
         locked_refinement = RecipeRefinement.objects.select_for_update().get(
             pk=refinement.pk
         )
+        if (
+            locked_refinement.status != RecipeRefinement.Status.PROCESSING
+            or locked_refinement.attempts != refinement.attempts
+        ):
+            raise ImportPipelineError(
+                "Эта попытка переработки больше не владеет задачей; результат отброшен."
+            )
         recipe = (
             Recipe.objects.select_for_update()
             .prefetch_related("ingredients", "steps", "categories")
@@ -834,19 +853,34 @@ def save_refined_recipe(
                 "Пожелание не применено, чтобы не привязать их к другим шагам."
             )
 
-        previous_steps = list(recipe.steps.all())
-        previous_images = [
-            (step.image.name, step.image_imported) if step.image else ("", False)
-            for step in previous_steps
-        ]
+        manual_nutrition_fields = set(recipe.nutrition_manual_fields or [])
+        manual_nutrition = {
+            field: getattr(recipe, field) for field in manual_nutrition_fields
+        }
         obsolete_images = [
             stored
-            for step in previous_steps[len(values["steps"]) :]
+            for step in recipe.steps.all()
             if step.image_imported and (stored := _stored_file(step.image))
         ]
 
         for field, value in _recipe_content_values(values).items():
             setattr(recipe, field, value)
+        for field, value in manual_nutrition.items():
+            setattr(recipe, field, value)
+        recipe.nutrition_manual_fields = sorted(manual_nutrition_fields)
+        recipe.calories_estimated = any(
+            field not in manual_nutrition_fields and getattr(recipe, field) is not None
+            for field in (
+                "calories_per_serving",
+                "proteins_per_serving",
+                "fats_per_serving",
+                "carbohydrates_per_serving",
+                "calories_per_100g",
+                "proteins_per_100g",
+                "fats_per_100g",
+                "carbohydrates_per_100g",
+            )
+        )
         recipe.save()
         recipe.ingredients.all().delete()
         recipe.steps.all().delete()
@@ -860,10 +894,6 @@ def save_refined_recipe(
         for index, step in enumerate(values["steps"]):
             step_values = {key: value for key, value in step.items() if key != "image_url"}
             recipe_step = RecipeStep(recipe=recipe, order=index, **step_values)
-            if index < len(previous_images):
-                image_name, image_imported = previous_images[index]
-                recipe_step.image.name = image_name
-                recipe_step.image_imported = image_imported
             steps.append(recipe_step)
         RecipeStep.objects.bulk_create(steps)
         _set_categories(recipe, values.get("categories", []))
