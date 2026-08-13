@@ -50,6 +50,7 @@ MAX_SEARCH_FRAGMENTS_PER_TOKEN = 4
 MAX_SEARCH_QUERY_LENGTH = 120
 MAX_SEARCH_TOKEN_LENGTH = 32
 MAX_SEARCH_TOKENS = 8
+REFINEMENT_HISTORY_LIMIT = 50
 SEARCH_FIELDS = (
     "title",
     "description",
@@ -475,18 +476,28 @@ def _recipe_form_context(request, instance=None):
 
 
 def _recipe_refinement_context(recipe):
+    active_refinement = (
+        recipe.refinements.select_related("requested_by")
+        .filter(
+            status__in=[
+                RecipeRefinement.Status.PENDING,
+                RecipeRefinement.Status.PROCESSING,
+            ]
+        )
+        .order_by("-created_at", "-pk")
+        .first()
+    )
+    history = recipe.refinements.select_related("requested_by")
+    if active_refinement:
+        history = history.exclude(pk=active_refinement.pk)
     refinements = list(
-        recipe.refinements.select_related("requested_by").order_by("created_at", "pk")
+        history.order_by("-created_at", "-pk")[: (
+            REFINEMENT_HISTORY_LIMIT - bool(active_refinement)
+        )]
     )
-    active_refinement = next(
-        (
-            refinement
-            for refinement in reversed(refinements)
-            if refinement.status
-            in [RecipeRefinement.Status.PENDING, RecipeRefinement.Status.PROCESSING]
-        ),
-        None,
-    )
+    if active_refinement:
+        refinements.append(active_refinement)
+    refinements.sort(key=lambda item: (item.created_at, item.pk))
     return {
         "refinement_form": RecipeRefinementForm(),
         "refinements": refinements,

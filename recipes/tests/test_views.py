@@ -225,6 +225,39 @@ class RecipeViewTests(TestCase):
         self.assertEqual(create.status_code, 302)
         self.assertEqual(status.status_code, 200)
 
+    def test_refinement_chat_limits_history_and_keeps_active_task(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        RecipeRefinement.objects.bulk_create(
+            [
+                RecipeRefinement(
+                    recipe=self.recipe,
+                    requested_by=self.user,
+                    prompt=f"Старое пожелание {index}",
+                    expected_recipe_updated_at=self.recipe.updated_at,
+                    status=RecipeRefinement.Status.COMPLETED,
+                )
+                for index in range(55)
+            ]
+        )
+        active = RecipeRefinement.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            prompt="Активное пожелание",
+            expected_recipe_updated_at=self.recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("recipe-update", args=[self.recipe.slug]))
+
+        refinements = response.context["refinements"]
+        self.assertEqual(len(refinements), 50)
+        self.assertEqual(response.context["active_refinement"], active)
+        self.assertIn(active, refinements)
+        self.assertNotContains(response, "Старое пожелание 0")
+        self.assertContains(response, "Старое пожелание 54")
+
     def test_recipe_slug_transliterates_russian_title(self):
         self.assertEqual(self.recipe.slug, "semeynaya-pasta")
         self.assertTrue(self.recipe.slug.isascii())
