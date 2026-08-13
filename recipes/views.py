@@ -22,7 +22,7 @@ from django.views.decorators.http import require_http_methods, require_POST
 
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
-from .importing.extractors import detect_source_type
+from .importing.extractors import detect_source_type, youtube_video_id
 from .importing.normalizer import estimate_nutrition
 from .models import (
     CartAttempt,
@@ -387,6 +387,11 @@ def recipe_detail(request, slug):
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
     )
+    video_id = (
+        youtube_video_id(recipe.source_url)
+        if import_job and import_job.source_type == ImportJob.SourceType.YOUTUBE
+        else None
+    )
     return render(
         request,
         "recipes/recipe_detail.html",
@@ -395,6 +400,7 @@ def recipe_detail(request, slug):
             "main_ingredients": [item for item in ingredients if not item.is_pantry],
             "pantry_ingredients": [item for item in ingredients if item.is_pantry],
             "source_import_job": import_job,
+            "youtube_video_id": video_id,
         },
     )
 

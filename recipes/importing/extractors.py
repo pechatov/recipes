@@ -36,6 +36,7 @@ class SourceDocument:
     step_image_urls: tuple[str, ...] = ()
     recipe_cover_image_urls: tuple[tuple[str, ...], ...] = ()
     recipe_step_image_urls: tuple[tuple[str, ...], ...] = ()
+    transcript_segments: tuple[dict[str, Any], ...] = ()
 
     @property
     def all_structured_recipes(self) -> tuple[dict[str, Any], ...]:
@@ -471,7 +472,24 @@ def extract_youtube(
             "У видео нет доступных русских или английских субтитров. "
             "Автоматическое распознавание аудио пока не подключено."
         ) from error
-    text = " ".join(snippet.text.strip() for snippet in transcript if snippet.text.strip())
+    transcript_segments = []
+    transcript_chars = 0
+    for snippet in transcript:
+        snippet_text = " ".join(snippet.text.split())
+        if not snippet_text:
+            continue
+        remaining_chars = MAX_SOURCE_CHARS - transcript_chars
+        if remaining_chars <= 0:
+            break
+        snippet_text = snippet_text[:remaining_chars]
+        transcript_segments.append(
+            {
+                "start_seconds": max(0, int(snippet.start)),
+                "text": snippet_text,
+            }
+        )
+        transcript_chars += len(snippet_text) + 1
+    text = " ".join(segment["text"] for segment in transcript_segments)
     if len(text) < 80:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
     return SourceDocument(
@@ -485,6 +503,7 @@ def extract_youtube(
             f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
             f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         ),
+        transcript_segments=tuple(transcript_segments),
     )
 
 
