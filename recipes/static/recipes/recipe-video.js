@@ -1,6 +1,19 @@
 (() => {
+  const disclosure = document.querySelector("[data-recipe-video-disclosure]");
   const player = document.querySelector("[data-recipe-video]");
-  if (!player) return;
+  if (!disclosure || !player) return;
+
+  function showVideo(seconds = null, autoplay = false) {
+    const parameters = new URLSearchParams({ rel: "0" });
+    if (seconds !== null) parameters.set("start", String(seconds));
+    if (autoplay) parameters.set("autoplay", "1");
+    const source = `${player.dataset.embedUrl}?${parameters}`;
+    if (player.src !== source) player.src = source;
+  }
+
+  disclosure.addEventListener("toggle", () => {
+    if (disclosure.open && !player.getAttribute("src")) showVideo();
+  });
 
   document.addEventListener("click", event => {
     const link = event.target.closest?.("[data-video-start]");
@@ -10,11 +23,13 @@
     if (!Number.isSafeInteger(seconds) || seconds < 0) return;
 
     event.preventDefault();
-    const separator = player.dataset.embedUrl.includes("?") ? "&" : "?";
-    player.src = `${player.dataset.embedUrl}${separator}start=${seconds}&autoplay=1&rel=0`;
-    document.getElementById("recipe-video")?.scrollIntoView({
-      behavior: "smooth",
-      block: "center",
+    disclosure.open = true;
+    showVideo(seconds, true);
+    requestAnimationFrame(() => {
+      disclosure.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
     });
   });
 })();

@@ -102,8 +102,10 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(
             response,
-            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?rel=0",
+            'data-embed-url="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"',
         )
+        self.assertContains(response, "data-recipe-video-disclosure")
+        self.assertContains(response, 'class="recipe-video-toggle"')
         self.assertContains(response, 'data-video-start="95"')
         self.assertContains(response, "Смотреть с 01:35")
         self.assertContains(response, "recipes/recipe-video.js")

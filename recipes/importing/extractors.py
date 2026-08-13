@@ -20,6 +20,8 @@ from .exceptions import SourceError
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CHARS = 60_000
+MAX_TRANSCRIPT_SEGMENTS = 1_200
+MAX_TRANSCRIPT_JSON_BYTES = 120_000
 MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
@@ -474,6 +476,7 @@ def extract_youtube(
         ) from error
     transcript_segments = []
     transcript_chars = 0
+    transcript_json_bytes = 2  # Opening and closing brackets of the JSON array.
     for snippet in transcript:
         snippet_text = " ".join(snippet.text.split())
         if not snippet_text:
@@ -482,13 +485,25 @@ def extract_youtube(
         if remaining_chars <= 0:
             break
         snippet_text = snippet_text[:remaining_chars]
-        transcript_segments.append(
-            {
-                "start_seconds": max(0, int(snippet.start)),
-                "text": snippet_text,
-            }
+        segment = {
+            "start_seconds": max(0, int(snippet.start)),
+            "text": snippet_text,
+        }
+        segment_json_bytes = len(
+            json.dumps(segment, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
         )
+        separator_bytes = 1 if transcript_segments else 0
+        if (
+            len(transcript_segments) >= MAX_TRANSCRIPT_SEGMENTS
+            or transcript_json_bytes + separator_bytes + segment_json_bytes
+            > MAX_TRANSCRIPT_JSON_BYTES
+        ):
+            break
+        transcript_segments.append(segment)
         transcript_chars += len(snippet_text) + 1
+        transcript_json_bytes += separator_bytes + segment_json_bytes
     text = " ".join(segment["text"] for segment in transcript_segments)
     if len(text) < 80:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")

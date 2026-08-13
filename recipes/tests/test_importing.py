@@ -13,6 +13,8 @@ from recipes.importing.exceptions import (
     UnsafeSourceError,
 )
 from recipes.importing.extractors import (
+    MAX_TRANSCRIPT_JSON_BYTES,
+    MAX_TRANSCRIPT_SEGMENTS,
     SourceDocument,
     _PinnedHTTPSConnection,
     _fetch_website_title,
@@ -84,6 +86,40 @@ class ExtractorTests(TestCase):
             },),
         )
         fetch_title.assert_called_once_with("dQw4w9WgXcQ")
+
+    @patch(
+        "recipes.importing.extractors._fetch_youtube_title",
+        return_value="Длинный рецепт",
+    )
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_limits_segment_count_and_serialized_transcript_size(
+        self, fetch, _fetch_title
+    ):
+        fetch.side_effect = [
+            [
+                Mock(text=f"Шаг {index}", start=index * 0.5)
+                for index in range(MAX_TRANSCRIPT_SEGMENTS + 500)
+            ],
+            [
+                Mock(
+                    text=("Подробное действие приготовления " * 5) + str(index),
+                    start=index * 0.5,
+                )
+                for index in range(MAX_TRANSCRIPT_SEGMENTS)
+            ],
+        ]
+
+        count_limited = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        size_limited = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        serialized = json.dumps(
+            size_limited.transcript_segments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.assertEqual(len(count_limited.transcript_segments), MAX_TRANSCRIPT_SEGMENTS)
+        self.assertLess(len(size_limited.transcript_segments), MAX_TRANSCRIPT_SEGMENTS)
+        self.assertLessEqual(len(serialized), MAX_TRANSCRIPT_JSON_BYTES)
 
     @patch("recipes.importing.extractors._open_public_url")
     def test_fetches_youtube_title_from_oembed(self, open_url):
