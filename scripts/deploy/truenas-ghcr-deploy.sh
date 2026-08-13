@@ -100,7 +100,7 @@ worker_id="$(sudo docker ps \
   --format '{{.ID}}' | head -n 1)"
 test -n "$worker_id"
 sudo docker exec "$worker_id" python manage.py backfill_import_titles --check
-sudo docker exec -d "$worker_id" \
+sudo timeout 120 docker exec "$worker_id" \
   python manage.py backfill_import_titles --limit 20
 REMOTE
 

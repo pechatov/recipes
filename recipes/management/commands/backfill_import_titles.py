@@ -1,4 +1,6 @@
 from django.core.management.base import BaseCommand
+from django.db.models import F
+from django.utils import timezone
 
 from recipes.importing.extractors import (
     YOUTUBE_OEMBED_PROBE_VIDEO_ID,
@@ -31,7 +33,10 @@ class Command(BaseCommand):
 
         jobs = ImportJob.objects.filter(
             source_type=ImportJob.SourceType.YOUTUBE
-        ).order_by("-created_at")
+        ).order_by(
+            F("source_title_checked_at").asc(nulls_first=True),
+            "created_at",
+        )
         technical_jobs = []
         for job in jobs.iterator():
             technical_title = f"YouTube {youtube_video_id(job.source_url) or ''}"
@@ -42,6 +47,8 @@ class Command(BaseCommand):
 
         updated = 0
         for job in technical_jobs:
+            job.source_title_checked_at = timezone.now()
+            job.save(update_fields=["source_title_checked_at"])
             title = fetch_source_title(job.source_url)
             if title:
                 job.source_title = title

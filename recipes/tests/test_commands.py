@@ -81,7 +81,9 @@ class BackfillImportTitlesTests(TestCase):
         "recipes.management.commands.backfill_import_titles.fetch_source_title",
         side_effect=lambda url: f"Title for {url.rsplit('=', 1)[-1]}",
     )
-    def test_backfill_respects_limit_and_processes_newest_first(self, fetch_title):
+    def test_backfill_respects_limit_and_processes_oldest_unchecked_first(
+        self, fetch_title
+    ):
         jobs = [
             ImportJob.objects.create(
                 source_url=f"https://www.youtube.com/watch?v=video00000{index}",
@@ -96,6 +98,35 @@ class BackfillImportTitlesTests(TestCase):
 
         for job in jobs:
             job.refresh_from_db()
-        self.assertEqual(jobs[0].source_title, "YouTube video000000")
+        self.assertEqual(jobs[0].source_title, "Title for video000000")
         self.assertEqual(jobs[1].source_title, "Title for video000001")
-        self.assertEqual(jobs[2].source_title, "Title for video000002")
+        self.assertEqual(jobs[2].source_title, "YouTube video000002")
+        self.assertIsNotNone(jobs[0].source_title_checked_at)
+        self.assertIsNotNone(jobs[1].source_title_checked_at)
+        self.assertIsNone(jobs[2].source_title_checked_at)
+
+    @patch(
+        "recipes.management.commands.backfill_import_titles.fetch_source_title",
+        return_value="",
+    )
+    def test_failed_lookup_does_not_block_unchecked_jobs_next_run(self, fetch_title):
+        jobs = [
+            ImportJob.objects.create(
+                source_url=f"https://www.youtube.com/watch?v=video00000{index}",
+                source_title=f"YouTube video00000{index}",
+                source_type=ImportJob.SourceType.YOUTUBE,
+                requested_by=self.user,
+            )
+            for index in range(3)
+        ]
+
+        call_command("backfill_import_titles", limit=2)
+        call_command("backfill_import_titles", limit=1)
+
+        for job in jobs:
+            job.refresh_from_db()
+        self.assertTrue(all(job.source_title_checked_at for job in jobs))
+        self.assertEqual(
+            [call.args[0] for call in fetch_title.call_args_list],
+            [jobs[0].source_url, jobs[1].source_url, jobs[2].source_url],
+        )
