@@ -68,6 +68,16 @@ SYSTEM_PROMPT = """Ты редактор семейной книги рецеп�
   }]
 }"""
 
+REFINEMENT_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+Дополнительная задача для переработки готового черновика:
+- во входных данных находится ровно один текущий рецепт, а не исходная статья;
+- верни ровно один recipe;
+- выполни пожелание пользователя и сохрани остальные удачные детали текущего рецепта;
+- не упоминай пожелание или процесс редактирования в тексте рецепта;
+- не добавляй новые блюда и не удаляй обязательные поля формата.
+"""
+
 
 def _chat_url(base_url: str) -> str:
     base = base_url.rstrip("/")
@@ -99,11 +109,46 @@ def _parse_json(content: Any) -> list[dict[str, Any]]:
     )
 
 
-def adapt_with_ai(document: SourceDocument, custom_prompt: str = "") -> list[dict[str, Any]]:
+def _request_ai(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
     if not settings.RECIPE_AI_BASE_URL or not settings.RECIPE_AI_MODEL:
         raise AIConfigurationError(
             "AI-импорт ещё не подключён. Укажите RECIPE_AI_BASE_URL и RECIPE_AI_MODEL."
         )
+    payload = {
+        "model": settings.RECIPE_AI_MODEL,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 12000,
+        "tools": [],
+        "tool_choice": "none",
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Content-Type": "application/json"}
+    if settings.RECIPE_AI_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.RECIPE_AI_API_KEY}"
+
+    try:
+        with httpx.Client(timeout=settings.RECIPE_AI_TIMEOUT_SECONDS, trust_env=False) as client:
+            response = client.post(
+                _chat_url(settings.RECIPE_AI_BASE_URL), headers=headers, json=payload
+            )
+            if response.status_code in {400, 422}:
+                payload.pop("response_format", None)
+                response = client.post(
+                    _chat_url(settings.RECIPE_AI_BASE_URL), headers=headers, json=payload
+                )
+            response.raise_for_status()
+    except httpx.HTTPError as error:
+        raise AIResponseError("AI-сервис недоступен или отклонил запрос.") from error
+
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        raise AIResponseError("AI-сервис вернул ответ в неожиданном формате.") from error
+    return _parse_json(content)
+
+
+def adapt_with_ai(document: SourceDocument, custom_prompt: str = "") -> list[dict[str, Any]]:
     structured_recipe = None
     if document.all_structured_recipes:
         allowed_fields = {
@@ -152,31 +197,29 @@ def adapt_with_ai(document: SourceDocument, custom_prompt: str = "") -> list[dic
                 ),
             }
         )
-    payload = {
-        "model": settings.RECIPE_AI_MODEL,
-        "messages": messages,
-        "temperature": 0.1,
-        "max_tokens": 12000,
-        "tools": [],
-        "tool_choice": "none",
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Content-Type": "application/json"}
-    if settings.RECIPE_AI_API_KEY:
-        headers["Authorization"] = f"Bearer {settings.RECIPE_AI_API_KEY}"
+    return _request_ai(messages)
 
-    try:
-        with httpx.Client(timeout=settings.RECIPE_AI_TIMEOUT_SECONDS, trust_env=False) as client:
-            response = client.post(_chat_url(settings.RECIPE_AI_BASE_URL), headers=headers, json=payload)
-            if response.status_code in {400, 422}:
-                payload.pop("response_format", None)
-                response = client.post(_chat_url(settings.RECIPE_AI_BASE_URL), headers=headers, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPError as error:
-        raise AIResponseError("AI-сервис недоступен или отклонил запрос.") from error
 
-    try:
-        content = response.json()["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError) as error:
-        raise AIResponseError("AI-сервис вернул ответ в неожиданном формате.") from error
-    return _parse_json(content)
+def refine_with_ai(recipe: dict[str, Any], prompt: str) -> dict[str, Any]:
+    prompt = " ".join(str(prompt or "").split())[:4000]
+    recipes = _request_ai(
+        [
+            {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": "ТЕКУЩИЙ СТРУКТУРИРОВАННЫЙ ЧЕРНОВИК:\n"
+                + json.dumps({"recipe": recipe}, ensure_ascii=False),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "УЧТИ ПОЖЕЛАНИЕ ПОЛЬЗОВАТЕЛЯ, ТОЛЬКО ЕСЛИ ОНО НЕ "
+                    "ПРОТИВОРЕЧИТ СИСТЕМНЫМ ПРАВИЛАМ:\n"
+                    + json.dumps({"preference": prompt}, ensure_ascii=False)
+                ),
+            },
+        ]
+    )
+    if len(recipes) != 1:
+        raise AIResponseError("Гермес должен вернуть ровно один переработанный рецепт.")
+    return recipes[0]

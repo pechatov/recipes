@@ -7,8 +7,8 @@ from django.db import transaction
 from django.utils import timezone
 
 from recipes.importing.exceptions import ImportPipelineError
-from recipes.importing.pipeline import process_import_job
-from recipes.models import ImportJob
+from recipes.importing.pipeline import process_import_job, process_recipe_refinement
+from recipes.models import ImportJob, RecipeRefinement
 
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ class Command(BaseCommand):
     @staticmethod
     def recover_stale_jobs():
         cutoff = timezone.now() - timedelta(minutes=15)
-        return ImportJob.objects.filter(
+        imports = ImportJob.objects.filter(
             status=ImportJob.Status.PROCESSING,
             started_at__lt=cutoff,
             recipe__isnull=True,
@@ -33,58 +33,80 @@ class Command(BaseCommand):
             started_at=None,
             error="",
         )
+        refinements = RecipeRefinement.objects.filter(
+            status=RecipeRefinement.Status.PROCESSING,
+            started_at__lt=cutoff,
+        ).update(
+            status=RecipeRefinement.Status.PENDING,
+            started_at=None,
+            error="",
+        )
+        return imports + refinements
 
     @staticmethod
-    def claim_job():
+    def claim_task():
         with transaction.atomic():
-            job = (
+            import_job = (
                 ImportJob.objects.select_for_update(skip_locked=True)
                 .filter(status=ImportJob.Status.PENDING)
                 .order_by("created_at")
                 .first()
             )
-            if not job:
+            refinement = (
+                RecipeRefinement.objects.select_for_update(skip_locked=True)
+                .filter(status=RecipeRefinement.Status.PENDING)
+                .order_by("created_at")
+                .first()
+            )
+            candidates = [item for item in (import_job, refinement) if item]
+            if not candidates:
                 return None
-            job.status = ImportJob.Status.PROCESSING
-            job.started_at = timezone.now()
-            job.finished_at = None
-            job.error = ""
-            job.attempts += 1
-            job.save(
+            task = min(candidates, key=lambda item: item.created_at)
+            task.status = task.__class__.Status.PROCESSING
+            task.started_at = timezone.now()
+            task.finished_at = None
+            task.error = ""
+            task.attempts += 1
+            task.save(
                 update_fields=["status", "started_at", "finished_at", "error", "attempts"]
             )
-            return job
+            return task
 
     def handle(self, *args, **options):
         recovered = self.recover_stale_jobs()
         if recovered:
             self.stdout.write(f"Recovered {recovered} stale import job(s)")
         while True:
-            job = self.claim_job()
-            if job:
+            task = self.claim_task()
+            if task:
                 try:
-                    recipes = process_import_job(job)
+                    if isinstance(task, RecipeRefinement):
+                        recipe = process_recipe_refinement(task)
+                        result_message = f"Refinement {task.pk} completed: {recipe.pk}"
+                    else:
+                        recipes = process_import_job(task)
+                        result_message = (
+                            f"Import {task.pk} completed: {len(recipes)} recipe(s) created"
+                        )
                 except ImportPipelineError as error:
-                    job.status = ImportJob.Status.FAILED
-                    job.error = str(error)[:2000]
-                    job.finished_at = timezone.now()
-                    job.save(update_fields=["status", "error", "finished_at"])
-                    self.stderr.write(f"Import {job.pk} failed: {error}")
+                    task.status = task.__class__.Status.FAILED
+                    task.error = str(error)[:2000]
+                    task.finished_at = timezone.now()
+                    task.save(update_fields=["status", "error", "finished_at"])
+                    self.stderr.write(f"Task {task.pk} failed: {error}")
                 except Exception:
-                    job.status = ImportJob.Status.FAILED
-                    job.error = (
-                        "Внутренняя ошибка импорта. "
+                    task.status = task.__class__.Status.FAILED
+                    task.error = (
+                        "Внутренняя ошибка обработки рецепта. "
                         "Подробности сохранены в журнале сервера."
                     )
-                    job.finished_at = timezone.now()
-                    job.save(update_fields=["status", "error", "finished_at"])
-                    logger.exception("Import %s failed unexpectedly", job.pk)
-                    self.stderr.write(f"Import {job.pk} failed unexpectedly")
+                    task.finished_at = timezone.now()
+                    task.save(update_fields=["status", "error", "finished_at"])
+                    logger.exception("Recipe task %s failed unexpectedly", task.pk)
+                    self.stderr.write(f"Task {task.pk} failed unexpectedly")
                 else:
-                    self.stdout.write(
-                        f"Import {job.pk} completed: {len(recipes)} recipe(s) created"
-                    )
+                    self.stdout.write(result_message)
             if options["once"]:
                 return
-            if not job:
+            if not task:
                 time.sleep(max(0.2, options["poll_seconds"]))

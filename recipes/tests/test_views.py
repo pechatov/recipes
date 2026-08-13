@@ -12,6 +12,7 @@ from recipes.models import (
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeRefinement,
     RecipeSlugAlias,
     RecipeStep,
 )
@@ -82,6 +83,94 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(response.context["recipe"].calories_per_100g), "205.0")
         self.assertEqual(str(response.context["recipe"].proteins_per_serving), "2.8")
         self.assertEqual(str(response.context["recipe"].fats_per_100g), "20.0")
+
+    def test_draft_editor_shows_hermes_refinement_chat(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        self.client.force_login(self.user)
+
+        response = self.client.get(
+            reverse("recipe-update", args=[self.recipe.slug])
+        )
+
+        self.assertContains(response, "Гермес-редактор")
+        self.assertContains(response, "Попросите изменить рецепт")
+        self.assertContains(
+            response, reverse("recipe-refine", args=[self.recipe.slug])
+        )
+
+    def test_published_recipe_editor_does_not_show_refinement_chat(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get(
+            reverse("recipe-update", args=[self.recipe.slug])
+        )
+
+        self.assertNotContains(response, "Гермес-редактор")
+
+    def test_refinement_message_queues_current_draft_version(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        expected_version = self.recipe.updated_at
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            reverse("recipe-refine", args=[self.recipe.slug]),
+            {"prompt": "  Сделай   рецепт менее острым  "},
+        )
+
+        self.assertRedirects(
+            response,
+            f'{reverse("recipe-update", args=[self.recipe.slug])}#agent-chat',
+            fetch_redirect_response=False,
+        )
+        refinement = RecipeRefinement.objects.get()
+        self.assertEqual(refinement.recipe, self.recipe)
+        self.assertEqual(refinement.requested_by, self.user)
+        self.assertEqual(refinement.prompt, "Сделай рецепт менее острым")
+        self.assertEqual(refinement.expected_recipe_updated_at, expected_version)
+        self.assertEqual(refinement.status, RecipeRefinement.Status.PENDING)
+
+    def test_second_refinement_is_not_queued_while_hermes_is_working(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        RecipeRefinement.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            prompt="Первое пожелание",
+            expected_recipe_updated_at=self.recipe.updated_at,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            reverse("recipe-refine", args=[self.recipe.slug]),
+            {"prompt": "Второе пожелание"},
+            follow=True,
+        )
+
+        self.assertEqual(RecipeRefinement.objects.count(), 1)
+        self.assertContains(response, "Гермес уже перерабатывает этот рецепт")
+
+    def test_refinement_status_is_available_for_chat_polling(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        refinement = RecipeRefinement.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            prompt="Сделай быстрее",
+            expected_recipe_updated_at=self.recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(
+            reverse(
+                "recipe-refinement-status",
+                args=[self.recipe.slug, refinement.pk],
+            )
+        )
+
+        self.assertEqual(response.json()["status"], RecipeRefinement.Status.PROCESSING)
 
     def test_recipe_slug_transliterates_russian_title(self):
         self.assertEqual(self.recipe.slug, "semeynaya-pasta")

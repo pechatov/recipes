@@ -6,12 +6,35 @@
     <div>
       <p class="eyebrow">Фоновые процессы</p>
       <h1>Текущие задачи</h1>
-      <p class="lead">Здесь можно вернуться к импорту рецепта или сборке корзины и проверить результат.</p>
+      <p class="lead">Здесь можно вернуться к импорту, переработке рецепта или сборке корзины и проверить результат.</p>
     </div>
     <a class="button" href="{% url 'import-create' %}">Новый импорт</a>
   </header>
 
   <div class="task-columns">
+    <section class="task-section">
+      <div class="task-section-heading">
+        <h2>Правки Гермеса</h2>
+        <span>{{ refinements|length }}</span>
+      </div>
+      {% if refinements %}
+        <div class="task-list">
+          {% for refinement in refinements %}
+            <a class="task-item" href="{% url 'recipe-update' refinement.recipe.slug %}#agent-chat">
+              <span class="task-status status-{{ refinement.status }}" aria-hidden="true"></span>
+              <span class="task-copy">
+                <strong>{{ refinement.recipe.title }}</strong>
+                <small>{{ refinement.created_at|date:"d.m.Y H:i" }} · {{ refinement.get_status_display }}</small>
+              </span>
+              <span class="task-arrow">→</span>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="task-empty">Пожеланий к черновикам пока нет.</p>
+      {% endif %}
+    </section>
+
     <section class="task-section">
       <div class="task-section-heading">
         <h2>Импорт рецептов</h2>

@@ -7,6 +7,7 @@ from .models import (
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeRefinement,
     RecipeStep,
     is_water_ingredient_name,
 )
@@ -82,6 +83,31 @@ class ImportRecipeForm(forms.ModelForm):
                 }
             ),
         }
+
+
+class RecipeRefinementForm(forms.ModelForm):
+    class Meta:
+        model = RecipeRefinement
+        fields = ("prompt",)
+        labels = {"prompt": "Пожелания к рецепту"}
+        widgets = {
+            "prompt": forms.Textarea(
+                attrs={
+                    "rows": 3,
+                    "maxlength": 4000,
+                    "placeholder": (
+                        "Например: сделай рецепт менее острым и замени сливки "
+                        "на кокосовое молоко…"
+                    ),
+                }
+            )
+        }
+
+    def clean_prompt(self):
+        prompt = " ".join(self.cleaned_data["prompt"].split())
+        if not prompt:
+            raise forms.ValidationError("Напишите, что нужно изменить в рецепте.")
+        return prompt[:4000]
 
 
 class IngredientForm(forms.ModelForm):

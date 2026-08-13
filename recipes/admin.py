@@ -9,6 +9,7 @@ from .models import (
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeRefinement,
     RecipeSlugAlias,
     RecipeStep,
     StorePreference,
@@ -69,6 +70,18 @@ class ImportJobAdmin(admin.ModelAdmin):
     list_display = ("source_type", "status", "source_title", "requested_by", "created_at")
     list_filter = ("source_type", "status")
     readonly_fields = ("created_at", "started_at", "finished_at")
+
+
+@admin.register(RecipeRefinement)
+class RecipeRefinementAdmin(admin.ModelAdmin):
+    list_display = ("recipe", "status", "requested_by", "created_at")
+    list_filter = ("status",)
+    readonly_fields = (
+        "expected_recipe_updated_at",
+        "created_at",
+        "started_at",
+        "finished_at",
+    )
 
 
 @admin.register(StorePreference)

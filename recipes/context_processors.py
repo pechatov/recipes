@@ -1,6 +1,6 @@
 from django.db.models import Q
 
-from .models import CartRun, ImportJob
+from .models import CartRun, ImportJob, RecipeRefinement
 
 
 def active_tasks(request):
@@ -10,6 +10,13 @@ def active_tasks(request):
     import_count = ImportJob.objects.filter(
         requested_by=request.user,
         status__in=[ImportJob.Status.PENDING, ImportJob.Status.PROCESSING],
+    ).count()
+    refinement_count = RecipeRefinement.objects.filter(
+        requested_by=request.user,
+        status__in=[
+            RecipeRefinement.Status.PENDING,
+            RecipeRefinement.Status.PROCESSING,
+        ],
     ).count()
     cart_count = (
         CartRun.objects.filter(requested_by=request.user)
@@ -27,4 +34,4 @@ def active_tasks(request):
         )
         .count()
     )
-    return {"active_task_count": import_count + cart_count}
+    return {"active_task_count": import_count + refinement_count + cart_count}

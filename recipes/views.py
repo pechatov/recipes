@@ -9,7 +9,7 @@ from django.contrib.auth import get_user_model, login
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
 from django.contrib.postgres.search import TrigramWordSimilarity
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Case, FloatField, IntegerField, Max, Q, Value, When
 from django.db.models.functions import Coalesce, Greatest
 from django.http import FileResponse, Http404, JsonResponse
@@ -21,7 +21,14 @@ from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_http_methods, require_POST
 
 from .carting.pipeline import attempt_needs_cleanup
-from .forms import ImportRecipeForm, IngredientFormSet, RecipeForm, SetupForm, StepFormSet
+from .forms import (
+    ImportRecipeForm,
+    IngredientFormSet,
+    RecipeForm,
+    RecipeRefinementForm,
+    SetupForm,
+    StepFormSet,
+)
 from .importing.extractors import detect_source_type
 from .importing.normalizer import estimate_nutrition
 from .models import (
@@ -30,6 +37,7 @@ from .models import (
     Category,
     ImportJob,
     Recipe,
+    RecipeRefinement,
     RecipeSlugAlias,
     StorePreference,
 )
@@ -466,6 +474,26 @@ def _recipe_form_context(request, instance=None):
     return recipe, form, ingredient_formset, step_formset
 
 
+def _recipe_refinement_context(recipe):
+    refinements = list(
+        recipe.refinements.select_related("requested_by").order_by("created_at", "pk")
+    )
+    active_refinement = next(
+        (
+            refinement
+            for refinement in reversed(refinements)
+            if refinement.status
+            in [RecipeRefinement.Status.PENDING, RecipeRefinement.Status.PROCESSING]
+        ),
+        None,
+    )
+    return {
+        "refinement_form": RecipeRefinementForm(),
+        "refinements": refinements,
+        "active_refinement": active_refinement,
+    }
+
+
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_create(request):
@@ -572,7 +600,53 @@ def recipe_update(request, slug):
             "ingredient_formset": ingredient_formset,
             "step_formset": step_formset,
             "is_create": False,
+            **_recipe_refinement_context(recipe),
         },
+    )
+
+
+@login_required
+@require_POST
+def recipe_refine(request, slug):
+    recipe, _ = _resolve_recipe_slug(
+        slug, Recipe.objects.filter(status=Recipe.Status.DRAFT)
+    )
+    form = RecipeRefinementForm(request.POST)
+    active_refinement = recipe.refinements.filter(
+        status__in=[
+            RecipeRefinement.Status.PENDING,
+            RecipeRefinement.Status.PROCESSING,
+        ]
+    ).exists()
+    if active_refinement:
+        messages.info(request, "Гермес уже перерабатывает этот рецепт.")
+    elif form.is_valid():
+        refinement = form.save(commit=False)
+        refinement.recipe = recipe
+        refinement.requested_by = request.user
+        refinement.expected_recipe_updated_at = recipe.updated_at
+        try:
+            with transaction.atomic():
+                refinement.save()
+        except IntegrityError:
+            messages.info(request, "Гермес уже перерабатывает этот рецепт.")
+        else:
+            messages.success(request, "Пожелание отправлено Гермесу.")
+    else:
+        messages.error(request, "Напишите пожелание к рецепту обычным текстом.")
+    return redirect(f'{reverse("recipe-update", args=[recipe.slug])}#agent-chat')
+
+
+@login_required
+def recipe_refinement_status(request, slug, pk):
+    recipe, _ = _resolve_recipe_slug(slug)
+    refinement = get_object_or_404(RecipeRefinement, pk=pk, recipe=recipe)
+    return JsonResponse(
+        {
+            "status": refinement.status,
+            "status_label": refinement.get_status_display(),
+            "error": refinement.error,
+        }
     )
 
 
@@ -674,10 +748,17 @@ def task_list(request):
     cart_runs = CartRun.objects.filter(requested_by=request.user).select_related(
         "recipe", "selected_attempt"
     )[:50]
+    refinements = RecipeRefinement.objects.filter(
+        requested_by=request.user
+    ).select_related("recipe").order_by("-created_at")[:50]
     return render(
         request,
         "recipes/task_list.html",
-        {"import_jobs": import_jobs, "cart_runs": cart_runs},
+        {
+            "import_jobs": import_jobs,
+            "refinements": refinements,
+            "cart_runs": cart_runs,
+        },
     )
 
 
