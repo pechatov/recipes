@@ -2,6 +2,7 @@ from unittest.mock import patch
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.db import DatabaseError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -12,6 +13,7 @@ from recipes.carting.pipeline import (
     process_cart_cleanup,
     process_cart_run,
 )
+from recipes.carting.browser_login import BrowserLoginError
 from recipes.carting.client import (
     STORE_INSTRUCTIONS,
     CartAgentError,
@@ -132,7 +134,105 @@ class CartViewTests(TestCase):
         start_session.assert_called_once_with(
             cart_browser_session_key(self.user.pk),
             15,
+            login_session.remote_session_id,
         )
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+        CART_BROWSER_LOGIN_MINUTES=15,
+    )
+    @patch("recipes.views.stop_browser_login_session")
+    @patch("recipes.views.start_browser_login_session")
+    def test_failed_start_releases_worker_only_after_confirmed_cleanup(
+        self,
+        start_session,
+        stop_session,
+    ):
+        start_session.side_effect = BrowserLoginError("start failed")
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+
+        self.client.post(reverse("cart-browser-login-start", args=[run.pk]))
+
+        login_session = BrowserLoginSession.objects.get()
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.FAILED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+        CART_BROWSER_LOGIN_MINUTES=15,
+    )
+    @patch("recipes.views.stop_browser_login_session")
+    @patch("recipes.views.start_browser_login_session")
+    def test_uncertain_start_cleanup_keeps_worker_blocked(
+        self,
+        start_session,
+        stop_session,
+    ):
+        start_session.side_effect = BrowserLoginError("start connection lost")
+        stop_session.side_effect = BrowserLoginError("controller unavailable")
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+
+        self.client.post(reverse("cart-browser-login-start", args=[run.pk]))
+
+        login_session = BrowserLoginSession.objects.get()
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.STARTING)
+        self.assertIn("start connection lost", login_session.error)
+        pending_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        self.assertIsNone(claim_cart_run())
+        pending_run.refresh_from_db()
+        self.assertEqual(pending_run.status, CartRun.Status.PENDING)
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+        CART_BROWSER_LOGIN_MINUTES=15,
+    )
+    @patch("recipes.views.stop_browser_login_session")
+    @patch("recipes.views.start_browser_login_session")
+    def test_finalize_failure_compensates_remote_session(
+        self,
+        start_session,
+        stop_session,
+    ):
+        original_save = BrowserLoginSession.save
+
+        def fail_active_save(instance, *args, **kwargs):
+            if (
+                instance.status == BrowserLoginSession.Status.ACTIVE
+                and kwargs.get("update_fields") == ["status"]
+            ):
+                raise DatabaseError("commit failed")
+            return original_save(instance, *args, **kwargs)
+
+        with patch.object(BrowserLoginSession, "save", new=fail_active_save):
+            self.client.post(reverse("browser-login-start"))
+
+        login_session = BrowserLoginSession.objects.get()
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.FAILED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
 
     @patch("recipes.views.issue_browser_login_access")
     def test_browser_login_page_embeds_one_time_access_path(self, issue_access):
@@ -580,6 +680,55 @@ class CartPipelineTests(TestCase):
         self.assertIsNone(claim_cart_run())
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.PENDING)
+
+    @patch("recipes.carting.coordination.stop_session")
+    def test_expired_login_still_blocks_when_remote_close_is_uncertain(self, stop_session):
+        stop_session.side_effect = BrowserLoginError("controller unavailable")
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        self.assertIsNone(claim_cart_run())
+
+        run.refresh_from_db()
+        login_session.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.ACTIVE)
+
+    @patch("recipes.carting.coordination.stop_session")
+    def test_expired_login_releases_worker_after_confirmed_close(self, stop_session):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        claimed = claim_cart_run()
+
+        login_session.refresh_from_db()
+        self.assertEqual(claimed, run)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.EXPIRED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
 
     @patch("recipes.carting.client.run_store_cart_task")
     def test_single_ingredient_keeps_legacy_agent_call(self, run_task):

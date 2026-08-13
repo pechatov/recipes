@@ -29,6 +29,13 @@ if (!controlKey || !hermesRoot || !hermesHome || !statePath || !Number.isInteger
 
 let activeSession = null;
 let startingSession = false;
+let controlMutationQueue = Promise.resolve();
+
+function serializeControlMutation(operation) {
+  const result = controlMutationQueue.then(operation, operation);
+  controlMutationQueue = result.catch(() => {});
+  return result;
+}
 
 function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString("base64url");
@@ -204,52 +211,68 @@ async function handleControl(request, response, url) {
   if (request.method === "POST" && url.pathname === "/v1/sessions") {
     const body = await readJson(request);
     const scope = String(body.scope || "");
+    const requestedSessionId = String(body.session_id || "");
     const lifetimeMinutes = Number(body.lifetime_minutes || 15);
-    if (!scopePattern.test(scope) || !Number.isInteger(lifetimeMinutes) || lifetimeMinutes < 5 || lifetimeMinutes > 30) {
+    if (!scopePattern.test(scope) || !idPattern.test(requestedSessionId) || !Number.isInteger(lifetimeMinutes) || lifetimeMinutes < 5 || lifetimeMinutes > 30) {
       return sendJson(response, 400, { error: "invalid_request" });
     }
-    if (startingSession || (activeSession && activeSession.expiresAt > Date.now())) {
-      return sendJson(response, 409, { error: "browser_busy" });
-    }
-    if (activeSession) await closeActiveSession();
-    startingSession = true;
-    try {
-      const identity = await camofoxIdentity(scope);
-      const sessionId = randomToken(24);
-      persistRecoveryState({ id: sessionId, userId: identity.user_id, scope });
-      try {
-        await openCamofox(identity);
-      } catch (error) {
-        await closeCamofoxUser(identity.user_id).catch(() => {});
-        clearRecoveryState();
-        throw error;
+    return serializeControlMutation(async () => {
+      if (startingSession || (activeSession && activeSession.expiresAt > Date.now())) {
+        return sendJson(response, 409, { error: "browser_busy" });
       }
-      const cookieToken = randomToken();
-      activeSession = {
-        id: sessionId,
-        scope,
-        userId: identity.user_id,
-        expiresAt: Date.now() + lifetimeMinutes * 60_000,
-        cookieDigest: digest(cookieToken),
-        cookieToken,
-        accessDigests: new Set(),
-      };
-    } finally {
-      startingSession = false;
-    }
-    return sendJson(response, 201, { session_id: activeSession.id });
+      if (activeSession) await closeActiveSession();
+      startingSession = true;
+      try {
+        const identity = await camofoxIdentity(scope);
+        persistRecoveryState({ id: requestedSessionId, userId: identity.user_id, scope });
+        try {
+          await openCamofox(identity);
+        } catch (openError) {
+          try {
+            await closeCamofoxUser(identity.user_id);
+          } catch (cleanupError) {
+            console.error("Ambiguous Camofox start could not be cleaned up", cleanupError);
+            process.nextTick(() => process.exit(1));
+            throw cleanupError;
+          }
+          clearRecoveryState();
+          throw openError;
+        }
+        const cookieToken = randomToken();
+        activeSession = {
+          id: requestedSessionId,
+          scope,
+          userId: identity.user_id,
+          expiresAt: Date.now() + lifetimeMinutes * 60_000,
+          cookieDigest: digest(cookieToken),
+          cookieToken,
+          accessDigests: new Set(),
+        };
+      } finally {
+        startingSession = false;
+      }
+      return sendJson(response, 201, { session_id: activeSession.id });
+    });
   }
 
   const match = url.pathname.match(/^\/v1\/sessions\/([A-Za-z0-9_-]{20,128})(?:\/(access))?$/);
   if (!match || !idPattern.test(match[1])) return sendJson(response, 404, { error: "not_found" });
-  const session = currentSession(match[1]);
-  if (!session) return sendJson(response, 404, { error: "not_found" });
   if (request.method === "POST" && match[2] === "access") {
+    const session = currentSession(match[1]);
+    if (!session) return sendJson(response, 404, { error: "not_found" });
     return sendJson(response, 201, { access_path: issueAccess(session) });
   }
   if (request.method === "DELETE" && !match[2]) {
-    await closeActiveSession(match[1]);
-    return sendJson(response, 200, { status: "saved" });
+    return serializeControlMutation(async () => {
+      if (activeSession && activeSession.id !== match[1]) {
+        return sendJson(response, 409, { error: "browser_busy" });
+      }
+      if (!activeSession) {
+        return sendJson(response, 404, { error: "not_found" });
+      }
+      await closeActiveSession(match[1]);
+      return sendJson(response, 200, { status: "saved" });
+    });
   }
   return sendJson(response, 405, { error: "method_not_allowed" });
 }
@@ -319,7 +342,8 @@ server.on("upgrade", (request, socket, head) => {
 
 setInterval(() => {
   if (activeSession && activeSession.expiresAt <= Date.now()) {
-    closeActiveSession().catch((error) => console.error("Failed to expire browser login session", error));
+    serializeControlMutation(() => closeActiveSession())
+      .catch((error) => console.error("Failed to expire browser login session", error));
   }
 }, 15_000).unref();
 

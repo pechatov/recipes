@@ -30,6 +30,10 @@ from .carting.browser_login import (
     stop_session as stop_browser_login_session,
 )
 from .carting.client import cart_browser_session_key
+from .carting.coordination import (
+    BROWSER_BLOCKING_STATUSES,
+    reconcile_expired_browser_login_sessions,
+)
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import (
     ImportRecipeForm,
@@ -442,6 +446,32 @@ def _resume_cart_run_after_login(run: CartRun) -> None:
     run.finished_at = None
     run.error = ""
     run.save(update_fields=fields)
+
+
+def _record_browser_login_start_failure(
+    login_session_id: int,
+    error: Exception,
+    *,
+    cleanup_confirmed: bool,
+) -> None:
+    """Record failure without releasing the worker lock after uncertain cleanup."""
+    try:
+        with transaction.atomic():
+            acquire_application_lock(CART_BROWSER_LOCK)
+            login_session = BrowserLoginSession.objects.select_for_update().get(
+                pk=login_session_id
+            )
+            login_session.error = str(error)[:500]
+            fields = ["error"]
+            if cleanup_confirmed:
+                login_session.status = BrowserLoginSession.Status.FAILED
+                login_session.finished_at = timezone.now()
+                fields.extend(["status", "finished_at"])
+            login_session.save(update_fields=fields)
+    except Exception:
+        # If the database is unavailable, the previously committed STARTING
+        # row remains the conservative state and keeps the worker blocked.
+        return
 
 
 @login_required
@@ -1226,15 +1256,18 @@ def browser_login_start(request, pk=None):
         return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
 
     now = timezone.now()
+    remote_session_id = secrets.token_urlsafe(24)
     with transaction.atomic():
         acquire_application_lock(CART_BROWSER_LOCK)
-        BrowserLoginSession.objects.filter(
-            status__in=[BrowserLoginSession.Status.STARTING, BrowserLoginSession.Status.ACTIVE],
-            expires_at__lte=now,
-        ).update(status=BrowserLoginSession.Status.EXPIRED, finished_at=now)
+        recovery_ready = reconcile_expired_browser_login_sessions()
+        if not recovery_ready:
+            messages.error(
+                request,
+                "Браузер ещё восстанавливается после прошлой сессии. Попробуйте позже.",
+            )
+            return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
         active = BrowserLoginSession.objects.select_for_update().filter(
-            status__in=[BrowserLoginSession.Status.STARTING, BrowserLoginSession.Status.ACTIVE],
-            expires_at__gt=now,
+            status__in=BROWSER_BLOCKING_STATUSES,
         ).first()
         if active:
             if active.user_id != request.user.id:
@@ -1264,22 +1297,66 @@ def browser_login_start(request, pk=None):
         login_session = BrowserLoginSession.objects.create(
             user=request.user,
             run=run,
+            remote_session_id=remote_session_id,
             expires_at=expires_at,
         )
+
+    try:
+        start_browser_login_session(
+            cart_browser_session_key(request.user.id),
+            settings.CART_BROWSER_LOGIN_MINUTES,
+            remote_session_id,
+        )
+    except BrowserLoginError as error:
+        cleanup_confirmed = False
         try:
-            login_session.remote_session_id = start_browser_login_session(
-                cart_browser_session_key(request.user.id),
-                settings.CART_BROWSER_LOGIN_MINUTES,
-            )
-        except BrowserLoginError as error:
-            login_session.status = BrowserLoginSession.Status.FAILED
-            login_session.error = str(error)[:500]
-            login_session.finished_at = timezone.now()
-            login_session.save(update_fields=["status", "error", "finished_at"])
+            stop_browser_login_session(remote_session_id)
+            cleanup_confirmed = True
+        except BrowserLoginError:
+            pass
+        _record_browser_login_start_failure(
+            login_session.pk,
+            error,
+            cleanup_confirmed=cleanup_confirmed,
+        )
+        if cleanup_confirmed:
             messages.error(request, str(error))
-            return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
-        login_session.status = BrowserLoginSession.Status.ACTIVE
-        login_session.save(update_fields=["remote_session_id", "status"])
+        else:
+            messages.error(
+                request,
+                "Запуск браузера завершился неопределённо. Новые операции с "
+                "корзиной заблокированы до автоматического восстановления.",
+            )
+        return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
+
+    try:
+        with transaction.atomic():
+            acquire_application_lock(CART_BROWSER_LOCK)
+            login_session = BrowserLoginSession.objects.select_for_update().get(
+                pk=login_session.pk,
+                status=BrowserLoginSession.Status.STARTING,
+            )
+            login_session.status = BrowserLoginSession.Status.ACTIVE
+            login_session.save(update_fields=["status"])
+    except Exception as error:
+        cleanup_confirmed = False
+        try:
+            stop_browser_login_session(remote_session_id)
+            cleanup_confirmed = True
+        except BrowserLoginError:
+            pass
+        _record_browser_login_start_failure(
+            login_session.pk,
+            error,
+            cleanup_confirmed=cleanup_confirmed,
+        )
+        messages.error(
+            request,
+            "Браузер был закрыт после ошибки сохранения. Попробуйте ещё раз."
+            if cleanup_confirmed
+            else "Не удалось подтвердить закрытие браузера; сборка временно заблокирована.",
+        )
+        return redirect("cart-detail", pk=run.pk) if run else redirect("store-preferences")
     return redirect("browser-login", pk=login_session.pk)
 
 
@@ -1294,10 +1371,13 @@ def browser_login(request, pk):
         messages.error(request, "Это окно входа уже закрыто.")
         return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
     if login_session.expires_at <= timezone.now():
-        login_session.status = BrowserLoginSession.Status.EXPIRED
-        login_session.finished_at = timezone.now()
-        login_session.save(update_fields=["status", "finished_at"])
-        messages.error(request, "Время ручного входа истекло. Запустите его ещё раз.")
+        with transaction.atomic():
+            acquire_application_lock(CART_BROWSER_LOCK)
+            recovery_ready = reconcile_expired_browser_login_sessions()
+        if recovery_ready:
+            messages.error(request, "Время ручного входа истекло. Запустите его ещё раз.")
+        else:
+            messages.error(request, "Сессия истекла, но браузер ещё безопасно закрывается.")
         return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
     try:
         browser_url = issue_browser_login_access(login_session.remote_session_id)

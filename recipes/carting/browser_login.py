@@ -62,13 +62,21 @@ def _validated_session_id(value: Any) -> str:
     return session_id
 
 
-def start_session(scope: str, lifetime_minutes: int) -> str:
+def start_session(scope: str, lifetime_minutes: int, session_id: str) -> str:
+    session_id = _validated_session_id(session_id)
     data = _request(
         "POST",
         "/v1/sessions",
-        payload={"scope": scope, "lifetime_minutes": lifetime_minutes},
+        payload={
+            "scope": scope,
+            "lifetime_minutes": lifetime_minutes,
+            "session_id": session_id,
+        },
     )
-    return _validated_session_id(data.get("session_id"))
+    returned_id = _validated_session_id(data.get("session_id"))
+    if returned_id != session_id:
+        raise BrowserLoginError("Сервис браузера вернул чужой идентификатор сессии.")
+    return returned_id
 
 
 def issue_access(session_id: str) -> str:

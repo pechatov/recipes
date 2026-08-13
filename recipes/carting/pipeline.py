@@ -9,10 +9,14 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from recipes.models import BrowserLoginSession, CartAttempt, CartItemMatch, CartRun
+from recipes.models import CartAttempt, CartItemMatch, CartRun
 from recipes.locking import CART_BROWSER_LOCK, acquire_application_lock
 
 from .client import CartAgentError, assemble_store_cart, cleanup_store_cart
+from .coordination import (
+    browser_login_session_blocks_worker,
+    reconcile_expired_browser_login_sessions,
+)
 
 
 AGENT_STATUSES = {
@@ -472,6 +476,8 @@ def expire_unconfirmed_cart_runs() -> int:
 def claim_cleanup_run():
     with transaction.atomic():
         acquire_application_lock(CART_BROWSER_LOCK)
+        if not reconcile_expired_browser_login_sessions():
+            return None
         run = (
             CartRun.objects.select_for_update(skip_locked=True)
             .filter(status=CartRun.Status.CLEANUP_PENDING)
@@ -480,13 +486,7 @@ def claim_cleanup_run():
         )
         if not run:
             return None
-        if BrowserLoginSession.objects.filter(
-            status__in=[
-                BrowserLoginSession.Status.STARTING,
-                BrowserLoginSession.Status.ACTIVE,
-            ],
-            expires_at__gt=timezone.now(),
-        ).exists():
+        if browser_login_session_blocks_worker():
             return None
         if CartRun.objects.filter(
             status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING]
@@ -539,6 +539,8 @@ def process_cart_cleanup(run: CartRun) -> None:
 def claim_cart_run():
     with transaction.atomic():
         acquire_application_lock(CART_BROWSER_LOCK)
+        if not reconcile_expired_browser_login_sessions():
+            return None
         run = (
             CartRun.objects.select_for_update(skip_locked=True)
             .filter(status=CartRun.Status.PENDING)
@@ -548,14 +550,8 @@ def claim_cart_run():
         if not run:
             return None
         # A human and the agent must never drive the shared Camofox process at
-        # the same time. Expired controller sessions no longer hold this lock.
-        if BrowserLoginSession.objects.filter(
-            status__in=[
-                BrowserLoginSession.Status.STARTING,
-                BrowserLoginSession.Status.ACTIVE,
-            ],
-            expires_at__gt=timezone.now(),
-        ).exists():
+        # the same time. Even expired rows block until remote close is confirmed.
+        if browser_login_session_blocks_worker():
             return None
         # One persistent browser profile must not be shared by concurrent jobs.
         if CartRun.objects.filter(
