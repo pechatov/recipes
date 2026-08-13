@@ -1,6 +1,8 @@
 {% extends "base.html" %}
+{% load tz %}
 {% block title %}Текущие задачи · Домашние рецепты{% endblock %}
 {% block content %}
+  {% timezone "Europe/Moscow" %}
   {% if active_task_count %}<meta http-equiv="refresh" content="5">{% endif %}
   <header class="page-heading split-heading">
     <div>
@@ -81,4 +83,5 @@
       {% endif %}
     </section>
   </div>
+  {% endtimezone %}
 {% endblock %}

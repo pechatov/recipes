@@ -87,7 +87,9 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 LANGUAGE_CODE = "ru-ru"
-TIME_ZONE = os.environ.get("TIME_ZONE", "Europe/Moscow")
+# This is a Moscow-based household app. Keep the presentation timezone stable
+# even when the container or its environment is configured for UTC.
+TIME_ZONE = "Europe/Moscow"
 USE_I18N = True
 USE_TZ = True
 

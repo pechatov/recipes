@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
 from recipes.forms import IngredientForm
@@ -995,7 +995,8 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "Как приготовить домашний борщ")
         self.assertNotContains(response, job.source_url)
 
-    def test_task_list_displays_dates_in_moscow_time(self):
+    @override_settings(TIME_ZONE="UTC")
+    def test_task_list_displays_dates_in_moscow_time_even_if_runtime_uses_utc(self):
         job = ImportJob.objects.create(
             source_url="https://example.com/moscow-time",
             source_type=ImportJob.SourceType.WEBSITE,

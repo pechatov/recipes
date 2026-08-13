@@ -69,7 +69,6 @@ if [[ ! -f "$app_root/.env" ]]; then
     printf 'DEBUG=false\n'
     printf 'ALLOWED_HOSTS=%s\n' "$public_hosts"
     printf 'CSRF_TRUSTED_ORIGINS=%s\n' "$csrf_origins"
-    printf 'TIME_ZONE=Europe/Moscow\n'
     printf 'COOKIE_SECURE=true\n'
     printf 'SECURE_SSL_REDIRECT=false\n'
     printf 'SECURE_HSTS_SECONDS=0\n'
