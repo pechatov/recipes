@@ -382,6 +382,12 @@ class ImportJob(models.Model):
         related_name="recipe_imports",
     )
     source_title = models.CharField("название источника", max_length=300, blank=True)
+    source_title_checked_at = models.DateTimeField(
+        "последняя проверка названия источника",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
     error = models.TextField("ошибка", blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
