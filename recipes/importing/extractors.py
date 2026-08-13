@@ -22,6 +22,8 @@ from .exceptions import SourceError
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CHARS = 60_000
+MAX_TRANSCRIPT_SEGMENTS = 1_200
+MAX_TRANSCRIPT_JSON_BYTES = 120_000
 MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
@@ -39,6 +41,7 @@ class SourceDocument:
     step_image_urls: tuple[str, ...] = ()
     recipe_cover_image_urls: tuple[tuple[str, ...], ...] = ()
     recipe_step_image_urls: tuple[tuple[str, ...], ...] = ()
+    transcript_segments: tuple[dict[str, Any], ...] = ()
 
     @property
     def all_structured_recipes(self) -> tuple[dict[str, Any], ...]:
@@ -69,6 +72,45 @@ def youtube_video_id(url: str) -> str | None:
 
 def detect_source_type(url: str) -> str:
     return "youtube" if youtube_video_id(url) else "website"
+
+
+def _fit_transcript_segment(
+    start_seconds: int,
+    text: str,
+    max_json_bytes: int,
+) -> tuple[dict[str, Any] | None, int]:
+    """Fit the longest text prefix whose serialized segment stays in budget."""
+    if not text or max_json_bytes <= 0:
+        return None, 0
+
+    def serialized(prefix: str) -> tuple[dict[str, Any], int]:
+        segment = {"start_seconds": start_seconds, "text": prefix}
+        size = len(
+            json.dumps(segment, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        return segment, size
+
+    segment, size = serialized(text)
+    if size <= max_json_bytes:
+        return segment, size
+
+    low = 0
+    high = len(text)
+    best_segment = None
+    best_size = 0
+    while low <= high:
+        middle = (low + high) // 2
+        candidate, candidate_size = serialized(text[:middle])
+        if candidate_size <= max_json_bytes:
+            if middle:
+                best_segment = candidate
+                best_size = candidate_size
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best_segment, best_size
 
 
 def _resolve_public_url(url: str):
@@ -486,7 +528,36 @@ def extract_youtube(
             "У видео нет доступных русских или английских субтитров. "
             "Автоматическое распознавание аудио пока не подключено."
         ) from error
-    text = " ".join(snippet.text.strip() for snippet in transcript if snippet.text.strip())
+    transcript_segments = []
+    transcript_chars = 0
+    transcript_json_bytes = 2  # Opening and closing brackets of the JSON array.
+    for snippet in transcript:
+        snippet_text = " ".join(snippet.text.split())
+        if not snippet_text:
+            continue
+        remaining_chars = MAX_SOURCE_CHARS - transcript_chars
+        if remaining_chars <= 0:
+            break
+        snippet_text = snippet_text[:remaining_chars]
+        separator_bytes = 1 if transcript_segments else 0
+        if len(transcript_segments) >= MAX_TRANSCRIPT_SEGMENTS:
+            break
+        available_json_bytes = (
+            MAX_TRANSCRIPT_JSON_BYTES - transcript_json_bytes - separator_bytes
+        )
+        segment, segment_json_bytes = _fit_transcript_segment(
+            max(0, int(snippet.start)),
+            snippet_text,
+            available_json_bytes,
+        )
+        if segment is None:
+            break
+        transcript_segments.append(segment)
+        transcript_chars += len(segment["text"]) + 1
+        transcript_json_bytes += separator_bytes + segment_json_bytes
+        if segment["text"] != snippet_text:
+            break
+    text = " ".join(segment["text"] for segment in transcript_segments)
     if len(text) < 80:
         raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
     return SourceDocument(
@@ -500,6 +571,7 @@ def extract_youtube(
             f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
             f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         ),
+        transcript_segments=tuple(transcript_segments),
     )
 
 

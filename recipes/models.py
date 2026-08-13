@@ -326,6 +326,12 @@ class RecipeStep(models.Model):
         validators=[validate_recipe_image],
     )
     image_imported = models.BooleanField(default=False, editable=False)
+    video_timestamp_seconds = models.PositiveIntegerField(
+        "тайм-код видео, секунды",
+        null=True,
+        blank=True,
+        editable=False,
+    )
     order = models.PositiveSmallIntegerField(default=0)
 
     class Meta:
@@ -335,6 +341,16 @@ class RecipeStep(models.Model):
 
     def __str__(self):
         return self.title or f"Шаг {self.order + 1}"
+
+    @property
+    def video_timestamp_label(self):
+        if self.video_timestamp_seconds is None:
+            return ""
+        hours, remainder = divmod(self.video_timestamp_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
 
 class ImportJob(models.Model):

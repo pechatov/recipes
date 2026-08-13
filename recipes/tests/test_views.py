@@ -171,6 +171,41 @@ class RecipeViewTests(TestCase):
         self.assertEqual(str(response.context["recipe"].proteins_per_serving), "2.8")
         self.assertEqual(str(response.context["recipe"].fats_per_100g), "20.0")
 
+    def test_youtube_import_embeds_video_and_links_step_to_timestamp(self):
+        self.recipe.source_url = "https://youtu.be/dQw4w9WgXcQ"
+        self.recipe.save(update_fields=["source_url", "updated_at"])
+        step = self.recipe.steps.get()
+        step.video_timestamp_seconds = 95
+        step.save(update_fields=["video_timestamp_seconds"])
+        ImportJob.objects.create(
+            source_url=self.recipe.source_url,
+            source_type=ImportJob.SourceType.YOUTUBE,
+            status=ImportJob.Status.COMPLETED,
+            recipe=self.recipe,
+            requested_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertContains(
+            response,
+            'data-embed-url="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"',
+        )
+        self.assertContains(response, "data-recipe-video-disclosure")
+        self.assertContains(response, 'class="recipe-video-toggle"')
+        self.assertContains(response, 'data-video-start="95"')
+        self.assertContains(response, "Смотреть с 01:35")
+        self.assertContains(response, "recipes/recipe-video.js")
+
+    def test_non_youtube_recipe_does_not_render_video_player(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertNotContains(response, "data-recipe-video")
+        self.assertNotContains(response, "recipes/recipe-video.js")
+
     def test_recipe_slug_transliterates_russian_title(self):
         self.assertEqual(self.recipe.slug, "semeynaya-pasta")
         self.assertTrue(self.recipe.slug.isascii())

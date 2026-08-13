@@ -544,6 +544,12 @@ def save_draft(
         }
     recipe_data = normalize_recipes(data)
     prepared_images = _prepare_images(document, recipe_data)
+    allowed_video_timestamps = {
+        segment["start_seconds"]
+        for segment in (document.transcript_segments if document else ())
+        if isinstance(segment, dict)
+        and isinstance(segment.get("start_seconds"), int)
+    }
     new_files: list[tuple[Any, str]] = []
     old_files: list[tuple[Any, str]] = []
     try:
@@ -645,6 +651,12 @@ def save_draft(
                     step_values = {
                         key: value for key, value in step.items() if key != "image_url"
                     }
+                    if (
+                        locked_job.source_type != ImportJob.SourceType.YOUTUBE
+                        or step_values.get("video_timestamp_seconds")
+                        not in allowed_video_timestamps
+                    ):
+                        step_values["video_timestamp_seconds"] = None
                     recipe_step = RecipeStep(recipe=recipe, order=index, **step_values)
                     step_image = step_images[index]
                     if step_image:

@@ -24,6 +24,18 @@ def _integer(value: Any, default: int, maximum: int) -> int:
     return max(0, min(number, maximum))
 
 
+def _optional_integer(value: Any, maximum: int) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or number > maximum:
+        return None
+    return number
+
+
 def _quantity(value: Any) -> str | None:
     if value is None or value == "":
         return None
@@ -298,6 +310,11 @@ def normalize_recipe(
                         _text(item.get("image_url"), 2048)
                         if isinstance(item, dict)
                         else ""
+                    ),
+                    "video_timestamp_seconds": (
+                        _optional_integer(item.get("video_timestamp_seconds"), 604800)
+                        if isinstance(item, dict)
+                        else None
                     ),
                 }
             )
