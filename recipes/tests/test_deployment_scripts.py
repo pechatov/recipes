@@ -45,3 +45,17 @@ class BrowserLoginDeploymentContractTests(SimpleTestCase):
             issue_access.index("session.accessDigests.clear()"),
             issue_access.index("session.accessDigests.add"),
         )
+
+    def test_browser_proxy_forwards_only_its_dedicated_cookie(self):
+        script = (ROOT / "scripts/deploy/configure-npm-proxy.sh").read_text()
+
+        begin = script.index("location /browser-login/ {")
+        end = script.index("location / {", begin)
+        browser_location = script[begin:end]
+
+        self.assertIn(
+            'proxy_set_header Cookie "recipes_browser_login='
+            '\\$cookie_recipes_browser_login";',
+            browser_location,
+        )
+        self.assertNotIn("$http_cookie", browser_location)
