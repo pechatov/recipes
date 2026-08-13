@@ -2,6 +2,8 @@ from django.contrib import admin
 
 from .forms import IngredientForm, RecipeForm, StepForm
 from .models import (
+    ApplicationLock,
+    BrowserLoginSession,
     CartAttempt,
     CartItemMatch,
     CartRun,
@@ -11,6 +13,7 @@ from .models import (
     RecipeIngredient,
     RecipeSlugAlias,
     RecipeStep,
+    RegistrationInvite,
     StorePreference,
 )
 
@@ -96,3 +99,40 @@ class CartRunAdmin(admin.ModelAdmin):
     list_display = ("recipe", "requested_by", "status", "created_at", "finished_at")
     list_filter = ("status",)
     readonly_fields = ("created_at", "started_at", "finished_at", "ingredient_snapshot")
+
+
+@admin.register(BrowserLoginSession)
+class BrowserLoginSessionAdmin(admin.ModelAdmin):
+    list_display = ("user", "run", "status", "created_at", "expires_at", "finished_at")
+    list_filter = ("status",)
+    readonly_fields = (
+        "user",
+        "run",
+        "remote_session_id",
+        "status",
+        "error",
+        "created_at",
+        "expires_at",
+        "finished_at",
+    )
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RegistrationInvite)
+class RegistrationInviteAdmin(admin.ModelAdmin):
+    list_display = ("created_by", "registered_user", "is_open", "created_at", "expires_at", "used_at", "closed_at")
+    readonly_fields = ("token_digest", "created_by", "registered_user", "is_open", "created_at", "expires_at", "used_at", "closed_at")
+
+
+@admin.register(ApplicationLock)
+class ApplicationLockAdmin(admin.ModelAdmin):
+    list_display = ("name",)
+    readonly_fields = ("name",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

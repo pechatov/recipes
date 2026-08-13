@@ -397,6 +397,22 @@ input[type="file"]::file-selector-button:hover { color: var(--accent); border-co
 .reprocess-form { margin-top: 22px; }
 
 .auth-card { width: min(500px, 100%); margin: 50px auto; padding: clamp(28px, 5vw, 48px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--raised); box-shadow: var(--shadow); }
+.browser-connection-card, .browser-login-card { margin-bottom: 24px; padding: clamp(20px, 4vw, 32px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--raised); box-shadow: var(--shadow); }
+.access-card { max-width: 760px; padding: clamp(24px, 4vw, 40px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--raised); box-shadow: var(--shadow); }
+.access-card h2 { margin-top: 0; }
+.access-card input[type="url"] { width: 100%; }
+.browser-connection-card { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.browser-connection-card h2 { margin: 4px 0 8px; }
+.browser-connection-card p:last-child { margin-bottom: 0; }
+.browser-login-heading { margin-bottom: 20px; }
+.browser-login-card { padding: 12px; }
+.browser-login-frame { display: block; width: 100%; height: min(72vh, 900px); min-height: 520px; border: 0; border-radius: calc(var(--radius) - 6px); background: #111; }
+.browser-login-actions { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 16px 8px 4px; }
+.browser-login-actions p { margin: 0; }
+@media (max-width: 720px) {
+  .browser-connection-card, .browser-login-actions { align-items: stretch; flex-direction: column; }
+  .browser-login-frame { height: 68vh; min-height: 420px; }
+}
 .auth-card h1 { font-size: 44px; }
 .stack-form { display: grid; gap: 18px; margin-top: 28px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
