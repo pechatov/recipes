@@ -206,7 +206,7 @@ server {
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header Cookie "recipes_browser_login=\$cookie_recipes_browser_login";
     proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection \"upgrade\";
+    proxy_set_header Connection "upgrade";
     proxy_http_version 1.1;
     proxy_read_timeout 3600s;
     proxy_send_timeout 3600s;
