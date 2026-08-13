@@ -3,12 +3,12 @@
   const player = document.querySelector("[data-recipe-video]");
   if (!disclosure || !player) return;
 
-  function showVideo(seconds = null, autoplay = false) {
+  function showVideo(seconds = null, autoplay = false, forceReload = false) {
     const parameters = new URLSearchParams({ rel: "0" });
     if (seconds !== null) parameters.set("start", String(seconds));
     if (autoplay) parameters.set("autoplay", "1");
     const source = `${player.dataset.embedUrl}?${parameters}`;
-    if (player.src !== source) player.src = source;
+    if (forceReload || player.src !== source) player.src = source;
   }
 
   disclosure.addEventListener("toggle", () => {
@@ -24,7 +24,7 @@
 
     event.preventDefault();
     disclosure.open = true;
-    showVideo(seconds, true);
+    showVideo(seconds, true, true);
     requestAnimationFrame(() => {
       disclosure.scrollIntoView({
         behavior: "smooth",

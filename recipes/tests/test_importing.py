@@ -121,6 +121,29 @@ class ExtractorTests(TestCase):
         self.assertLess(len(size_limited.transcript_segments), MAX_TRANSCRIPT_SEGMENTS)
         self.assertLessEqual(len(serialized), MAX_TRANSCRIPT_JSON_BYTES)
 
+    @patch(
+        "recipes.importing.extractors._fetch_youtube_title",
+        return_value="Рецепт с длинным сегментом",
+    )
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_truncates_multibyte_segment_to_json_budget(
+        self, fetch, _fetch_title
+    ):
+        fetch.return_value = [Mock(text="я" * 60_000, start=12.5)]
+
+        document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        serialized = json.dumps(
+            document.transcript_segments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.assertEqual(len(document.transcript_segments), 1)
+        self.assertEqual(document.transcript_segments[0]["start_seconds"], 12)
+        self.assertGreater(len(document.transcript_segments[0]["text"]), 80)
+        self.assertLess(len(document.transcript_segments[0]["text"]), 60_000)
+        self.assertLessEqual(len(serialized), MAX_TRANSCRIPT_JSON_BYTES)
+
     @patch("recipes.importing.extractors._open_public_url")
     def test_fetches_youtube_title_from_oembed(self, open_url):
         response = MagicMock()
