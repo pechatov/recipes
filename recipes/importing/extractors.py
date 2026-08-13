@@ -6,6 +6,8 @@ import json
 import re
 import socket
 import ssl
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +27,7 @@ MAX_TRANSCRIPT_JSON_BYTES = 120_000
 MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
+YOUTUBE_OEMBED_PROBE_VIDEO_ID = "dQw4w9WgXcQ"
 
 
 @dataclass(frozen=True)
@@ -179,6 +182,13 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep the trusted YouTube oEmbed request on its fixed HTTPS endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 @contextmanager
 def _open_public_url(url: str, *, headers: dict[str, str], timeout: float):
     parsed, pinned_ip = _resolve_public_url(url)
@@ -292,11 +302,17 @@ def _fetch_youtube_title(video_id: str) -> str:
         }
     )
     url = f"https://www.youtube.com/oembed?{params}"
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
     try:
-        with _open_public_url(url, headers=headers, timeout=5) as response:
-            if response.status != 200:
-                return ""
+        # The oEmbed host is a fixed application endpoint, not a user-supplied
+        # destination. Use the platform resolver here so DNS proxy/fake-IP
+        # setups can route it. Redirects are forbidden so the request cannot
+        # leave this trusted HTTPS endpoint; user URLs still use _open_public_url.
+        opener = urllib.request.build_opener(_RejectRedirectHandler())
+        with opener.open(request, timeout=5) as response:
             if "json" not in response.headers.get("content-type", "").lower():
                 return ""
             content = response.read(MAX_TITLE_BYTES + 1)
@@ -306,11 +322,10 @@ def _fetch_youtube_title(video_id: str) -> str:
         title = payload.get("title", "") if isinstance(payload, dict) else ""
         return " ".join(str(title).split())[:300]
     except (
-        json.JSONDecodeError,
-        OSError,
         http.client.HTTPException,
-        ssl.SSLError,
-        SourceError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+        OSError,
     ):
         return ""
 

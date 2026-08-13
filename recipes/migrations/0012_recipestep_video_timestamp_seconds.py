@@ -2,7 +2,7 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-    dependencies = [("recipes", "0010_recipe_macros_and_ascii_slugs")]
+    dependencies = [("recipes", "0011_importjob_source_title_checked_at")]
 
     operations = [
         migrations.AddField(
