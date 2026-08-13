@@ -578,20 +578,13 @@ class PipelineTests(TestCase):
         )
         recipe.title = "Свежая ручная правка"
         recipe.save(update_fields=["title", "updated_at"])
-        refine_with_ai.return_value = {
-            "title": "Ответ Гермеса",
-            "categories": ["main-course"],
-            "ingredients": [
-                {"name": "Картофель", "quantity": 400, "unit": "г"}
-            ],
-            "steps": [{"instruction": "Запечь."}],
-        }
 
         with self.assertRaisesRegex(ImportPipelineError, "изменился"):
             process_recipe_refinement(refinement)
 
         recipe.refresh_from_db()
         self.assertEqual(recipe.title, "Свежая ручная правка")
+        refine_with_ai.assert_not_called()
 
     def test_import_worker_claims_a_pending_refinement(self):
         user = get_user_model().objects.create_user("worker-refinement-owner")

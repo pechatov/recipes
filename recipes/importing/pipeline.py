@@ -889,6 +889,11 @@ def process_recipe_refinement(refinement: RecipeRefinement) -> Recipe:
     )
     if recipe.status != Recipe.Status.DRAFT:
         raise ImportPipelineError("Перерабатывать через чат можно только черновики.")
+    if recipe.updated_at != refinement.expected_recipe_updated_at:
+        raise ImportPipelineError(
+            "Черновик изменился до начала обработки. Пожелание не отправлено "
+            "Гермесу, чтобы не расходовать ресурсы на устаревшую версию."
+        )
     if recipe.steps.filter(image_imported=False).exclude(image="").exists():
         raise ImportPipelineError(
             "В черновике есть фотографии шагов, добавленные вручную. "
