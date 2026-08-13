@@ -260,6 +260,30 @@ class RecipeViewTests(TestCase):
 
         self.assertEqual(response.json()["status"], RecipeRefinement.Status.PROCESSING)
 
+    def test_refinement_status_remains_available_after_recipe_is_published(self):
+        self.recipe.status = Recipe.Status.DRAFT
+        self.recipe.save(update_fields=["status", "updated_at"])
+        refinement = RecipeRefinement.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            prompt="Сделай быстрее",
+            expected_recipe_updated_at=self.recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+        )
+        self.recipe.status = Recipe.Status.PUBLISHED
+        self.recipe.save(update_fields=["status", "updated_at"])
+        self.client.force_login(self.user)
+
+        response = self.client.get(
+            reverse(
+                "recipe-refinement-status",
+                args=[self.recipe.slug, refinement.pk],
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], RecipeRefinement.Status.PROCESSING)
+
     def test_other_user_cannot_refine_or_poll_private_draft(self):
         self.recipe.status = Recipe.Status.DRAFT
         self.recipe.save(update_fields=["status", "updated_at"])

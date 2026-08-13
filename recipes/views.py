@@ -679,11 +679,15 @@ def _recipe_refinement_context(recipe):
     }
 
 
-def _recipes_refinable_by(user):
-    recipes = Recipe.objects.filter(status=Recipe.Status.DRAFT)
+def _recipes_owned_by(user):
+    recipes = Recipe.objects.all()
     if user.is_staff or user.is_superuser:
         return recipes
     return recipes.filter(created_by=user)
+
+
+def _recipes_refinable_by(user):
+    return _recipes_owned_by(user).filter(status=Recipe.Status.DRAFT)
 
 
 def _can_refine_recipe(user, recipe):
@@ -841,7 +845,7 @@ def recipe_refine(request, slug):
 
 @login_required
 def recipe_refinement_status(request, slug, pk):
-    recipe, _ = _resolve_recipe_slug(slug, _recipes_refinable_by(request.user))
+    recipe, _ = _resolve_recipe_slug(slug, _recipes_owned_by(request.user))
     refinement = get_object_or_404(RecipeRefinement, pk=pk, recipe=recipe)
     return JsonResponse(
         {
