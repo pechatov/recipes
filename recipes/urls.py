@@ -30,6 +30,12 @@ urlpatterns = [
     path("recipes/new/", views.recipe_create, name="recipe-create"),
     path("recipes/<str:slug>/", views.recipe_detail, name="recipe-detail"),
     path("recipes/<str:slug>/edit/", views.recipe_update, name="recipe-update"),
+    path("recipes/<str:slug>/refine/", views.recipe_refine, name="recipe-refine"),
+    path(
+        "recipes/<str:slug>/refinements/<int:pk>/status/",
+        views.recipe_refinement_status,
+        name="recipe-refinement-status",
+    ),
     path("recipes/<str:slug>/publish/", views.recipe_publish, name="recipe-publish"),
     path("recipes/<str:slug>/delete/", views.recipe_delete, name="recipe-delete"),
     path("recipes/<str:slug>/shopping/", views.shopping_list, name="shopping-list"),

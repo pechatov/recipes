@@ -11,7 +11,7 @@ from django.contrib.auth import get_user_model, login
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.postgres.search import TrigramWordSimilarity
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Case, FloatField, IntegerField, Max, Q, Value, When
 from django.db.models.functions import Coalesce, Greatest
 from django.http import FileResponse, Http404, JsonResponse
@@ -41,6 +41,7 @@ from .forms import (
     ImportRecipeForm,
     IngredientFormSet,
     RecipeForm,
+    RecipeRefinementForm,
     RegistrationForm,
     SetupForm,
     StepFormSet,
@@ -59,6 +60,7 @@ from .models import (
     Category,
     ImportJob,
     Recipe,
+    RecipeRefinement,
     RecipeSlugAlias,
     RegistrationInvite,
     StorePreference,
@@ -72,6 +74,7 @@ MAX_SEARCH_FRAGMENTS_PER_TOKEN = 4
 MAX_SEARCH_QUERY_LENGTH = 120
 MAX_SEARCH_TOKEN_LENGTH = 32
 MAX_SEARCH_TOKENS = 8
+REFINEMENT_HISTORY_LIMIT = 50
 SEARCH_FIELDS = (
     "title",
     "description",
@@ -646,6 +649,54 @@ def _recipe_form_context(request, instance=None):
     return recipe, form, ingredient_formset, step_formset
 
 
+def _recipe_refinement_context(recipe):
+    active_refinement = (
+        recipe.refinements.select_related("requested_by")
+        .filter(
+            status__in=[
+                RecipeRefinement.Status.PENDING,
+                RecipeRefinement.Status.PROCESSING,
+            ]
+        )
+        .order_by("-created_at", "-pk")
+        .first()
+    )
+    history = recipe.refinements.select_related("requested_by")
+    if active_refinement:
+        history = history.exclude(pk=active_refinement.pk)
+    refinements = list(
+        history.order_by("-created_at", "-pk")[: (
+            REFINEMENT_HISTORY_LIMIT - bool(active_refinement)
+        )]
+    )
+    if active_refinement:
+        refinements.append(active_refinement)
+    refinements.sort(key=lambda item: (item.created_at, item.pk))
+    return {
+        "refinement_form": RecipeRefinementForm(),
+        "refinements": refinements,
+        "active_refinement": active_refinement,
+    }
+
+
+def _recipes_owned_by(user):
+    recipes = Recipe.objects.all()
+    if user.is_staff or user.is_superuser:
+        return recipes
+    return recipes.filter(created_by=user)
+
+
+def _recipes_refinable_by(user):
+    return _recipes_owned_by(user).filter(status=Recipe.Status.DRAFT)
+
+
+def _can_refine_recipe(user, recipe):
+    return bool(
+        recipe.status == Recipe.Status.DRAFT
+        and (user.is_staff or user.is_superuser or recipe.created_by_id == user.pk)
+    )
+
+
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_create(request):
@@ -752,7 +803,56 @@ def recipe_update(request, slug):
             "ingredient_formset": ingredient_formset,
             "step_formset": step_formset,
             "is_create": False,
+            "can_refine_recipe": _can_refine_recipe(request.user, recipe),
+            **(
+                _recipe_refinement_context(recipe)
+                if _can_refine_recipe(request.user, recipe)
+                else {}
+            ),
         },
+    )
+
+
+@login_required
+@require_POST
+def recipe_refine(request, slug):
+    recipe, _ = _resolve_recipe_slug(slug, _recipes_refinable_by(request.user))
+    form = RecipeRefinementForm(request.POST)
+    active_refinement = recipe.refinements.filter(
+        status__in=[
+            RecipeRefinement.Status.PENDING,
+            RecipeRefinement.Status.PROCESSING,
+        ]
+    ).exists()
+    if active_refinement:
+        messages.info(request, "Гермес уже перерабатывает этот рецепт.")
+    elif form.is_valid():
+        refinement = form.save(commit=False)
+        refinement.recipe = recipe
+        refinement.requested_by = request.user
+        refinement.expected_recipe_updated_at = recipe.updated_at
+        try:
+            with transaction.atomic():
+                refinement.save()
+        except IntegrityError:
+            messages.info(request, "Гермес уже перерабатывает этот рецепт.")
+        else:
+            messages.success(request, "Пожелание отправлено Гермесу.")
+    else:
+        messages.error(request, "Напишите пожелание к рецепту обычным текстом.")
+    return redirect(f'{reverse("recipe-update", args=[recipe.slug])}#agent-chat')
+
+
+@login_required
+def recipe_refinement_status(request, slug, pk):
+    recipe, _ = _resolve_recipe_slug(slug, _recipes_owned_by(request.user))
+    refinement = get_object_or_404(RecipeRefinement, pk=pk, recipe=recipe)
+    return JsonResponse(
+        {
+            "status": refinement.status,
+            "status_label": refinement.get_status_display(),
+            "error": refinement.error,
+        }
     )
 
 
@@ -854,10 +954,17 @@ def task_list(request):
     cart_runs = CartRun.objects.filter(requested_by=request.user).select_related(
         "recipe", "selected_attempt"
     )[:50]
+    refinements = RecipeRefinement.objects.filter(
+        requested_by=request.user
+    ).select_related("recipe").order_by("-created_at")[:50]
     return render(
         request,
         "recipes/task_list.html",
-        {"import_jobs": import_jobs, "cart_runs": cart_runs},
+        {
+            "import_jobs": import_jobs,
+            "refinements": refinements,
+            "cart_runs": cart_runs,
+        },
     )
 
 

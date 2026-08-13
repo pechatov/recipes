@@ -419,6 +419,58 @@ class ImportJob(models.Model):
         return f"{self.get_source_type_display()}: {self.source_url}"
 
 
+class RecipeRefinement(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "В очереди"
+        PROCESSING = "processing", "Обрабатывается"
+        COMPLETED = "completed", "Готово"
+        FAILED = "failed", "Ошибка"
+
+    recipe = models.ForeignKey(
+        Recipe,
+        on_delete=models.CASCADE,
+        related_name="refinements",
+        verbose_name="рецепт",
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="recipe_refinements",
+    )
+    prompt = models.TextField("пожелание")
+    status = models.CharField(
+        "статус",
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    expected_recipe_updated_at = models.DateTimeField(
+        "версия рецепта перед обработкой"
+    )
+    error = models.TextField("ошибка", blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["recipe"],
+                condition=models.Q(status__in=["pending", "processing"]),
+                name="one_active_refinement_per_recipe",
+            )
+        ]
+        verbose_name = "пожелание к рецепту"
+        verbose_name_plural = "пожелания к рецептам"
+
+    def __str__(self):
+        return f"{self.recipe}: {self.prompt[:80]}"
+
+
 class StorePreference(models.Model):
     class Store(models.TextChoices):
         AUCHAN = "auchan", "Ашан"

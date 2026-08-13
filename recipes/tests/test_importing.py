@@ -44,10 +44,18 @@ from recipes.importing.pipeline import (
     _prepare_images,
     _search_cover_image_urls,
     process_import_job,
+    process_recipe_refinement,
     save_draft,
 )
 from recipes.importing.structured import _nutrition_calories
-from recipes.models import ImportJob, Recipe
+from recipes.management.commands.run_import_worker import Command as ImportWorkerCommand
+from recipes.models import (
+    ImportJob,
+    Recipe,
+    RecipeIngredient,
+    RecipeRefinement,
+    RecipeStep,
+)
 
 
 class ExtractorTests(TestCase):
@@ -613,6 +621,221 @@ class PipelineTests(TestCase):
         self.assertEqual(job.status, ImportJob.Status.COMPLETED)
         self.assertEqual(job.recipe, recipe)
         self.assertEqual(list(job.recipes.all()), [recipe])
+
+    @patch("recipes.importing.pipeline.refine_with_ai")
+    def test_refinement_updates_exact_draft_and_marks_task_completed(
+        self, refine_with_ai
+    ):
+        user = get_user_model().objects.create_user("refinement-owner")
+        recipe = Recipe.objects.create(
+            title="Острая картошка",
+            status=Recipe.Status.DRAFT,
+            created_by=user,
+        )
+        RecipeIngredient.objects.create(
+            recipe=recipe, name="Картофель", quantity=300, unit="г"
+        )
+        RecipeStep.objects.create(recipe=recipe, instruction="Обжарить.")
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Сделай менее острым",
+            expected_recipe_updated_at=recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+        )
+        refine_with_ai.return_value = {
+            "title": "Мягкая картошка",
+            "description": "Без остроты",
+            "servings": 2,
+            "categories": ["main-course"],
+            "ingredients": [
+                {"name": "Картофель", "quantity": 400, "unit": "г"}
+            ],
+            "steps": [{"instruction": "Запечь до мягкости."}],
+        }
+
+        result = process_recipe_refinement(refinement)
+
+        recipe.refresh_from_db()
+        refinement.refresh_from_db()
+        self.assertEqual(result, recipe)
+        self.assertEqual(recipe.title, "Мягкая картошка")
+        self.assertEqual(recipe.ingredients.get().quantity, 400)
+        self.assertEqual(recipe.steps.get().instruction, "Запечь до мягкости.")
+        self.assertEqual(refinement.status, RecipeRefinement.Status.COMPLETED)
+        payload, prompt = refine_with_ai.call_args.args
+        self.assertEqual(payload["title"], "Острая картошка")
+        self.assertEqual(prompt, "Сделай менее острым")
+
+    @patch("recipes.importing.pipeline.refine_with_ai")
+    def test_refinement_does_not_overwrite_newer_manual_changes(self, refine_with_ai):
+        user = get_user_model().objects.create_user("careful-refinement-owner")
+        recipe = Recipe.objects.create(
+            title="Старый черновик",
+            status=Recipe.Status.DRAFT,
+            created_by=user,
+        )
+        RecipeIngredient.objects.create(
+            recipe=recipe, name="Картофель", quantity=300, unit="г"
+        )
+        RecipeStep.objects.create(recipe=recipe, instruction="Приготовить.")
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Измени рецепт",
+            expected_recipe_updated_at=recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+        )
+        recipe.title = "Свежая ручная правка"
+        recipe.save(update_fields=["title", "updated_at"])
+
+        with self.assertRaisesRegex(ImportPipelineError, "изменился"):
+            process_recipe_refinement(refinement)
+
+        recipe.refresh_from_db()
+        self.assertEqual(recipe.title, "Свежая ручная правка")
+        refine_with_ai.assert_not_called()
+
+    @patch("recipes.importing.pipeline.refine_with_ai")
+    def test_refinement_preserves_manual_nutrition_metadata(self, refine_with_ai):
+        user = get_user_model().objects.create_user("nutrition-refinement-owner")
+        recipe = Recipe.objects.create(
+            title="Ручная калорийность",
+            status=Recipe.Status.DRAFT,
+            created_by=user,
+            calories_per_serving="777.0",
+            proteins_per_serving="12.0",
+            nutrition_manual_fields=["calories_per_serving"],
+            calories_estimated=True,
+        )
+        RecipeIngredient.objects.create(
+            recipe=recipe, name="Картофель", quantity=300, unit="г"
+        )
+        RecipeStep.objects.create(recipe=recipe, instruction="Приготовить.")
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Сделай описание короче",
+            expected_recipe_updated_at=recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+            attempts=1,
+        )
+        refine_with_ai.return_value = {
+            "title": "Ручная калорийность",
+            "description": "Коротко.",
+            "servings": 2,
+            "calories_per_serving": 100,
+            "proteins_per_serving": 5,
+            "categories": ["main-course"],
+            "ingredients": [
+                {"name": "Картофель", "quantity": 300, "unit": "г"}
+            ],
+            "steps": [{"instruction": "Приготовить."}],
+        }
+
+        process_recipe_refinement(refinement)
+
+        recipe.refresh_from_db()
+        self.assertEqual(recipe.calories_per_serving, 777)
+        self.assertEqual(recipe.proteins_per_serving, 5)
+        self.assertEqual(recipe.nutrition_manual_fields, ["calories_per_serving"])
+        self.assertTrue(recipe.calories_estimated)
+
+    @patch("recipes.importing.pipeline.refine_with_ai")
+    @patch("django.core.files.storage.FileSystemStorage.delete")
+    def test_refinement_drops_imported_step_images_instead_of_reassigning_them(
+        self, storage_delete, refine_with_ai
+    ):
+        user = get_user_model().objects.create_user("image-refinement-owner")
+        recipe = Recipe.objects.create(
+            title="Шаги с фото",
+            status=Recipe.Status.DRAFT,
+            created_by=user,
+        )
+        RecipeIngredient.objects.create(
+            recipe=recipe, name="Картофель", quantity=300, unit="г"
+        )
+        step = RecipeStep.objects.create(recipe=recipe, instruction="Нарезать.")
+        step.image.name = "recipes/steps/imported.jpg"
+        step.image_imported = True
+        step.save(update_fields=["image", "image_imported"])
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Добавь новый первый шаг",
+            expected_recipe_updated_at=recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+            attempts=1,
+        )
+        refine_with_ai.return_value = {
+            "title": "Шаги с фото",
+            "categories": ["main-course"],
+            "ingredients": [
+                {"name": "Картофель", "quantity": 300, "unit": "г"}
+            ],
+            "steps": [
+                {"instruction": "Разогреть духовку."},
+                {"instruction": "Нарезать картофель."},
+            ],
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            process_recipe_refinement(refinement)
+
+        self.assertFalse(recipe.steps.exclude(image="").exists())
+        storage_delete.assert_called_once_with("recipes/steps/imported.jpg")
+
+    def test_import_worker_claims_a_pending_refinement(self):
+        user = get_user_model().objects.create_user("worker-refinement-owner")
+        recipe = Recipe.objects.create(
+            title="Черновик для воркера",
+            status=Recipe.Status.DRAFT,
+            created_by=user,
+        )
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Уточни шаги",
+            expected_recipe_updated_at=recipe.updated_at,
+        )
+
+        claimed = ImportWorkerCommand.claim_task()
+
+        refinement.refresh_from_db()
+        self.assertEqual(claimed.pk, refinement.pk)
+        self.assertIsInstance(claimed, RecipeRefinement)
+        self.assertEqual(refinement.status, RecipeRefinement.Status.PROCESSING)
+        self.assertEqual(refinement.attempts, 1)
+
+    def test_stale_worker_cannot_overwrite_completed_refinement(self):
+        user = get_user_model().objects.create_user("stale-worker-owner")
+        recipe = Recipe.objects.create(
+            title="Готовая правка",
+            status=Recipe.Status.DRAFT,
+            created_by=user,
+        )
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Уточни рецепт",
+            expected_recipe_updated_at=recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+            attempts=1,
+        )
+        stale_attempt = RecipeRefinement.objects.get(pk=refinement.pk)
+        RecipeRefinement.objects.filter(pk=refinement.pk).update(
+            status=RecipeRefinement.Status.COMPLETED,
+            attempts=2,
+        )
+
+        updated = ImportWorkerCommand.fail_owned_task(
+            stale_attempt, "Запоздалая ошибка"
+        )
+
+        refinement.refresh_from_db()
+        self.assertFalse(updated)
+        self.assertEqual(refinement.status, RecipeRefinement.Status.COMPLETED)
+        self.assertEqual(refinement.error, "")
 
     @override_settings(RECIPE_AI_BASE_URL="", RECIPE_AI_MODEL="")
     @patch("recipes.importing.pipeline.extract_source")

@@ -8,6 +8,64 @@
     <h1>{% if is_create %}Добавить блюдо{% else %}{{ recipe.title }}{% endif %}</h1>
   </header>
 
+  {% if not is_create and can_refine_recipe %}
+    <section
+      class="agent-chat"
+      id="agent-chat"
+      {% if active_refinement %}data-refinement-status-url="{% url 'recipe-refinement-status' recipe.slug active_refinement.pk %}"{% endif %}
+    >
+      <div class="agent-chat-heading">
+        <div class="agent-avatar" aria-hidden="true">✦</div>
+        <div>
+          <p class="eyebrow">Гермес-редактор</p>
+          <h2>Попросите изменить рецепт</h2>
+          <p>Напишите пожелания обычным текстом — Гермес переработает весь черновик.</p>
+        </div>
+      </div>
+
+      <div class="chat-thread" aria-live="polite">
+        {% if not refinements %}
+          <div class="chat-message is-agent">
+            Например, можно попросить заменить продукт, изменить число порций или сделать шаги подробнее.
+          </div>
+        {% endif %}
+        {% for refinement in refinements %}
+          <div class="chat-turn">
+            <div class="chat-message is-user">
+              <span>{{ refinement.prompt }}</span>
+              <small>{% firstof refinement.requested_by.get_full_name refinement.requested_by.username "Пользователь" %} · {{ refinement.created_at|date:"d.m H:i" }}</small>
+            </div>
+            <div class="chat-message is-agent status-{{ refinement.status }}"{% if refinement == active_refinement %} data-active-refinement-reply{% endif %}>
+              {% if refinement.status == "completed" %}
+                Готово — рецепт переработан с учётом пожелания.
+              {% elif refinement.status == "failed" %}
+                Не получилось: {{ refinement.error|default:"Гермес не смог переработать рецепт." }}
+              {% elif refinement.status == "processing" %}
+                <span class="chat-working-dot" aria-hidden="true"></span> Гермес перерабатывает рецепт…
+              {% else %}
+                <span class="chat-working-dot" aria-hidden="true"></span> Пожелание ждёт своей очереди…
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+
+      <form class="chat-compose" method="post" action="{% url 'recipe-refine' recipe.slug %}">
+        {% csrf_token %}
+        <div class="field">
+          {{ refinement_form.prompt.label_tag }}
+          {{ refinement_form.prompt }}
+        </div>
+        <div class="chat-compose-actions">
+          <small>Гермес возьмёт сохранённую версию рецепта. Несохранённые изменения формы ниже не учитываются.</small>
+          <button class="button" type="submit"{% if active_refinement %} disabled{% endif %}>
+            {% if active_refinement %}Гермес работает…{% else %}Отправить Гермесу{% endif %}
+          </button>
+        </div>
+      </form>
+    </section>
+  {% endif %}
+
   <form method="post" enctype="multipart/form-data" class="recipe-form" id="recipe-form">
     {% csrf_token %}
     {% if form.non_field_errors %}<div class="form-errors">{{ form.non_field_errors }}</div>{% endif %}
@@ -56,4 +114,7 @@
     </div>
   </form>
 {% endblock %}
-{% block scripts %}<script src="{% static 'recipes/formsets.js' %}" defer></script>{% endblock %}
+{% block scripts %}
+  <script src="{% static 'recipes/formsets.js' %}" defer></script>
+  {% if not is_create and can_refine_recipe %}<script src="{% static 'recipes/refinement-chat.js' %}" defer></script>{% endif %}
+{% endblock %}

@@ -19,7 +19,14 @@ from django.db.models import Q
 from django.utils import timezone
 
 from recipes.categories import CATEGORY_TAXONOMY
-from recipes.models import Category, ImportJob, Recipe, RecipeIngredient, RecipeStep
+from recipes.models import (
+    Category,
+    ImportJob,
+    Recipe,
+    RecipeIngredient,
+    RecipeRefinement,
+    RecipeStep,
+)
 
 from .exceptions import AIResponseError, ImportPipelineError
 from .extractors import (
@@ -31,7 +38,7 @@ from .extractors import (
     fetch_source_title,
     youtube_video_id,
 )
-from .llm import adapt_with_ai
+from .llm import adapt_with_ai, refine_with_ai
 from .normalizer import normalize_recipes
 from .safety import validate_source_safety
 from .structured import adapt_structured_recipe
@@ -433,7 +440,7 @@ def _prepare_images(
     return prepared
 
 
-def _recipe_values(job: ImportJob, data: dict) -> dict:
+def _recipe_content_values(data: dict) -> dict:
     return {
         "title": data["title"],
         "description": data["description"],
@@ -450,6 +457,12 @@ def _recipe_values(job: ImportJob, data: dict) -> dict:
         "carbohydrates_per_100g": data.get("carbohydrates_per_100g"),
         "calories_estimated": True,
         "nutrition_manual_fields": [],
+    }
+
+
+def _recipe_values(job: ImportJob, data: dict) -> dict:
+    return {
+        **_recipe_content_values(data),
         "source_url": job.source_url,
     }
 
@@ -533,6 +546,7 @@ def save_draft(
     *,
     document: SourceDocument | None = None,
     expected_draft_versions: dict[int, Any] | None = None,
+    expected_job_attempt: int | None = None,
 ) -> list[Recipe]:
     if expected_draft_versions is None:
         expected_draft_versions = {
@@ -555,6 +569,13 @@ def save_draft(
     try:
         with transaction.atomic():
             locked_job = ImportJob.objects.select_for_update().get(pk=job.pk)
+            if expected_job_attempt is not None and (
+                locked_job.status != ImportJob.Status.PROCESSING
+                or locked_job.attempts != expected_job_attempt
+            ):
+                raise ImportPipelineError(
+                    "Эта попытка импорта больше не владеет задачей; результат отброшен."
+                )
             linked_recipe_ids = set(locked_job.recipes.values_list("pk", flat=True))
             if locked_job.recipe_id:
                 linked_recipe_ids.add(locked_job.recipe_id)
@@ -711,6 +732,9 @@ def save_draft(
 
 
 def process_import_job(job: ImportJob) -> list[Recipe]:
+    expected_job_attempt = (
+        job.attempts if job.status == ImportJob.Status.PROCESSING else None
+    )
     expected_draft_versions = {
         recipe.pk: recipe.updated_at
         for recipe in Recipe.objects.filter(
@@ -750,4 +774,172 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
         data,
         document=document,
         expected_draft_versions=expected_draft_versions,
+        expected_job_attempt=expected_job_attempt,
     )
+
+
+def _recipe_refinement_payload(recipe: Recipe) -> dict[str, Any]:
+    def json_number(value):
+        return str(value) if value is not None else None
+
+    return {
+        "title": recipe.title,
+        "description": recipe.description,
+        "servings": recipe.servings,
+        "prep_minutes": recipe.prep_minutes,
+        "cook_minutes": recipe.cook_minutes,
+        "calories_per_serving": json_number(recipe.calories_per_serving),
+        "proteins_per_serving": json_number(recipe.proteins_per_serving),
+        "fats_per_serving": json_number(recipe.fats_per_serving),
+        "carbohydrates_per_serving": json_number(recipe.carbohydrates_per_serving),
+        "calories_per_100g": json_number(recipe.calories_per_100g),
+        "proteins_per_100g": json_number(recipe.proteins_per_100g),
+        "fats_per_100g": json_number(recipe.fats_per_100g),
+        "carbohydrates_per_100g": json_number(recipe.carbohydrates_per_100g),
+        "categories": list(recipe.categories.values_list("slug", flat=True)),
+        "cover_image_url": "",
+        "cover_image_search_query": "",
+        "ingredients": [
+            {
+                "section": ingredient.section,
+                "name": ingredient.name,
+                "quantity": json_number(ingredient.quantity),
+                "unit": ingredient.unit,
+                "search_query": ingredient.search_query,
+                "optional": ingredient.optional,
+                "estimated": ingredient.estimated,
+                "is_pantry": ingredient.is_pantry,
+            }
+            for ingredient in recipe.ingredients.all()
+        ],
+        "steps": [
+            {
+                "section": step.section,
+                "title": step.title,
+                "instruction": step.instruction,
+                "image_url": "",
+            }
+            for step in recipe.steps.all()
+        ],
+    }
+
+
+def save_refined_recipe(
+    refinement: RecipeRefinement,
+    data: dict,
+) -> Recipe:
+    values = normalize_recipes(
+        {"recipes": [data]},
+        require_quantities=True,
+        keep_ingredient_notes=False,
+        require_categories=True,
+    )[0]
+    with transaction.atomic():
+        locked_refinement = RecipeRefinement.objects.select_for_update().get(
+            pk=refinement.pk
+        )
+        if (
+            locked_refinement.status != RecipeRefinement.Status.PROCESSING
+            or locked_refinement.attempts != refinement.attempts
+        ):
+            raise ImportPipelineError(
+                "Эта попытка переработки больше не владеет задачей; результат отброшен."
+            )
+        recipe = (
+            Recipe.objects.select_for_update()
+            .prefetch_related("ingredients", "steps", "categories")
+            .get(pk=locked_refinement.recipe_id)
+        )
+        if recipe.status != Recipe.Status.DRAFT:
+            raise ImportPipelineError(
+                "Рецепт уже опубликован. Пожелание не применено к готовому рецепту."
+            )
+        if recipe.updated_at != locked_refinement.expected_recipe_updated_at:
+            raise ImportPipelineError(
+                "Черновик изменился во время обработки. Пожелание не применено, "
+                "чтобы не потерять новые правки."
+            )
+        if recipe.steps.filter(image_imported=False).exclude(image="").exists():
+            raise ImportPipelineError(
+                "В черновике есть фотографии шагов, добавленные вручную. "
+                "Пожелание не применено, чтобы не привязать их к другим шагам."
+            )
+
+        manual_nutrition_fields = set(recipe.nutrition_manual_fields or [])
+        manual_nutrition = {
+            field: getattr(recipe, field) for field in manual_nutrition_fields
+        }
+        obsolete_images = [
+            stored
+            for step in recipe.steps.all()
+            if step.image_imported and (stored := _stored_file(step.image))
+        ]
+
+        for field, value in _recipe_content_values(values).items():
+            setattr(recipe, field, value)
+        for field, value in manual_nutrition.items():
+            setattr(recipe, field, value)
+        recipe.nutrition_manual_fields = sorted(manual_nutrition_fields)
+        recipe.calories_estimated = any(
+            field not in manual_nutrition_fields and getattr(recipe, field) is not None
+            for field in (
+                "calories_per_serving",
+                "proteins_per_serving",
+                "fats_per_serving",
+                "carbohydrates_per_serving",
+                "calories_per_100g",
+                "proteins_per_100g",
+                "fats_per_100g",
+                "carbohydrates_per_100g",
+            )
+        )
+        recipe.save()
+        recipe.ingredients.all().delete()
+        recipe.steps.all().delete()
+        RecipeIngredient.objects.bulk_create(
+            [
+                RecipeIngredient(recipe=recipe, order=index, **ingredient)
+                for index, ingredient in enumerate(values["ingredients"])
+            ]
+        )
+        steps = []
+        for index, step in enumerate(values["steps"]):
+            step_values = {key: value for key, value in step.items() if key != "image_url"}
+            recipe_step = RecipeStep(recipe=recipe, order=index, **step_values)
+            steps.append(recipe_step)
+        RecipeStep.objects.bulk_create(steps)
+        _set_categories(recipe, values.get("categories", []))
+
+        locked_refinement.status = RecipeRefinement.Status.COMPLETED
+        locked_refinement.error = ""
+        locked_refinement.finished_at = timezone.now()
+        locked_refinement.save(update_fields=["status", "error", "finished_at"])
+        transaction.on_commit(
+            lambda files=obsolete_images: _delete_stored_files(files)
+        )
+
+    refinement.status = locked_refinement.status
+    refinement.error = locked_refinement.error
+    refinement.finished_at = locked_refinement.finished_at
+    return recipe
+
+
+def process_recipe_refinement(refinement: RecipeRefinement) -> Recipe:
+    recipe = (
+        Recipe.objects.prefetch_related("ingredients", "steps", "categories")
+        .get(pk=refinement.recipe_id)
+    )
+    if recipe.status != Recipe.Status.DRAFT:
+        raise ImportPipelineError("Перерабатывать через чат можно только черновики.")
+    if recipe.updated_at != refinement.expected_recipe_updated_at:
+        raise ImportPipelineError(
+            "Черновик изменился до начала обработки. Пожелание не отправлено "
+            "Гермесу, чтобы не расходовать ресурсы на устаревшую версию."
+        )
+    if recipe.steps.filter(image_imported=False).exclude(image="").exists():
+        raise ImportPipelineError(
+            "В черновике есть фотографии шагов, добавленные вручную. "
+            "Пожелание не применено, чтобы не привязать их к другим шагам."
+        )
+    data = refine_with_ai(_recipe_refinement_payload(recipe), refinement.prompt)
+    return save_refined_recipe(refinement, data)
