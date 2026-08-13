@@ -116,6 +116,9 @@ class BrowserLoginSessionAdmin(admin.ModelAdmin):
         "finished_at",
     )
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(RegistrationInvite)
 class RegistrationInviteAdmin(admin.ModelAdmin):

@@ -1,8 +1,10 @@
-from unittest.mock import patch
 from datetime import timedelta
+from unittest.mock import patch
 
+from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError
+from django.db.models.deletion import ProtectedError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -13,7 +15,12 @@ from recipes.carting.pipeline import (
     process_cart_cleanup,
     process_cart_run,
 )
-from recipes.carting.browser_login import BrowserLoginError
+from recipes.admin import BrowserLoginSessionAdmin
+from recipes.carting.browser_login import (
+    BrowserLoginError,
+    BrowserLoginSessionNotFound,
+    issue_access,
+)
 from recipes.carting.client import (
     STORE_INSTRUCTIONS,
     CartAgentError,
@@ -249,6 +256,90 @@ class CartViewTests(TestCase):
         self.assertContains(response, issue_access.return_value)
         self.assertContains(response, "Сохранить сессию и продолжить")
         issue_access.assert_called_once_with(login_session.remote_session_id)
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+        CART_BROWSER_LOGIN_MINUTES=15,
+    )
+    @patch("recipes.carting.coordination.stop_session")
+    @patch("recipes.views.issue_browser_login_access")
+    def test_missing_remote_login_is_reconciled_and_can_restart(
+        self,
+        issue_login_access,
+        stop_session,
+    ):
+        issue_login_access.side_effect = BrowserLoginSessionNotFound("missing")
+        stale_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.get(reverse("browser-login", args=[stale_session.pk]))
+
+        self.assertRedirects(response, reverse("store-preferences"))
+        stale_session.refresh_from_db()
+        self.assertEqual(stale_session.status, BrowserLoginSession.Status.FAILED)
+        stop_session.assert_called_once_with(stale_session.remote_session_id)
+
+        with patch("recipes.views.start_browser_login_session"):
+            restart = self.client.post(reverse("browser-login-start"))
+
+        replacement = BrowserLoginSession.objects.exclude(pk=stale_session.pk).get()
+        self.assertRedirects(
+            restart,
+            reverse("browser-login", args=[replacement.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(replacement.status, BrowserLoginSession.Status.ACTIVE)
+
+    @patch("recipes.carting.coordination.stop_session")
+    @patch("recipes.views.issue_browser_login_access")
+    def test_missing_remote_login_stays_blocking_if_recheck_fails(
+        self,
+        issue_login_access,
+        stop_session,
+    ):
+        issue_login_access.side_effect = BrowserLoginSessionNotFound("missing")
+        stop_session.side_effect = BrowserLoginError("controller unavailable")
+        stale_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        self.client.get(reverse("browser-login", args=[stale_session.pk]))
+
+        stale_session.refresh_from_db()
+        self.assertEqual(stale_session.status, BrowserLoginSession.Status.ACTIVE)
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    @patch("recipes.carting.browser_login.httpx.Client")
+    def test_access_404_has_a_distinct_missing_session_error(self, client_class):
+        response = client_class.return_value.__enter__.return_value.request.return_value
+        response.status_code = 404
+
+        with self.assertRaises(BrowserLoginSessionNotFound):
+            issue_access("remote-session-id-1234567890")
+
+    def test_active_browser_session_cannot_be_deleted_through_admin_or_user(self):
+        BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+        session_admin = BrowserLoginSessionAdmin(BrowserLoginSession, AdminSite())
+
+        self.assertFalse(session_admin.has_delete_permission(request=None))
+        with self.assertRaises(ProtectedError):
+            self.user.delete()
 
     @patch("recipes.views.stop_browser_login_session")
     def test_browser_login_completion_saves_and_resumes_run(self, stop_session):

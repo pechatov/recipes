@@ -24,6 +24,7 @@ from django.views.decorators.http import require_http_methods, require_POST
 
 from .carting.browser_login import (
     BrowserLoginError,
+    BrowserLoginSessionNotFound,
     is_configured as browser_login_is_configured,
     issue_access as issue_browser_login_access,
     start_session as start_browser_login_session,
@@ -33,6 +34,7 @@ from .carting.client import cart_browser_session_key
 from .carting.coordination import (
     BROWSER_BLOCKING_STATUSES,
     reconcile_expired_browser_login_sessions,
+    reconcile_missing_browser_login_session,
 )
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import (
@@ -1373,7 +1375,11 @@ def browser_login(request, pk):
     )
     if login_session.status != BrowserLoginSession.Status.ACTIVE:
         messages.error(request, "Это окно входа уже закрыто.")
-        return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
+        return (
+            redirect("cart-detail", pk=login_session.run_id)
+            if login_session.run_id
+            else redirect("store-preferences")
+        )
     if login_session.expires_at <= timezone.now():
         with transaction.atomic():
             acquire_application_lock(CART_BROWSER_LOCK)
@@ -1382,12 +1388,40 @@ def browser_login(request, pk):
             messages.error(request, "Время ручного входа истекло. Запустите его ещё раз.")
         else:
             messages.error(request, "Сессия истекла, но браузер ещё безопасно закрывается.")
-        return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
+        return (
+            redirect("cart-detail", pk=login_session.run_id)
+            if login_session.run_id
+            else redirect("store-preferences")
+        )
     try:
         browser_url = issue_browser_login_access(login_session.remote_session_id)
+    except BrowserLoginSessionNotFound:
+        with transaction.atomic():
+            acquire_application_lock(CART_BROWSER_LOCK)
+            recovery_ready = reconcile_missing_browser_login_session(login_session.pk)
+        if recovery_ready:
+            messages.error(
+                request,
+                "Прошлое окно было закрыто при восстановлении браузера. "
+                "Теперь можно сразу запустить новое.",
+            )
+        else:
+            messages.error(
+                request,
+                "Не удалось подтвердить закрытие прошлого окна; браузер пока заблокирован.",
+            )
+        return (
+            redirect("cart-detail", pk=login_session.run_id)
+            if login_session.run_id
+            else redirect("store-preferences")
+        )
     except BrowserLoginError as error:
         messages.error(request, str(error))
-        return redirect("cart-detail", pk=login_session.run_id) if login_session.run_id else redirect("store-preferences")
+        return (
+            redirect("cart-detail", pk=login_session.run_id)
+            if login_session.run_id
+            else redirect("store-preferences")
+        )
     return render(
         request,
         "recipes/browser_login.html",

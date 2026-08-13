@@ -35,6 +35,26 @@ def reconcile_expired_browser_login_sessions() -> bool:
     return True
 
 
+def reconcile_missing_browser_login_session(session_pk: int) -> bool:
+    """Release a DB session only after its absence is reconfirmed remotely.
+
+    The caller must hold CART_BROWSER_LOCK in a transaction. A failed DELETE
+    leaves the blocking row unchanged, preserving the worker/browser boundary.
+    """
+    login_session = BrowserLoginSession.objects.select_for_update().get(pk=session_pk)
+    if login_session.status not in BROWSER_BLOCKING_STATUSES:
+        return True
+    try:
+        stop_session(login_session.remote_session_id)
+    except BrowserLoginError:
+        return False
+    login_session.status = BrowserLoginSession.Status.FAILED
+    login_session.finished_at = timezone.now()
+    login_session.error = "Controller подтвердил отсутствие удалённой сессии."
+    login_session.save(update_fields=["status", "finished_at", "error"])
+    return True
+
+
 def browser_login_session_blocks_worker() -> bool:
     return BrowserLoginSession.objects.filter(
         status__in=BROWSER_BLOCKING_STATUSES,

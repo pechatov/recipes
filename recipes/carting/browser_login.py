@@ -16,6 +16,10 @@ class BrowserLoginError(Exception):
     pass
 
 
+class BrowserLoginSessionNotFound(BrowserLoginError):
+    """The controller confirmed that a specific session no longer exists."""
+
+
 def is_configured() -> bool:
     return bool(settings.CART_BROWSER_CONTROL_URL and settings.CART_BROWSER_CONTROL_KEY)
 
@@ -26,6 +30,7 @@ def _request(
     *,
     payload: dict[str, Any] | None = None,
     allow_not_found: bool = False,
+    session_not_found: bool = False,
 ) -> dict:
     if not is_configured():
         raise BrowserLoginError("Удалённый вход в Яндекс Еду ещё не настроен.")
@@ -44,6 +49,10 @@ def _request(
             )
         if allow_not_found and response.status_code == 404:
             return {"status": "already_closed"}
+        if session_not_found and response.status_code == 404:
+            raise BrowserLoginSessionNotFound(
+                "Окно входа было закрыто при восстановлении браузера. Запустите новое."
+            )
         response.raise_for_status()
         data = response.json()
     except BrowserLoginError:
@@ -81,7 +90,11 @@ def start_session(scope: str, lifetime_minutes: int, session_id: str) -> str:
 
 def issue_access(session_id: str) -> str:
     session_id = _validated_session_id(session_id)
-    data = _request("POST", f"/v1/sessions/{session_id}/access")
+    data = _request(
+        "POST",
+        f"/v1/sessions/{session_id}/access",
+        session_not_found=True,
+    )
     path = str(data.get("access_path") or "")
     parsed = urlparse(path)
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
