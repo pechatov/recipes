@@ -16,6 +16,7 @@ from recipes.importing.exceptions import (
 from recipes.importing.extractors import (
     SourceDocument,
     _PinnedHTTPSConnection,
+    _RejectRedirectHandler,
     _fetch_website_title,
     _fetch_youtube_title,
     _resolve_public_url,
@@ -74,29 +75,37 @@ class ExtractorTests(TestCase):
         self.assertTrue(document.cover_image_urls[-1].endswith("/hqdefault.jpg"))
         fetch_title.assert_called_once_with("dQw4w9WgXcQ")
 
-    @patch("recipes.importing.extractors.urllib.request.urlopen")
-    def test_fetches_youtube_title_from_oembed(self, urlopen):
+    @patch("recipes.importing.extractors.urllib.request.build_opener")
+    def test_fetches_youtube_title_from_oembed_without_redirects(self, build_opener):
         response = MagicMock()
         response.status = 200
         response.headers.get.return_value = "application/json; charset=utf-8"
         response.read.return_value = json.dumps(
             {"title": "  Лучший   домашний гуляш  "}
         ).encode()
-        urlopen.return_value.__enter__.return_value = response
+        opener = build_opener.return_value
+        opener.open.return_value.__enter__.return_value = response
 
         title = _fetch_youtube_title("dQw4w9WgXcQ")
 
         self.assertEqual(title, "Лучший домашний гуляш")
-        request = urlopen.call_args.args[0]
+        redirect_handler = build_opener.call_args.args[0]
+        self.assertIsInstance(redirect_handler, _RejectRedirectHandler)
+        self.assertIsNone(
+            redirect_handler.redirect_request(
+                Mock(), None, 302, "Found", {}, "http://127.0.0.1/private"
+            )
+        )
+        request = opener.open.call_args.args[0]
         self.assertIn("youtube.com/oembed?", request.full_url)
         self.assertIn("dQw4w9WgXcQ", request.full_url)
 
-    @patch("recipes.importing.extractors.urllib.request.urlopen")
-    def test_youtube_title_returns_empty_on_incomplete_response(self, urlopen):
+    @patch("recipes.importing.extractors.urllib.request.build_opener")
+    def test_youtube_title_returns_empty_on_incomplete_response(self, build_opener):
         response = MagicMock()
         response.headers.get.return_value = "application/json"
         response.read.side_effect = http.client.IncompleteRead(b'{"title":')
-        urlopen.return_value.__enter__.return_value = response
+        build_opener.return_value.open.return_value.__enter__.return_value = response
 
         title = _fetch_youtube_title("dQw4w9WgXcQ")
 

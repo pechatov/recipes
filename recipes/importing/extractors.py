@@ -140,6 +140,13 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep the trusted YouTube oEmbed request on its fixed HTTPS endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 @contextmanager
 def _open_public_url(url: str, *, headers: dict[str, str], timeout: float):
     parsed, pinned_ip = _resolve_public_url(url)
@@ -260,8 +267,10 @@ def _fetch_youtube_title(video_id: str) -> str:
     try:
         # The oEmbed host is a fixed application endpoint, not a user-supplied
         # destination. Use the platform resolver here so DNS proxy/fake-IP
-        # setups can route it; user-provided URLs still use _open_public_url.
-        with urllib.request.urlopen(request, timeout=5) as response:
+        # setups can route it. Redirects are forbidden so the request cannot
+        # leave this trusted HTTPS endpoint; user URLs still use _open_public_url.
+        opener = urllib.request.build_opener(_RejectRedirectHandler())
+        with opener.open(request, timeout=5) as response:
             if "json" not in response.headers.get("content-type", "").lower():
                 return ""
             content = response.read(MAX_TITLE_BYTES + 1)
