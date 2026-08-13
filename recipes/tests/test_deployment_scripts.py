@@ -58,4 +58,6 @@ class BrowserLoginDeploymentContractTests(SimpleTestCase):
             '\\$cookie_recipes_browser_login";',
             browser_location,
         )
+        self.assertIn('proxy_set_header Connection "upgrade";', browser_location)
+        self.assertNotIn(r'Connection \"upgrade\"', browser_location)
         self.assertNotIn("$http_cookie", browser_location)
