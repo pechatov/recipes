@@ -46,6 +46,18 @@ class BrowserLoginDeploymentContractTests(SimpleTestCase):
             issue_access.index("session.accessDigests.add"),
         )
 
+    def test_novnc_websocket_path_is_origin_absolute(self):
+        server = (ROOT / "scripts/browser-login-server.mjs").read_text()
+
+        self.assertIn(
+            "path=/browser-login/session/${session.id}/websockify",
+            server,
+        )
+        self.assertNotIn(
+            "path=browser-login/session/${session.id}/websockify",
+            server,
+        )
+
     def test_browser_proxy_forwards_only_its_dedicated_cookie(self):
         script = (ROOT / "scripts/deploy/configure-npm-proxy.sh").read_text()
 

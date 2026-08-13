@@ -297,7 +297,7 @@ async function handleAccess(request, response, token) {
   }
   const maxAge = Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000));
   response.writeHead(302, {
-    Location: `${publicPrefix}/session/${session.id}/vnc.html?autoconnect=true&resize=scale&path=browser-login/session/${session.id}/websockify`,
+    Location: `${publicPrefix}/session/${session.id}/vnc.html?autoconnect=true&resize=scale&path=/browser-login/session/${session.id}/websockify`,
     "Set-Cookie": `recipes_browser_login=${session.cookieToken}; Path=${publicPrefix}/session/${session.id}/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Strict`,
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
