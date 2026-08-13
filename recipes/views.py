@@ -366,10 +366,14 @@ def registration_access(request):
                 )
             request.session["registration_invite_token"] = token
             messages.success(request, "Одноразовая ссылка создана на 24 часа.")
-        elif action == "close" and active:
-            active.is_open = False
-            active.closed_at = now
-            active.save(update_fields=["is_open", "closed_at"])
+        elif action == "close":
+            with transaction.atomic():
+                acquire_application_lock(REGISTRATION_LOCK)
+                RegistrationInvite.objects.filter(
+                    is_open=True,
+                    used_at__isnull=True,
+                    closed_at__isnull=True,
+                ).update(is_open=False, closed_at=now)
             request.session.pop("registration_invite_token", None)
             messages.success(request, "Регистрация закрыта.")
         return redirect("registration-access")

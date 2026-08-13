@@ -119,7 +119,12 @@ function cookieValue(request, name) {
 }
 
 function currentSession(id) {
-  if (!activeSession || activeSession.id !== id || activeSession.expiresAt <= Date.now()) return null;
+  if (
+    !activeSession
+    || activeSession.id !== id
+    || activeSession.closing
+    || activeSession.expiresAt <= Date.now()
+  ) return null;
   return activeSession;
 }
 
@@ -188,6 +193,9 @@ async function recoverInterruptedSession() {
 async function closeActiveSession(expectedId = null) {
   const session = activeSession;
   if (!session || (expectedId && session.id !== expectedId)) return false;
+  session.closing = true;
+  for (const socket of session.webSockets) socket.destroy();
+  session.webSockets.clear();
   try {
     await closeCamofoxUser(session.userId);
   } catch (error) {
@@ -247,6 +255,8 @@ async function handleControl(request, response, url) {
           cookieDigest: digest(cookieToken),
           cookieToken,
           accessDigests: new Set(),
+          webSockets: new Set(),
+          closing: false,
         };
       } finally {
         startingSession = false;
@@ -335,9 +345,18 @@ const server = http.createServer(async (request, response) => {
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url, "http://browser-login.local");
   const match = url.pathname.match(/^\/browser-login\/session\/([A-Za-z0-9_-]{20,128})\/websockify$/);
-  if (!match || !sessionFromPublicRequest(request, match[1])) return socket.destroy();
+  const session = match && sessionFromPublicRequest(request, match[1]);
+  if (!session) return socket.destroy();
+  session.webSockets.add(socket);
+  socket.once("close", () => session.webSockets.delete(socket));
   request.url = "/websockify";
-  proxy.ws(request, socket, head);
+  try {
+    proxy.ws(request, socket, head);
+  } catch (error) {
+    console.error("noVNC WebSocket proxy failed", error);
+    session.webSockets.delete(socket);
+    socket.destroy();
+  }
 });
 
 setInterval(() => {

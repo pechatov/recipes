@@ -308,6 +308,8 @@ Environment=HERMES_ROOT={home}/.hermes/hermes-agent
 Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
 EnvironmentFile={home}/.hermes/profiles/{profile}/.env
 ExecStart={home}/.hermes/node/bin/node {home}/.local/share/recipes-browser-login/server.mjs
+ExecStartPost=/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused http://{os.environ['PI_ADDRESS']}:9380/healthz
+ExecStartPost=/usr/bin/systemctl --user --no-block start hermes-gateway-{profile}.service
 Restart=always
 RestartSec=2
 

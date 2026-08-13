@@ -85,6 +85,27 @@ class RegistrationAccessTests(TestCase):
         self.assertIsNotNone(RegistrationInvite.objects.get().closed_at)
         self.assertEqual(self.client.get(reverse("register-invite", args=[token])).status_code, 410)
 
+    def test_close_serializes_with_open_and_closes_the_current_invite(self):
+        self.client.post(reverse("registration-access"), {"action": "open"})
+        stale_invite = RegistrationInvite.objects.get(is_open=True)
+
+        def replace_invite_after_lock(*_args, **_kwargs):
+            stale_invite.is_open = False
+            stale_invite.closed_at = datetime.now(datetime_timezone.utc)
+            stale_invite.save(update_fields=["is_open", "closed_at"])
+            RegistrationInvite.objects.create(
+                token_digest="c" * 64,
+                created_by=self.owner,
+                expires_at=datetime(2099, 1, 1, tzinfo=datetime_timezone.utc),
+            )
+
+        with patch("recipes.views.acquire_application_lock", side_effect=replace_invite_after_lock):
+            response = self.client.post(reverse("registration-access"), {"action": "close"})
+
+        self.assertRedirects(response, reverse("registration-access"))
+        self.assertFalse(RegistrationInvite.objects.filter(is_open=True).exists())
+        self.assertEqual(RegistrationInvite.objects.filter(closed_at__isnull=False).count(), 2)
+
     def test_regular_user_cannot_manage_registration(self):
         user = get_user_model().objects.create_user(username="cook", password="pass")
         self.client.force_login(user)
