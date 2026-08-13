@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 from pathlib import Path
@@ -13,8 +14,11 @@ from recipes.importing.exceptions import (
     UnsafeSourceError,
 )
 from recipes.importing.extractors import (
+    MAX_TRANSCRIPT_JSON_BYTES,
+    MAX_TRANSCRIPT_SEGMENTS,
     SourceDocument,
     _PinnedHTTPSConnection,
+    _RejectRedirectHandler,
     _fetch_website_title,
     _fetch_youtube_title,
     _resolve_public_url,
@@ -74,29 +78,117 @@ class ExtractorTests(TestCase):
     def test_youtube_exposes_title_and_multiple_thumbnail_fallbacks(
         self, fetch, fetch_title
     ):
-        fetch.return_value = [Mock(text="Ингредиенты и подробное приготовление " * 5)]
+        fetch.return_value = [
+            Mock(
+                text="Ингредиенты и подробное приготовление " * 5,
+                start=42.8,
+            )
+        ]
         document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
         self.assertEqual(document.title, "Гуляш из говядины с густой подливой")
         self.assertEqual(len(document.cover_image_urls), 3)
         self.assertTrue(document.cover_image_urls[-1].endswith("/hqdefault.jpg"))
+        self.assertEqual(
+            document.transcript_segments,
+            ({
+                "start_seconds": 42,
+                "text": ("Ингредиенты и подробное приготовление " * 5).strip(),
+            },),
+        )
         fetch_title.assert_called_once_with("dQw4w9WgXcQ")
 
-    @patch("recipes.importing.extractors._open_public_url")
-    def test_fetches_youtube_title_from_oembed(self, open_url):
+    @patch(
+        "recipes.importing.extractors._fetch_youtube_title",
+        return_value="Длинный рецепт",
+    )
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_limits_segment_count_and_serialized_transcript_size(
+        self, fetch, _fetch_title
+    ):
+        fetch.side_effect = [
+            [
+                Mock(text=f"Шаг {index}", start=index * 0.5)
+                for index in range(MAX_TRANSCRIPT_SEGMENTS + 500)
+            ],
+            [
+                Mock(
+                    text=("Подробное действие приготовления " * 5) + str(index),
+                    start=index * 0.5,
+                )
+                for index in range(MAX_TRANSCRIPT_SEGMENTS)
+            ],
+        ]
+
+        count_limited = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        size_limited = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        serialized = json.dumps(
+            size_limited.transcript_segments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.assertEqual(len(count_limited.transcript_segments), MAX_TRANSCRIPT_SEGMENTS)
+        self.assertLess(len(size_limited.transcript_segments), MAX_TRANSCRIPT_SEGMENTS)
+        self.assertLessEqual(len(serialized), MAX_TRANSCRIPT_JSON_BYTES)
+
+    @patch(
+        "recipes.importing.extractors._fetch_youtube_title",
+        return_value="Рецепт с длинным сегментом",
+    )
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_truncates_multibyte_segment_to_json_budget(
+        self, fetch, _fetch_title
+    ):
+        fetch.return_value = [Mock(text="я" * 60_000, start=12.5)]
+
+        document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+        serialized = json.dumps(
+            document.transcript_segments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.assertEqual(len(document.transcript_segments), 1)
+        self.assertEqual(document.transcript_segments[0]["start_seconds"], 12)
+        self.assertGreater(len(document.transcript_segments[0]["text"]), 80)
+        self.assertLess(len(document.transcript_segments[0]["text"]), 60_000)
+        self.assertLessEqual(len(serialized), MAX_TRANSCRIPT_JSON_BYTES)
+
+    @patch("recipes.importing.extractors.urllib.request.build_opener")
+    def test_fetches_youtube_title_from_oembed_without_redirects(self, build_opener):
         response = MagicMock()
         response.status = 200
         response.headers.get.return_value = "application/json; charset=utf-8"
         response.read.return_value = json.dumps(
             {"title": "  Лучший   домашний гуляш  "}
         ).encode()
-        open_url.return_value.__enter__.return_value = response
+        opener = build_opener.return_value
+        opener.open.return_value.__enter__.return_value = response
 
         title = _fetch_youtube_title("dQw4w9WgXcQ")
 
         self.assertEqual(title, "Лучший домашний гуляш")
-        requested_url = open_url.call_args.args[0]
-        self.assertIn("youtube.com/oembed?", requested_url)
-        self.assertIn("dQw4w9WgXcQ", requested_url)
+        redirect_handler = build_opener.call_args.args[0]
+        self.assertIsInstance(redirect_handler, _RejectRedirectHandler)
+        self.assertIsNone(
+            redirect_handler.redirect_request(
+                Mock(), None, 302, "Found", {}, "http://127.0.0.1/private"
+            )
+        )
+        request = opener.open.call_args.args[0]
+        self.assertIn("youtube.com/oembed?", request.full_url)
+        self.assertIn("dQw4w9WgXcQ", request.full_url)
+
+    @patch("recipes.importing.extractors.urllib.request.build_opener")
+    def test_youtube_title_returns_empty_on_incomplete_response(self, build_opener):
+        response = MagicMock()
+        response.headers.get.return_value = "application/json"
+        response.read.side_effect = http.client.IncompleteRead(b'{"title":')
+        build_opener.return_value.open.return_value.__enter__.return_value = response
+
+        title = _fetch_youtube_title("dQw4w9WgXcQ")
+
+        self.assertEqual(title, "")
 
     @patch("recipes.importing.extractors._open_public_url")
     def test_website_title_falls_back_to_utf8_for_unknown_charset(self, open_url):
@@ -241,6 +333,24 @@ class NormalizerTests(TestCase):
         self.assertEqual(recipe["title"], "Паста с грибами")
         self.assertEqual(recipe["ingredients"][0]["quantity"], "250.50")
         self.assertEqual(recipe["prep_minutes"], 0)
+
+    def test_normalizes_youtube_timestamp_without_inventing_invalid_values(self):
+        base = {
+            "title": "Паста",
+            "ingredients": [{"name": "Макароны", "quantity": 200, "unit": "г"}],
+        }
+        recipe = normalize_recipe(
+            {
+                **base,
+                "steps": [
+                    {"instruction": "Отварить.", "video_timestamp_seconds": "95"},
+                    {"instruction": "Подать.", "video_timestamp_seconds": -1},
+                ],
+            }
+        )
+
+        self.assertEqual(recipe["steps"][0]["video_timestamp_seconds"], 95)
+        self.assertIsNone(recipe["steps"][1]["video_timestamp_seconds"])
 
     def test_ai_recipe_requires_quantity_and_unit(self):
         with self.assertRaisesRegex(AIResponseError, "Соль"):
@@ -768,6 +878,9 @@ class PipelineTests(TestCase):
             "youtube",
             "Два рецепта из картофеля",
             "Ингредиенты: 500 г картофеля и соль. Нарезать картофель, затем обжарить.",
+            transcript_segments=(
+                {"start_seconds": 75, "text": "Нарезать картофель и обжарить."},
+            ),
         )
         base = {
             "description": "",
@@ -789,6 +902,7 @@ class PipelineTests(TestCase):
                     "title": "",
                     "instruction": "Приготовить.",
                     "image_url": "",
+                    "video_timestamp_seconds": 75,
                 }
             ],
         }
@@ -809,6 +923,9 @@ class PipelineTests(TestCase):
 
         self.assertEqual([recipe.title for recipe in recipes], ["Картофель", "Драники"])
         self.assertTrue(all(recipe.status == Recipe.Status.DRAFT for recipe in recipes))
+        self.assertTrue(
+            all(recipe.steps.get().video_timestamp_seconds == 75 for recipe in recipes)
+        )
         job.refresh_from_db()
         self.assertEqual(job.recipe, recipes[0])
         self.assertCountEqual(job.recipes.all(), recipes)

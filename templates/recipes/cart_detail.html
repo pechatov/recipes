@@ -43,9 +43,7 @@
     {% elif run.status == 'login_required' %}
       <div class="status-orb is-error">↗</div>
       <h2>Нужно подтвердить браузер</h2>
-      <p>Яндекс запросил вход или ручную проверку. Запустите свою отдельную сессию, пройдите проверку и выберите адрес, затем сохраните её и повторите попытку.</p>
-      <code class="command-chip">./scripts/cart-browser-login-pi.sh start {{ run.requested_by_id }}</code>
-      <p><small>Следуйте подсказкам скрипта, войдите в Яндекс и укажите адрес доставки. После проверки выполните <strong>./scripts/cart-browser-login-pi.sh stop {{ run.requested_by_id }}</strong>. Сессия сохранится только для вашего пользователя сайта.</small></p>
+      <p>Яндекс запросил вход или ручную проверку. Откройте защищённое окно, войдите и выберите адрес доставки. Сессия сохранится только для вашего пользователя сайта.</p>
     {% else %}
       <div class="status-orb is-error">×</div>
       <h2>Корзину собрать не удалось</h2>
@@ -73,9 +71,13 @@
         {% endif %}
       {% endif %}
       {% if run.status == 'login_required' or run.status == 'failed' %}
+        <form method="post" action="{% url 'cart-browser-login-start' run.pk %}">
+          {% csrf_token %}
+          <button class="button" type="submit">Войти в Яндекс Еду</button>
+        </form>
         <form method="post" action="{% url 'cart-retry' run.pk %}">
           {% csrf_token %}
-          <button class="button" type="submit">Проверка пройдена — продолжить</button>
+          <button class="button button-secondary" type="submit">Уже вошли — продолжить</button>
         </form>
       {% endif %}
       {% if run.status == 'manual_check' %}

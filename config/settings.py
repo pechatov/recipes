@@ -140,3 +140,9 @@ CART_CONFIRMATION_MINUTES = max(
     5,
     int(os.environ.get("CART_CONFIRMATION_MINUTES", "180")),
 )
+CART_BROWSER_CONTROL_URL = os.environ.get("CART_BROWSER_CONTROL_URL", "").strip().rstrip("/")
+CART_BROWSER_CONTROL_KEY = os.environ.get("CART_BROWSER_CONTROL_KEY", "").strip()
+CART_BROWSER_LOGIN_MINUTES = min(
+    30,
+    max(5, int(os.environ.get("CART_BROWSER_LOGIN_MINUTES", "15"))),
+)

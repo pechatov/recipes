@@ -93,6 +93,15 @@ done
 sudo midclt call app.get_instance "$app_name" | jq -e \
   --arg image "$image_ref" \
   '.state == "RUNNING" and any(.active_workloads.images[]; . == $image)' >/dev/null
+
+worker_id="$(sudo docker ps \
+  --filter "label=com.docker.compose.project=ix-${app_name}" \
+  --filter "label=com.docker.compose.service=worker" \
+  --format '{{.ID}}' | head -n 1)"
+test -n "$worker_id"
+sudo docker exec "$worker_id" python manage.py backfill_import_titles --check
+sudo timeout 120 docker exec "$worker_id" \
+  python manage.py backfill_import_titles --limit 20
 REMOTE
 
 for _ in $(seq 1 30); do

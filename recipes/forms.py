@@ -20,6 +20,16 @@ class SetupForm(UserCreationForm):
         labels = {"username": "Имя пользователя"}
 
 
+class RegistrationForm(UserCreationForm):
+    class Meta(UserCreationForm.Meta):
+        model = get_user_model()
+        fields = ("username", "first_name")
+        labels = {
+            "username": "Имя пользователя",
+            "first_name": "Как вас зовут",
+        }
+
+
 class RecipeForm(forms.ModelForm):
     class Meta:
         model = Recipe

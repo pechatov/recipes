@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Доступ к книге · Домашние рецепты{% endblock %}
+{% block content %}
+  <header class="page-heading">
+    <a class="back-link" href="{% url 'recipe-list' %}">← К рецептам</a>
+    <p class="eyebrow">Только для владельца</p>
+    <h1>Доступ к семейной книге</h1>
+    <p class="lead">Регистрация всегда закрыта, кроме одной секретной ссылки. После создания одного аккаунта ссылка автоматически перестаёт работать.</p>
+  </header>
+
+  <section class="access-card">
+    {% if active_invite %}
+      <h2>Одноразовая регистрация открыта</h2>
+      <p>Ссылка действует до {{ active_invite.expires_at|date:"d.m.Y H:i" }} или до первой регистрации.</p>
+      {% if invite_url %}
+        <label class="field">
+          <span>Отправьте эту ссылку жене</span>
+          <input type="url" value="{{ invite_url }}" readonly data-invite-url>
+        </label>
+      {% else %}
+        <p class="muted">Секрет ссылки больше не хранится в этой сессии владельца. Создайте новую ссылку.</p>
+      {% endif %}
+      <form method="post">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="close">
+        <button class="button button-secondary" type="submit">Закрыть регистрацию</button>
+      </form>
+    {% else %}
+      <h2>Регистрация закрыта</h2>
+      {% if latest_invite.registered_user %}
+        <p>Последний созданный аккаунт: <strong>{% firstof latest_invite.registered_user.get_full_name latest_invite.registered_user.username %}</strong>. Повторно использовать его ссылку нельзя.</p>
+      {% endif %}
+      <form method="post">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="open">
+        <button class="button" type="submit">Создать одноразовую ссылку</button>
+      </form>
+    {% endif %}
+  </section>
+{% endblock %}

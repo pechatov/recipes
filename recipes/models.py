@@ -1,3 +1,4 @@
+import hashlib
 import re
 import unicodedata
 from decimal import Decimal
@@ -325,6 +326,12 @@ class RecipeStep(models.Model):
         validators=[validate_recipe_image],
     )
     image_imported = models.BooleanField(default=False, editable=False)
+    video_timestamp_seconds = models.PositiveIntegerField(
+        "тайм-код видео, секунды",
+        null=True,
+        blank=True,
+        editable=False,
+    )
     order = models.PositiveSmallIntegerField(default=0)
 
     class Meta:
@@ -334,6 +341,16 @@ class RecipeStep(models.Model):
 
     def __str__(self):
         return self.title or f"Шаг {self.order + 1}"
+
+    @property
+    def video_timestamp_label(self):
+        if self.video_timestamp_seconds is None:
+            return ""
+        hours, remainder = divmod(self.video_timestamp_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
 
 class ImportJob(models.Model):
@@ -381,6 +398,12 @@ class ImportJob(models.Model):
         related_name="recipe_imports",
     )
     source_title = models.CharField("название источника", max_length=300, blank=True)
+    source_title_checked_at = models.DateTimeField(
+        "последняя проверка названия источника",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
     error = models.TextField("ошибка", blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -544,6 +567,101 @@ class CartRun(models.Model):
             self.Status.CLEANING,
             self.Status.MANUAL_CHECK,
         }
+
+
+class BrowserLoginSession(models.Model):
+    class Status(models.TextChoices):
+        STARTING = "starting", "Запускается"
+        ACTIVE = "active", "Открыта"
+        COMPLETED = "completed", "Сохранена"
+        EXPIRED = "expired", "Истекла"
+        FAILED = "failed", "Ошибка"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="browser_login_sessions",
+    )
+    run = models.ForeignKey(
+        CartRun,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="browser_login_sessions",
+    )
+    remote_session_id = models.CharField(max_length=128, blank=True, unique=True, null=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.STARTING,
+        db_index=True,
+    )
+    error = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "ручной вход в браузер"
+        verbose_name_plural = "ручные входы в браузер"
+
+    def __str__(self):
+        return f"{self.user}: {self.get_status_display()}"
+
+
+class ApplicationLock(models.Model):
+    """A database row used to serialize cross-process application operations."""
+
+    name = models.CharField(max_length=32, primary_key=True)
+
+    class Meta:
+        verbose_name = "блокировка приложения"
+        verbose_name_plural = "блокировки приложения"
+
+    def __str__(self):
+        return self.name
+
+
+class RegistrationInvite(models.Model):
+    token_digest = models.CharField(max_length=64, unique=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="created_registration_invites",
+    )
+    registered_user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="registration_invite",
+    )
+    is_open = models.BooleanField(default=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "приглашение в семейную книгу"
+        verbose_name_plural = "приглашения в семейную книгу"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_open"],
+                condition=models.Q(is_open=True),
+                name="unique_open_registration_invite",
+            )
+        ]
+
+    @staticmethod
+    def digest_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def __str__(self):
+        return f"Приглашение от {self.created_by or 'владельца'}"
 
 
 class CartAttempt(models.Model):

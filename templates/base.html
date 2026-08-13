@@ -41,6 +41,7 @@
     </a>
     <nav class="site-nav" aria-label="Основная навигация">
       {% if user.is_authenticated %}
+        {% if user.is_superuser %}<a href="{% url 'registration-access' %}" class="nav-link">Доступ</a>{% endif %}
         <a href="{% url 'task-list' %}" class="nav-link tasks-nav-link">
           Задачи
           {% if active_task_count %}<span class="task-count" aria-label="Активных задач: {{ active_task_count }}">{{ active_task_count }}</span>{% endif %}
