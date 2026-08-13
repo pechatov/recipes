@@ -6,7 +6,7 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('recipes', '0011_importjob_source_title_checked_at'),
+        ('recipes', '0012_recipestep_video_timestamp_seconds'),
         ('recipes', '0012_alter_browserloginsession_user'),
     ]
 
