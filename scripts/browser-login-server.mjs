@@ -209,6 +209,7 @@ async function closeActiveSession(expectedId = null) {
 
 function issueAccess(session) {
   const token = randomToken();
+  session.accessDigests.clear();
   session.accessDigests.add(digest(token).toString("hex"));
   return `${publicPrefix}/access/${token}`;
 }

@@ -33,3 +33,15 @@ class BrowserLoginDeploymentContractTests(SimpleTestCase):
         remote_close = close_function.index("await closeCamofoxUser")
         self.assertLess(close_function.index("session.closing = true"), remote_close)
         self.assertLess(close_function.index("socket.destroy()"), remote_close)
+
+    def test_only_the_latest_unused_access_token_is_retained(self):
+        server = (ROOT / "scripts/browser-login-server.mjs").read_text()
+
+        begin = server.index("function issueAccess")
+        end = server.index("async function handleControl", begin)
+        issue_access = server[begin:end]
+
+        self.assertLess(
+            issue_access.index("session.accessDigests.clear()"),
+            issue_access.index("session.accessDigests.add"),
+        )
