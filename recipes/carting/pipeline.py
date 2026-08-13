@@ -10,6 +10,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from recipes.models import BrowserLoginSession, CartAttempt, CartItemMatch, CartRun
+from recipes.locking import CART_BROWSER_LOCK, acquire_application_lock
 
 from .client import CartAgentError, assemble_store_cart, cleanup_store_cart
 
@@ -470,6 +471,7 @@ def expire_unconfirmed_cart_runs() -> int:
 
 def claim_cleanup_run():
     with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
         run = (
             CartRun.objects.select_for_update(skip_locked=True)
             .filter(status=CartRun.Status.CLEANUP_PENDING)
@@ -536,6 +538,7 @@ def process_cart_cleanup(run: CartRun) -> None:
 
 def claim_cart_run():
     with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
         run = (
             CartRun.objects.select_for_update(skip_locked=True)
             .filter(status=CartRun.Status.PENDING)

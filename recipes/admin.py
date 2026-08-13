@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from .forms import IngredientForm, RecipeForm, StepForm
 from .models import (
+    ApplicationLock,
     BrowserLoginSession,
     CartAttempt,
     CartItemMatch,
@@ -118,5 +119,17 @@ class BrowserLoginSessionAdmin(admin.ModelAdmin):
 
 @admin.register(RegistrationInvite)
 class RegistrationInviteAdmin(admin.ModelAdmin):
-    list_display = ("created_by", "registered_user", "created_at", "expires_at", "used_at", "closed_at")
-    readonly_fields = ("token_digest", "created_by", "registered_user", "created_at", "expires_at", "used_at", "closed_at")
+    list_display = ("created_by", "registered_user", "is_open", "created_at", "expires_at", "used_at", "closed_at")
+    readonly_fields = ("token_digest", "created_by", "registered_user", "is_open", "created_at", "expires_at", "used_at", "closed_at")
+
+
+@admin.register(ApplicationLock)
+class ApplicationLockAdmin(admin.ModelAdmin):
+    list_display = ("name",)
+    readonly_fields = ("name",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

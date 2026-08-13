@@ -536,6 +536,19 @@ class BrowserLoginSession(models.Model):
         return f"{self.user}: {self.get_status_display()}"
 
 
+class ApplicationLock(models.Model):
+    """A database row used to serialize cross-process application operations."""
+
+    name = models.CharField(max_length=32, primary_key=True)
+
+    class Meta:
+        verbose_name = "блокировка приложения"
+        verbose_name_plural = "блокировки приложения"
+
+    def __str__(self):
+        return self.name
+
+
 class RegistrationInvite(models.Model):
     token_digest = models.CharField(max_length=64, unique=True)
     created_by = models.ForeignKey(
@@ -551,6 +564,7 @@ class RegistrationInvite(models.Model):
         blank=True,
         related_name="registration_invite",
     )
+    is_open = models.BooleanField(default=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(db_index=True)
     used_at = models.DateTimeField(null=True, blank=True)
@@ -560,6 +574,13 @@ class RegistrationInvite(models.Model):
         ordering = ["-created_at"]
         verbose_name = "приглашение в семейную книгу"
         verbose_name_plural = "приглашения в семейную книгу"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_open"],
+                condition=models.Q(is_open=True),
+                name="unique_open_registration_invite",
+            )
+        ]
 
     @staticmethod
     def digest_token(token: str) -> str:

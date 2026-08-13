@@ -179,6 +179,74 @@ class CartViewTests(TestCase):
         self.assertEqual(login_session.status, BrowserLoginSession.Status.COMPLETED)
         stop_session.assert_called_once_with(login_session.remote_session_id)
 
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    def test_existing_unbound_login_session_attaches_to_requested_run(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.post(reverse("cart-browser-login-start", args=[run.pk]))
+
+        self.assertRedirects(
+            response,
+            reverse("browser-login", args=[login_session.pk]),
+            fetch_redirect_response=False,
+        )
+        login_session.refresh_from_db()
+        self.assertEqual(login_session.run, run)
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    def test_existing_login_session_rejects_a_different_run(self):
+        first_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+        second_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            run=first_run,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.post(
+            reverse("cart-browser-login-start", args=[second_run.pk]),
+            follow=True,
+        )
+
+        self.assertContains(response, "Окно входа уже связано с другой сборкой")
+        login_session.refresh_from_db()
+        self.assertEqual(login_session.run, first_run)
+
     def test_store_preferences_can_disable_and_reorder_stores(self):
         get_store_preferences(self.user)
         response = self.client.post(

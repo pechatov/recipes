@@ -303,6 +303,7 @@ After=recipes-camofox.service network-online.target
 Environment=PATH={home}/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin
 Environment=BROWSER_LOGIN_BIND_HOST={os.environ['PI_ADDRESS']}
 Environment=BROWSER_LOGIN_PORT=9380
+Environment=BROWSER_LOGIN_STATE_PATH={home}/.local/share/recipes-browser-login/active-session.json
 Environment=HERMES_ROOT={home}/.hermes/hermes-agent
 Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
 EnvironmentFile={home}/.hermes/profiles/{profile}/.env
@@ -328,9 +329,13 @@ path = (
     / f"hermes-gateway-{os.environ['HERMES_PROFILE']}.service.d"
     / "recipes-browser.conf"
 )
-path.write_text("""[Unit]
-Requires=recipes-camofox.service
-After=recipes-camofox.service
+path.write_text(f"""[Unit]
+Requires=recipes-camofox.service recipes-browser-login.service
+BindsTo=recipes-browser-login.service
+After=recipes-camofox.service recipes-browser-login.service
+
+[Service]
+ExecStartPre=/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused http://{os.environ['PI_ADDRESS']}:9380/healthz
 """)
 path.chmod(0o600)
 PY

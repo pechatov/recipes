@@ -2,6 +2,7 @@ from datetime import datetime, timezone as datetime_timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError, transaction
 from django.test import Client, TestCase
 from django.urls import reverse
 
@@ -91,6 +92,20 @@ class RegistrationAccessTests(TestCase):
         response = self.client.get(reverse("registration-access"))
 
         self.assertEqual(response.status_code, 302)
+
+    def test_database_rejects_multiple_open_invites(self):
+        RegistrationInvite.objects.create(
+            token_digest="a" * 64,
+            created_by=self.owner,
+            expires_at=datetime.now(datetime_timezone.utc),
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            RegistrationInvite.objects.create(
+                token_digest="b" * 64,
+                created_by=self.owner,
+                expires_at=datetime.now(datetime_timezone.utc),
+            )
 
 
 class RecipeViewTests(TestCase):

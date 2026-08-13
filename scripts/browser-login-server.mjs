@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -15,12 +17,13 @@ const hermesHome = process.env.HERMES_HOME || "";
 const hermesPython = `${hermesRoot}/venv/bin/python`;
 const camofoxUrl = "http://127.0.0.1:9377";
 const noVncUrl = "http://127.0.0.1:6080";
+const statePath = process.env.BROWSER_LOGIN_STATE_PATH || "";
 const publicPrefix = "/browser-login";
 const scopePattern = /^recipes-cart-user-[1-9][0-9]*$/;
 const idPattern = /^[A-Za-z0-9_-]{20,128}$/;
 const proxy = httpProxy.createProxyServer({ target: noVncUrl, ws: true });
 
-if (!controlKey || !hermesRoot || !hermesHome || !Number.isInteger(port)) {
+if (!controlKey || !hermesRoot || !hermesHome || !statePath || !Number.isInteger(port)) {
   throw new Error("Browser login service environment is incomplete");
 }
 
@@ -29,6 +32,40 @@ let startingSession = false;
 
 function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString("base64url");
+}
+
+function persistRecoveryState(session) {
+  const temporaryPath = `${statePath}.tmp`;
+  const file = fs.openSync(temporaryPath, "w", 0o600);
+  try {
+    fs.writeFileSync(
+      file,
+      `${JSON.stringify({ id: session.id, userId: session.userId, scope: session.scope })}\n`,
+    );
+    fs.fsyncSync(file);
+  } finally {
+    fs.closeSync(file);
+  }
+  fs.renameSync(temporaryPath, statePath);
+  fsyncStateDirectory();
+}
+
+function fsyncStateDirectory() {
+  const directory = fs.openSync(path.dirname(statePath), "r");
+  try {
+    fs.fsyncSync(directory);
+  } finally {
+    fs.closeSync(directory);
+  }
+}
+
+function clearRecoveryState() {
+  try {
+    fs.unlinkSync(statePath);
+    fsyncStateDirectory();
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
 }
 
 function digest(value) {
@@ -103,8 +140,7 @@ async function camofoxIdentity(scope) {
   return identity;
 }
 
-async function openCamofox(scope) {
-  const identity = await camofoxIdentity(scope);
+async function openCamofox(identity) {
   const response = await fetch(`${camofoxUrl}/tabs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -119,19 +155,39 @@ async function openCamofox(scope) {
   return identity.user_id;
 }
 
+async function closeCamofoxUser(userId) {
+  const response = await fetch(`${camofoxUrl}/sessions/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok && response.status !== 404) throw new Error(`camofox_stop_${response.status}`);
+}
+
+async function recoverInterruptedSession() {
+  let recovery;
+  try {
+    recovery = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (!recovery || !idPattern.test(String(recovery.id || "")) || !recovery.userId) {
+    throw new Error("Invalid browser login recovery state");
+  }
+  await closeCamofoxUser(recovery.userId);
+  clearRecoveryState();
+}
+
 async function closeActiveSession(expectedId = null) {
   const session = activeSession;
   if (!session || (expectedId && session.id !== expectedId)) return false;
   try {
-    const response = await fetch(`${camofoxUrl}/sessions/${encodeURIComponent(session.userId)}`, {
-      method: "DELETE",
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!response.ok && response.status !== 404) throw new Error(`camofox_stop_${response.status}`);
+    await closeCamofoxUser(session.userId);
   } catch (error) {
     console.error("Failed to stop Camofox login session", error);
     throw error;
   }
+  clearRecoveryState();
   if (activeSession?.id === session.id) activeSession = null;
   return true;
 }
@@ -158,12 +214,21 @@ async function handleControl(request, response, url) {
     if (activeSession) await closeActiveSession();
     startingSession = true;
     try {
-      const userId = await openCamofox(scope);
+      const identity = await camofoxIdentity(scope);
+      const sessionId = randomToken(24);
+      persistRecoveryState({ id: sessionId, userId: identity.user_id, scope });
+      try {
+        await openCamofox(identity);
+      } catch (error) {
+        await closeCamofoxUser(identity.user_id).catch(() => {});
+        clearRecoveryState();
+        throw error;
+      }
       const cookieToken = randomToken();
       activeSession = {
-        id: randomToken(24),
+        id: sessionId,
         scope,
-        userId,
+        userId: identity.user_id,
         expiresAt: Date.now() + lifetimeMinutes * 60_000,
         cookieDigest: digest(cookieToken),
         cookieToken,
@@ -257,6 +322,8 @@ setInterval(() => {
     closeActiveSession().catch((error) => console.error("Failed to expire browser login session", error));
   }
 }, 15_000).unref();
+
+await recoverInterruptedSession();
 
 server.listen(port, bindHost, () => {
   console.log(`Browser login service listening on http://${bindHost}:${port}`);
