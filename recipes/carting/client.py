@@ -284,10 +284,18 @@ def _run_adapter_task(
             mutation_possible=mutation_possible,
         )
     if response.is_error:
+        reported_mutation = data.get("mutation_possible")
         raise CartAgentError(
             str(data.get("summary") or "Адаптер корзины отклонил запрос."),
-            mutation_possible=mutation_possible
-            or bool(data.get("mutation_possible")),
+            # A valid structured response is sent only after the adapter has
+            # finished and released its profile. Trust its explicit mutation
+            # classification; retain the conservative phase default when an
+            # older/nonconforming response omits the field.
+            mutation_possible=(
+                reported_mutation
+                if isinstance(reported_mutation, bool)
+                else mutation_possible
+            ),
         )
     return data
 

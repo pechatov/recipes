@@ -1116,6 +1116,29 @@ class CartPipelineTests(TestCase):
     @override_settings(
         CART_ADAPTER_BASE_URL="http://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client.httpx.Client")
+    def test_adapter_trusts_explicit_safe_http_rejection(self, client):
+        response = client.return_value.__enter__.return_value.post.return_value
+        response.json.return_value = {
+            "status": "failed",
+            "summary": "Запрос отклонён до изменения корзины.",
+            "mutation_possible": False,
+        }
+        response.is_error = True
+
+        with self.assertRaises(CartAgentError) as caught:
+            _run_adapter_task(
+                "/v1/apply",
+                {"scope": "recipes-cart-user-1", "store": "auchan"},
+                mutation_possible=True,
+            )
+
+        self.assertFalse(caught.exception.mutation_possible)
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
     @patch("recipes.carting.client.run_store_cart_task")
