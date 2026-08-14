@@ -9,12 +9,27 @@ set -Eeuo pipefail
 
 HERMES_PROFILE="${HERMES_PROFILE:-recipecart}"
 HERMES_MODEL="${HERMES_MODEL:-gpt-5.6-sol}"
+PI_ADAPTER_PORT="${PI_ADAPTER_PORT:-9381}"
 LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-ssh "$PI_SSH_HOST" 'install -d -m 0700 "$HOME/.local/share/recipes-browser-login" && install -m 0600 /dev/stdin "$HOME/.local/share/recipes-browser-login/server.mjs"' \
+ssh "$PI_SSH_HOST" 'set -e
+target="$HOME/.local/share/recipes-browser-login/server.mjs"
+install -d -m 0700 "${target%/*}"
+staging="$(mktemp "${target}.XXXXXX")"
+trap '\''rm -f "$staging"'\'' EXIT
+cat >"$staging"
+install -m 0600 "$staging" "$target"' \
   <"$LOCAL_ROOT/scripts/browser-login-server.mjs"
+ssh "$PI_SSH_HOST" 'set -e
+target="$HOME/.local/share/recipes-cart-adapter/server.mjs"
+install -d -m 0700 "${target%/*}"
+staging="$(mktemp "${target}.XXXXXX")"
+trap '\''rm -f "$staging"'\'' EXIT
+cat >"$staging"
+install -m 0600 "$staging" "$target"' \
+  <"$LOCAL_ROOT/scripts/cart-adapter-server.mjs"
 
-ssh "$PI_SSH_HOST" "PI_ADDRESS='$PI_ADDRESS' PI_API_PORT='$PI_API_PORT' HERMES_PROFILE='$HERMES_PROFILE' HERMES_MODEL='$HERMES_MODEL' bash -s" <<'REMOTE'
+ssh "$PI_SSH_HOST" "PI_ADDRESS='$PI_ADDRESS' PI_API_PORT='$PI_API_PORT' PI_ADAPTER_PORT='$PI_ADAPTER_PORT' HERMES_PROFILE='$HERMES_PROFILE' HERMES_MODEL='$HERMES_MODEL' bash -s" <<'REMOTE'
 set -Eeuo pipefail
 HERMES_ROOT="$HOME/.hermes/hermes-agent"
 HERMES_PY="$HERMES_ROOT/venv/bin/python"
@@ -199,6 +214,7 @@ updates = {
     "CAMOFOX_LOCALE": "ru-RU",
     "CAMOFOX_TIMEZONE": "Europe/Moscow",
     "BROWSER_LOGIN_CONTROL_KEY": values.get("BROWSER_LOGIN_CONTROL_KEY") or secrets.token_urlsafe(48),
+    "CART_ADAPTER_CONTROL_KEY": values.get("CART_ADAPTER_CONTROL_KEY") or secrets.token_urlsafe(48),
 }
 obsolete = {
     "AGENT_BROWSER_PROFILE",
@@ -319,6 +335,35 @@ WantedBy=default.target
 path.chmod(0o600)
 PY
 
+HERMES_PROFILE="$HERMES_PROFILE" python3 - <<'PY'
+import os
+from pathlib import Path
+
+home = Path.home()
+profile = os.environ["HERMES_PROFILE"]
+path = home / ".config/systemd/user/recipes-cart-adapter.service"
+path.write_text(f"""[Unit]
+Description=Deterministic Yandex Food API adapter for recipes carts
+Requires=recipes-camofox.service recipes-browser-login.service
+After=recipes-camofox.service recipes-browser-login.service network-online.target
+
+[Service]
+Environment=PATH={home}/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CART_ADAPTER_BIND_HOST={os.environ['PI_ADDRESS']}
+Environment=CART_ADAPTER_PORT={os.environ['PI_ADAPTER_PORT']}
+Environment=HERMES_ROOT={home}/.hermes/hermes-agent
+Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
+EnvironmentFile={home}/.hermes/profiles/{profile}/.env
+ExecStart={home}/.hermes/node/bin/node {home}/.local/share/recipes-cart-adapter/server.mjs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+""")
+path.chmod(0o600)
+PY
+
 printf 'y\ny\n' | "$HERMES_PY" -m hermes_cli.main -p "$HERMES_PROFILE" gateway install --force >/dev/null
 install -d -m 0700 "$HOME/.config/systemd/user/hermes-gateway-$HERMES_PROFILE.service.d"
 HERMES_PROFILE="$HERMES_PROFILE" python3 - <<'PY'
@@ -345,25 +390,28 @@ systemctl --user daemon-reload
 systemctl --user disable --now recipes-xvfb.service >/dev/null 2>&1 || true
 systemctl --user enable recipes-camofox.service >/dev/null
 systemctl --user enable recipes-browser-login.service >/dev/null
+systemctl --user enable recipes-cart-adapter.service >/dev/null
 systemctl --user restart recipes-camofox.service
 systemctl --user restart recipes-browser-login.service
+systemctl --user restart recipes-cart-adapter.service
 systemctl --user restart "hermes-gateway-$HERMES_PROFILE.service"
 
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:9377/health" >/dev/null 2>&1 \
     && curl -fsS "http://$PI_ADDRESS:$PI_API_PORT/health" >/dev/null 2>&1 \
-    && curl -fsS "http://$PI_ADDRESS:9380/healthz" >/dev/null 2>&1; then
+    && curl -fsS "http://$PI_ADDRESS:9380/healthz" >/dev/null 2>&1 \
+    && curl -fsS "http://$PI_ADDRESS:$PI_ADAPTER_PORT/healthz" >/dev/null 2>&1; then
     exit 0
   fi
   sleep 1
 done
-echo "Hermes cart API did not become healthy" >&2
+echo "Cart automation services did not become healthy" >&2
 exit 1
 REMOTE
 
-# Pass both bearer keys directly from Pi to the root-owned TrueNAS env file.
-ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY']}))\"" \
-  | ssh "$TRUENAS_SSH_HOST" "sudo env TRUENAS_ENV='$TRUENAS_ENV' CART_BASE_URL='http://$PI_ADDRESS:$PI_API_PORT/v1' python3 -c '
+# Pass the bearer keys directly from Pi to the root-owned TrueNAS env file.
+ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY'], 'adapter': values['CART_ADAPTER_CONTROL_KEY']}))\"" \
+  | ssh "$TRUENAS_SSH_HOST" "sudo env TRUENAS_ENV='$TRUENAS_ENV' CART_BASE_URL='http://$PI_ADDRESS:$PI_API_PORT/v1' CART_ADAPTER_URL='http://$PI_ADDRESS:$PI_ADAPTER_PORT' python3 -c '
 import json
 import os
 import sys
@@ -371,9 +419,13 @@ from pathlib import Path
 
 path = Path(os.environ[\"TRUENAS_ENV\"])
 keys = json.loads(sys.stdin.read())
-if not keys.get(\"cart\") or not keys.get(\"browser\") or not path.is_file():
-    raise SystemExit(\"Missing Hermes key or TrueNAS application .env\")
+if not all(keys.get(name) for name in (\"cart\", \"browser\", \"adapter\")) or not path.is_file():
+    raise SystemExit(\"Missing cart automation key or TrueNAS application .env\")
 values = {
+    \"CART_ADAPTER_BASE_URL\": os.environ[\"CART_ADAPTER_URL\"],
+    \"CART_ADAPTER_API_KEY\": keys[\"adapter\"],
+    \"CART_ADAPTER_TIMEOUT_SECONDS\": \"120\",
+    \"CART_ADAPTER_FALLBACK_TO_HERMES\": \"true\",
     \"CART_AI_BASE_URL\": os.environ[\"CART_BASE_URL\"],
     \"CART_AI_API_KEY\": keys[\"cart\"],
     \"CART_AI_MODEL\": \"recipes-cart-sol\",

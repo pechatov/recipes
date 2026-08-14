@@ -1320,33 +1320,18 @@ def cart_manual_resolved(request, pk):
         attempt.save(update_fields=["result", "cart_url"])
 
         run.error = ""
+        run.status = CartRun.Status.CANCELLED
+        run.cleaned_at = now
+        run.finished_at = now
         run.confirmation_deadline = None
-        if run.cleanup_requested_at:
-            run.status = CartRun.Status.CANCELLED
-            run.cleaned_at = now
-            run.finished_at = now
-            fields = [
-                "status",
-                "cleaned_at",
-                "finished_at",
-                "confirmation_deadline",
-                "error",
-            ]
-            message = "Ручная проверка сохранена; сборка отменена."
-        else:
-            run.status = CartRun.Status.PENDING
-            run.selected_attempt = None
-            run.started_at = None
-            run.finished_at = None
-            fields = [
-                "status",
-                "selected_attempt",
-                "started_at",
-                "finished_at",
-                "confirmation_deadline",
-                "error",
-            ]
-            message = "Ручная проверка сохранена; сборка снова поставлена в очередь."
+        fields = [
+            "status",
+            "cleaned_at",
+            "finished_at",
+            "confirmation_deadline",
+            "error",
+        ]
+        message = "Ручная проверка сохранена; сборка отменена."
         run.save(update_fields=fields)
 
     messages.success(request, message)

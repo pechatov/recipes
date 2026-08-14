@@ -10,8 +10,8 @@
   <section class="cart-run-status status-{{ run.status }}">
     {% if run.status == 'pending' or run.status == 'processing' %}
       <div class="status-orb is-working">…</div>
-      <h2>{% if run.status == 'pending' %}Ожидает своей очереди{% else %}Hermes собирает корзину{% endif %}</h2>
-      <p>Поиск идёт последовательно и может занять несколько минут. Эту страницу можно закрыть.</p>
+      <h2>{% if run.status == 'pending' %}Ожидает своей очереди{% else %}Сервис собирает корзину{% endif %}</h2>
+      <p>Товары ищутся параллельно; обычно сборка занимает несколько десятков секунд. Эту страницу можно закрыть.</p>
     {% elif run.status == 'completed' %}
       <div class="status-orb is-done">✓</div>
       <h2>Все ингредиенты найдены</h2>
@@ -70,7 +70,7 @@
         </form>
         {% endif %}
       {% endif %}
-      {% if run.status == 'login_required' or run.status == 'failed' %}
+      {% if run.status == 'login_required' %}
         <form method="post" action="{% url 'cart-browser-login-start' run.pk %}">
           {% csrf_token %}
           <button class="button" type="submit">Войти в Яндекс Еду</button>
@@ -78,6 +78,11 @@
         <form method="post" action="{% url 'cart-retry' run.pk %}">
           {% csrf_token %}
           <button class="button button-secondary" type="submit">Уже вошли — продолжить</button>
+        </form>
+      {% elif run.status == 'failed' %}
+        <form method="post" action="{% url 'cart-retry' run.pk %}">
+          {% csrf_token %}
+          <button class="button" type="submit">Повторить сборку</button>
         </form>
       {% endif %}
       {% if run.status == 'manual_check' %}

@@ -73,3 +73,40 @@ class BrowserLoginDeploymentContractTests(SimpleTestCase):
         self.assertIn('proxy_set_header Connection "upgrade";', browser_location)
         self.assertNotIn(r'Connection \"upgrade\"', browser_location)
         self.assertNotIn("$http_cookie", browser_location)
+
+
+class CartAdapterDeploymentContractTests(SimpleTestCase):
+    def test_adapter_is_installed_as_a_camofox_dependent_service(self):
+        script = (ROOT / "scripts/connect-hermes-cart-pi.sh").read_text()
+
+        self.assertIn("recipes-cart-adapter.service", script)
+        self.assertIn(
+            "Requires=recipes-camofox.service recipes-browser-login.service",
+            script,
+        )
+        self.assertIn("CART_ADAPTER_CONTROL_KEY", script)
+        self.assertIn("CART_ADAPTER_BASE_URL", script)
+        self.assertIn("CART_ADAPTER_FALLBACK_TO_HERMES", script)
+
+    def test_adapter_exposes_only_bounded_cart_operations(self):
+        server = (ROOT / "scripts/cart-adapter-server.mjs").read_text()
+
+        self.assertIn('"/v1/search"', server)
+        self.assertIn('"/v1/cart-state"', server)
+        self.assertIn('"/v1/apply"', server)
+        self.assertIn('"/v1/cleanup"', server)
+        self.assertIn("/api/v1/cart", server)
+        self.assertIn("/api/v1/cart/add_bulk", server)
+        self.assertIn("item_id:", server)
+        self.assertIn("place_business: context.place_business", server)
+        self.assertIn('soft_multi: "true"', server)
+        self.assertIn("placeSlug: context.place_slug", server)
+        self.assertIn("removeLegacyItemExpression", server)
+        self.assertIn("evaluateCartMutation", server)
+        self.assertNotIn("/eats/v1/sku-cart", server)
+        self.assertIn("changedStatus >= 400 && changedStatus < 500", server)
+        self.assertIn("sealSelection", server)
+        self.assertIn("openSelection", server)
+        self.assertIn('createCipheriv("aes-256-gcm"', server)
+        self.assertIn("rawLatitude === null || rawLongitude === null", server)
+        self.assertNotIn('url.pathname === "/evaluate"', server)

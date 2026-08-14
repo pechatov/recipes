@@ -5,7 +5,7 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError
 from django.db.models.deletion import ProtectedError
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -29,6 +29,7 @@ from recipes.carting.client import (
     cart_browser_session_key,
     cleanup_store_cart,
 )
+from recipes.carting.matching import choose_product
 from recipes.models import (
     BrowserLoginSession,
     CartAttempt,
@@ -546,6 +547,23 @@ class CartViewTests(TestCase):
         self.assertContains(response, "Не проверено")
         self.assertNotContains(response, "Ничего не найдено")
 
+    def test_failed_cart_offers_retry_without_login_actions(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.FAILED,
+            store_priority=["magnit"],
+            ingredient_snapshot=[],
+            error="API магазина отклонил товар.",
+        )
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Повторить сборку")
+        self.assertNotContains(response, "Войти в Яндекс Еду")
+        self.assertNotContains(response, "Уже вошли — продолжить")
+
     def test_cart_detail_keeps_separate_matches_for_duplicate_ingredient_names(self):
         run = CartRun.objects.create(
             recipe=self.recipe,
@@ -695,7 +713,7 @@ class CartViewTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.CLEANUP_PENDING)
         self.assertIsNotNone(run.cleanup_requested_at)
 
-    def test_manual_check_resolution_requeues_unknown_assembly(self):
+    def test_manual_check_resolution_cancels_unknown_assembly(self):
         run = CartRun.objects.create(
             recipe=self.recipe,
             requested_by=self.user,
@@ -718,8 +736,9 @@ class CartViewTests(TestCase):
         self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
         run.refresh_from_db()
         attempt.refresh_from_db()
-        self.assertEqual(run.status, CartRun.Status.PENDING)
-        self.assertIsNone(run.selected_attempt)
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertEqual(run.selected_attempt, attempt)
+        self.assertIsNotNone(run.cleaned_at)
         self.assertFalse(attempt.result["mutation_unknown"])
         self.assertTrue(attempt.result["cart_cleared"])
 
@@ -747,6 +766,96 @@ class CartViewTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
         self.assertIsNotNone(run.cleaned_at)
+
+
+class CartProductMatchingTests(SimpleTestCase):
+    def candidate(self, **overrides):
+        candidate = {
+            "product_id": "product-12345678",
+            "sku_id": "product-12345678",
+            "name": "Молоко 3,2% 900 мл",
+            "weight": "900 ml",
+            "available": True,
+            "in_stock": 10,
+            "product_url": (
+                "https://eda.yandex.ru/retail/shop/product/product-12345678"
+                "?placeSlug=shop-nearby"
+            ),
+        }
+        candidate.update(overrides)
+        return candidate
+
+    def test_calculates_package_count_from_metric_units(self):
+        match = choose_product(
+            {
+                "name": "Молоко",
+                "search_query": "молоко 3,2%",
+                "quantity": "1,5",
+                "unit": "л",
+            },
+            [self.candidate()],
+        )
+
+        self.assertEqual(match["quality"], "exact")
+        self.assertEqual(match["package_count"], 2)
+
+    def test_skips_an_exact_product_with_insufficient_stock(self):
+        match = choose_product(
+            {
+                "name": "Молоко",
+                "search_query": "молоко",
+                "quantity": "1000",
+                "unit": "мл",
+            },
+            [
+                self.candidate(in_stock=1, weight="400 ml", name="Молоко 400 мл"),
+                self.candidate(
+                    product_id="product-87654321",
+                    sku_id="product-87654321",
+                    weight="1 l",
+                    name="Молоко 1 л",
+                    product_url=(
+                        "https://eda.yandex.ru/retail/shop/product/product-87654321"
+                        "?placeSlug=shop-nearby"
+                    ),
+                ),
+            ],
+        )
+
+        self.assertEqual(match["product_id"], "product-87654321")
+        self.assertEqual(match["package_count"], 1)
+
+    def test_unexpected_material_modifier_is_a_reviewable_substitute(self):
+        match = choose_product(
+            {
+                "name": "Молоко",
+                "search_query": "молоко",
+                "quantity": "500",
+                "unit": "мл",
+            },
+            [self.candidate(name="Молоко овсяное 900 мл")],
+        )
+
+        self.assertEqual(match["quality"], "substitute")
+        self.assertTrue(match["warning"])
+
+    def test_understands_yandex_english_multipack_weight(self):
+        match = choose_product(
+            {
+                "name": "Яйца",
+                "search_query": "яйца",
+                "quantity": "12",
+                "unit": "шт",
+            },
+            [
+                self.candidate(
+                    name="Яйца куриные 12 шт",
+                    weight="2 x 6 pcs",
+                )
+            ],
+        )
+
+        self.assertEqual(match["package_count"], 1)
 
 
 class CartPipelineTests(TestCase):
@@ -899,6 +1008,230 @@ class CartPipelineTests(TestCase):
             "cleanup",
             added_items=added_items,
             cart_url="https://eda.yandex.ru/cart",
+        )
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_fast_adapter_searches_then_applies_without_hermes(
+        self, adapter_task, run_task
+    ):
+        product_id = "12345678-1234-1234-1234-123456789abc"
+        product_url = (
+            f"https://eda.yandex.ru/retail/auchan/product/{product_id}"
+            "?placeSlug=auchan-nearby"
+        )
+        adapter_task.side_effect = [
+            {
+                "status": "ready",
+                "selection_token": "signed-selection",
+                "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
+                "elapsed_ms": 450,
+                "results": [
+                    {
+                        "index": 0,
+                        "candidates": [
+                            {
+                                "product_id": product_id,
+                                "sku_id": product_id,
+                                "name": "Спагетти 450 г",
+                                "weight": "450 g",
+                                "available": True,
+                                "in_stock": 8,
+                                "product_url": product_url,
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "status": "applied",
+                "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
+                "elapsed_ms": 300,
+                "additions": [{"product_id": product_id, "added_quantity": 1}],
+            },
+        ]
+        run = self.make_run()
+
+        result = assemble_store_cart(run, "auchan")
+
+        self.assertEqual(result["status"], "exact")
+        self.assertEqual(result["provider"], "yandex_api_adapter")
+        self.assertEqual(result["items"][0]["package_count"], 1)
+        self.assertEqual(result["items"][0]["added_package_count"], 1)
+        self.assertEqual(result["timings_ms"], {"search": 450, "apply": 300})
+        self.assertEqual(adapter_task.call_count, 2)
+        self.assertEqual(adapter_task.call_args_list[0].args[0], "/v1/search")
+        self.assertEqual(adapter_task.call_args_list[1].args[0], "/v1/apply")
+        self.assertFalse(adapter_task.call_args_list[0].kwargs["mutation_possible"])
+        self.assertTrue(adapter_task.call_args_list[1].kwargs["mutation_possible"])
+        run_task.assert_not_called()
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._search_with_adapter")
+    def test_adapter_failure_before_search_mutation_falls_back_to_hermes(
+        self, adapter_search, run_task
+    ):
+        adapter_search.side_effect = CartAgentError("Адаптер недоступен")
+        run_task.return_value = {"status": "exact", "items": []}
+        run = self.make_run()
+
+        result = assemble_store_cart(run, "auchan")
+
+        self.assertEqual(result, run_task.return_value)
+        run_task.assert_called_once_with(run, "auchan", "assemble")
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_adapter_never_falls_back_after_apply_was_dispatched(
+        self, adapter_task, run_task
+    ):
+        product_id = "12345678-1234-1234-1234-123456789abc"
+        adapter_task.side_effect = [
+            {
+                "status": "ready",
+                "selection_token": "signed-selection",
+                "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
+                "results": [
+                    {
+                        "index": 0,
+                        "candidates": [
+                            {
+                                "product_id": product_id,
+                                "sku_id": product_id,
+                                "name": "Спагетти 450 г",
+                                "weight": "450 g",
+                                "available": True,
+                                "in_stock": 8,
+                                "product_url": (
+                                    "https://eda.yandex.ru/retail/auchan/product/"
+                                    f"{product_id}?placeSlug=auchan-nearby"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            },
+            CartAgentError("Связь оборвалась", mutation_possible=True),
+        ]
+        run = self.make_run()
+
+        with self.assertRaises(CartAgentError) as raised:
+            assemble_store_cart(run, "auchan")
+
+        self.assertTrue(raised.exception.mutation_possible)
+        run_task.assert_not_called()
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=False,
+    )
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_adapter_safe_apply_rejection_does_not_require_manual_check(
+        self, adapter_task
+    ):
+        product_id = "12345678-1234-1234-1234-123456789abc"
+        adapter_task.side_effect = [
+            {
+                "status": "ready",
+                "selection_token": "signed-selection",
+                "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
+                "results": [
+                    {
+                        "index": 0,
+                        "candidates": [
+                            {
+                                "product_id": product_id,
+                                "sku_id": product_id,
+                                "name": "Спагетти 450 г",
+                                "weight": "450 g",
+                                "available": True,
+                                "in_stock": 8,
+                                "product_url": (
+                                    "https://eda.yandex.ru/retail/auchan/product/"
+                                    f"{product_id}?placeSlug=auchan-nearby"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "status": "failed",
+                "summary": "Запрос отклонён до изменения корзины.",
+                "mutation_possible": False,
+            },
+        ]
+        run = self.make_run()
+
+        with self.assertRaises(CartAgentError) as raised:
+            assemble_store_cart(run, "auchan")
+
+        self.assertFalse(raised.exception.mutation_possible)
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_adapter_does_not_mutate_when_nothing_matches(self, adapter_task):
+        adapter_task.return_value = {
+            "status": "ready",
+            "selection_token": "signed-selection",
+            "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
+            "results": [{"index": 0, "candidates": []}],
+        }
+        run = self.make_run()
+
+        result = assemble_store_cart(run, "auchan")
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(result["cart_cleared"])
+        self.assertEqual(result["items"][0]["quality"], "missing")
+        adapter_task.assert_called_once()
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_cleanup_uses_exact_adapter_journal(self, adapter_task):
+        adapter_task.return_value = {"status": "cleared", "summary": "Очищено"}
+        run = self.make_run()
+
+        result = cleanup_store_cart(
+            run,
+            "auchan",
+            [{"product_id": "product-12345678", "package_count": 2}],
+            "https://eda.yandex.ru/cart",
+        )
+
+        self.assertEqual(result["status"], "cleared")
+        adapter_task.assert_called_once_with(
+            "/v1/cleanup",
+            {
+                "scope": "recipes-cart-user-1",
+                "store": "auchan",
+                "items": [
+                    {"product_id": "product-12345678", "package_count": 2}
+                ],
+            },
+            mutation_possible=True,
         )
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
@@ -1141,6 +1474,7 @@ class CartPipelineTests(TestCase):
         self.assertEqual(run.next_store_index, 0)
         self.assertEqual(run.selected_attempt, attempt)
         self.assertTrue(attempt.result["mutation_unknown"])
+        self.assertEqual(attempt.result["error"], "Соединение оборвалось")
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_captcha_pauses_same_store_for_manual_verification(self, assemble):

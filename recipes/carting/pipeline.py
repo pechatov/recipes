@@ -378,9 +378,13 @@ def process_cart_run(run: CartRun) -> None:
         try:
             data = assemble_store_cart(run, store)
         except CartAgentError as error:
+            diagnostic = _text(str(error), 500)
             attempt.status = CartAttempt.Status.FAILED
-            attempt.summary = "Браузерный агент не завершил одноэтапную сборку."
-            attempt.result = {"mutation_unknown": error.mutation_possible}
+            attempt.summary = diagnostic or "Сервис не завершил одноэтапную сборку."
+            attempt.result = {
+                "mutation_unknown": error.mutation_possible,
+                "error": diagnostic,
+            }
             attempt.finished_at = timezone.now()
             attempt.save(update_fields=["status", "summary", "result", "finished_at"])
             if error.mutation_possible:

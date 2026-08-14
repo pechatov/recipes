@@ -7,6 +7,8 @@ from typing import Any
 import httpx
 from django.conf import settings
 
+from .matching import choose_product
+
 
 class CartAgentError(Exception):
     """A safe, user-facing cart-agent failure."""
@@ -114,6 +116,13 @@ def _chat_url(base_url: str) -> str:
     if base.endswith("/v1"):
         return f"{base}/chat/completions"
     return f"{base}/v1/chat/completions"
+
+
+def _adapter_url(path: str) -> str:
+    base = settings.CART_ADAPTER_BASE_URL.rstrip("/")
+    if base.endswith("/v1") and path.startswith("/v1/"):
+        return f"{base}{path[3:]}"
+    return f"{base}{path}"
 
 
 def cart_browser_session_key(user_id: int, shard: int | None = None) -> str:
@@ -232,6 +241,231 @@ def run_store_cart_task(
         ) from error
 
 
+def _run_adapter_task(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    mutation_possible: bool,
+) -> dict[str, Any]:
+    if not settings.CART_ADAPTER_BASE_URL or not settings.CART_ADAPTER_API_KEY:
+        raise CartAgentError("Быстрый адаптер корзины ещё не подключён.")
+    headers = {
+        "Authorization": f"Bearer {settings.CART_ADAPTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        with httpx.Client(
+            timeout=settings.CART_ADAPTER_TIMEOUT_SECONDS,
+            trust_env=False,
+        ) as client:
+            response = client.post(
+                _adapter_url(path),
+                headers=headers,
+                json=payload,
+            )
+    except httpx.HTTPError as error:
+        raise CartAgentError(
+            "Адаптер корзины недоступен.",
+            mutation_possible=mutation_possible,
+        ) from error
+    try:
+        data = response.json()
+    except ValueError as error:
+        raise CartAgentError(
+            "Адаптер корзины вернул неверный ответ.",
+            mutation_possible=mutation_possible,
+        ) from error
+    if not isinstance(data, dict):
+        raise CartAgentError(
+            "Адаптер корзины вернул неверный ответ.",
+            mutation_possible=mutation_possible,
+        )
+    if response.is_error:
+        raise CartAgentError(
+            str(data.get("summary") or "Адаптер корзины отклонил запрос."),
+            mutation_possible=mutation_possible
+            or bool(data.get("mutation_possible")),
+        )
+    return data
+
+
+def _adapter_status_result(
+    status: str,
+    summary: str,
+    *,
+    cart_url: str = "",
+    items: list[dict[str, Any]] | None = None,
+    cart_cleared: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "cart_url": cart_url,
+        "summary": summary,
+        "cart_cleared": cart_cleared,
+        "items": items or [],
+        "provider": "yandex_api_adapter",
+    }
+
+
+def _search_with_adapter(run, store: str) -> dict[str, Any]:
+    scope = cart_browser_session_key(run.requested_by_id)
+    ingredients = run.ingredient_snapshot
+    return _run_adapter_task(
+        "/v1/search",
+        {
+            "scope": scope,
+            "store": store,
+            "ingredients": [
+                {
+                    "name": ingredient.get("name", ""),
+                    "search_query": ingredient.get("search_query", ""),
+                    "quantity": ingredient.get("quantity", ""),
+                    "unit": ingredient.get("unit", ""),
+                }
+                for ingredient in ingredients
+                if isinstance(ingredient, dict)
+            ],
+        },
+        mutation_possible=False,
+    )
+
+
+def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
+    search = _search_with_adapter(run, store)
+    search_status = str(search.get("status") or "")
+    if search_status in {"login_required", "blocked"}:
+        return _adapter_status_result(
+            search_status,
+            str(search.get("summary") or "Нужно открыть Яндекс Еду вручную."),
+        )
+    if search_status == "incomplete":
+        return _adapter_status_result(
+            "incomplete",
+            str(search.get("summary") or "Выбранный магазин недоступен."),
+            cart_cleared=True,
+        )
+    if search_status != "ready":
+        raise CartAgentError(
+            str(search.get("summary") or "Быстрый поиск товаров не завершился."),
+            mutation_possible=bool(search.get("mutation_possible")),
+        )
+
+    raw_results = search.get("results")
+    selection_token = str(search.get("selection_token") or "")
+    if not isinstance(raw_results, list) or not selection_token:
+        raise CartAgentError("Быстрый поиск вернул неполный ответ.")
+    by_index = {}
+    for result in raw_results:
+        if not isinstance(result, dict) or not isinstance(result.get("index"), int):
+            continue
+        candidates = result.get("candidates")
+        by_index.setdefault(
+            result["index"],
+            candidates if isinstance(candidates, list) else [],
+        )
+    ingredients = run.ingredient_snapshot
+    if len(by_index) != len(ingredients) or any(
+        index not in by_index for index in range(len(ingredients))
+    ):
+        raise CartAgentError("Быстрый поиск пропустил часть ингредиентов.")
+
+    matches = [
+        choose_product(ingredient, by_index[index])
+        for index, ingredient in enumerate(ingredients)
+    ]
+    missing_count = sum(match["quality"] == "missing" for match in matches)
+    cleanup_threshold = max(2, math.ceil(len(matches) * 0.25))
+    selected = [match for match in matches if match["quality"] != "missing"]
+    if not selected or missing_count >= cleanup_threshold:
+        summary = (
+            f"Не найдено позиций: {missing_count} из {len(matches)}. "
+            "Корзина не изменялась."
+        )
+        return _adapter_status_result(
+            "incomplete",
+            summary,
+            items=matches,
+            cart_cleared=True,
+        )
+
+    # From this request onward a lost response may hide a successful mutation.
+    # Never retry through Hermes after entering this phase.
+    apply_result = _run_adapter_task(
+        "/v1/apply",
+        {
+            "scope": cart_browser_session_key(run.requested_by_id),
+            "store": store,
+            "selection_token": selection_token,
+            "items": [
+                {
+                    "product_id": match["product_id"],
+                    "sku_id": match["sku_id"],
+                    "package_count": match["package_count"],
+                }
+                for match in selected
+            ],
+        },
+        mutation_possible=True,
+    )
+    apply_status = str(apply_result.get("status") or "")
+    if apply_status in {"login_required", "blocked"} and not apply_result.get(
+        "mutation_possible"
+    ):
+        return _adapter_status_result(
+            apply_status,
+            str(apply_result.get("summary") or "Нужно открыть Яндекс Еду вручную."),
+            items=matches,
+        )
+    if apply_status != "applied":
+        raise CartAgentError(
+            str(apply_result.get("summary") or "Изменение корзины не было подтверждено."),
+            mutation_possible=bool(apply_result.get("mutation_possible")),
+        )
+
+    additions = {}
+    if isinstance(apply_result.get("additions"), list):
+        for addition in apply_result["additions"]:
+            if not isinstance(addition, dict):
+                continue
+            product_id = str(addition.get("product_id") or "")
+            try:
+                count = max(0, int(addition.get("added_quantity") or 0))
+            except (TypeError, ValueError):
+                count = 0
+            additions[product_id] = min(100, count)
+    for match in matches:
+        product_id = match.get("product_id", "")
+        available = additions.get(product_id, 0)
+        added = min(match["package_count"], available)
+        match["added_package_count"] = added
+        additions[product_id] = max(0, available - added)
+
+    qualities = {match["quality"] for match in matches}
+    if "missing" in qualities:
+        status = "incomplete"
+    elif "substitute" in qualities:
+        status = "substitutions"
+    else:
+        status = "exact"
+    exact_count = sum(match["quality"] == "exact" for match in matches)
+    substitute_count = sum(match["quality"] == "substitute" for match in matches)
+    summary = f"Найдено {len(matches) - missing_count} из {len(matches)}"
+    if substitute_count:
+        summary += f", замен: {substitute_count}"
+    summary += f"; точных совпадений: {exact_count}."
+    result = _adapter_status_result(
+        status,
+        summary,
+        cart_url=str(apply_result.get("cart_url") or search.get("cart_url") or ""),
+        items=matches,
+    )
+    result["timings_ms"] = {
+        "search": search.get("elapsed_ms"),
+        "apply": apply_result.get("elapsed_ms"),
+    }
+    return result
+
+
 def assemble_store_cart(run, store: str) -> dict[str, Any]:
     ingredients = run.ingredient_snapshot
     if not isinstance(ingredients, list) or not ingredients:
@@ -243,7 +477,14 @@ def assemble_store_cart(run, store: str) -> dict[str, Any]:
             "items": [],
         }
 
-    return run_store_cart_task(run, store, "assemble")
+    if not settings.CART_ADAPTER_BASE_URL:
+        return run_store_cart_task(run, store, "assemble")
+    try:
+        return _assemble_with_adapter(run, store)
+    except CartAgentError as error:
+        if error.mutation_possible or not settings.CART_ADAPTER_FALLBACK_TO_HERMES:
+            raise
+        return run_store_cart_task(run, store, "assemble")
 
 
 def cleanup_store_cart(
@@ -252,6 +493,30 @@ def cleanup_store_cart(
     added_items: list[dict[str, Any]],
     cart_url: str,
 ) -> dict[str, Any]:
+    if settings.CART_ADAPTER_BASE_URL:
+        data = _run_adapter_task(
+            "/v1/cleanup",
+            {
+                "scope": cart_browser_session_key(run.requested_by_id),
+                "store": store,
+                "items": [
+                    {
+                        "product_id": item.get("product_id", ""),
+                        "package_count": item.get("package_count", 0),
+                    }
+                    for item in added_items
+                    if isinstance(item, dict)
+                ],
+            },
+            mutation_possible=True,
+        )
+        status = str(data.get("status") or "")
+        if status in {"cleared", "login_required", "blocked"}:
+            return data
+        raise CartAgentError(
+            str(data.get("summary") or "Очистка корзины не была подтверждена."),
+            mutation_possible=True,
+        )
     return run_store_cart_task(
         run,
         store,
