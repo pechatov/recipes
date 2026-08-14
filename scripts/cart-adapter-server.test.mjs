@@ -10,6 +10,7 @@ process.env.CART_ADAPTER_QUARANTINE_FILE = `/tmp/recipes-cart-quarantine-${proce
 
 const {
   boundedOperationTimeout,
+  deferScopeRecovery,
   errorBody,
   finalBrowserError,
   isScopeQuarantined,
@@ -19,10 +20,12 @@ const {
   preserveMutationUncertainty,
   quarantineScope,
   readOperationRecord,
+  recoverQuarantinedScope,
   releaseScopeQuarantine,
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
+  scopeRecoveryAt,
   storeOperationRecord,
 } = await import("./cart-adapter-server.mjs");
 
@@ -74,6 +77,17 @@ await unlink(process.env.CART_ADAPTER_STATE_FILE);
 
 await quarantineScope("recipes-cart-user-42");
 assert.equal(await isScopeQuarantined("recipes-cart-user-42"), true);
+const recoveryStartedAt = Date.now();
+const recoveryAt = await deferScopeRecovery(
+  "recipes-cart-user-42",
+  recoveryStartedAt,
+);
+assert.equal(recoveryAt, recoveryStartedAt + 120_000);
+assert.equal(await scopeRecoveryAt("recipes-cart-user-42"), recoveryAt);
+await assert.rejects(
+  recoverQuarantinedScope("recipes-cart-user-42"),
+  (error) => error.code === "profile_quarantined" && error.profileUncertain,
+);
 assert.equal((await stat(process.env.CART_ADAPTER_QUARANTINE_FILE)).mode & 0o777, 0o600);
 await releaseScopeQuarantine("recipes-cart-user-42");
 assert.equal(await isScopeQuarantined("recipes-cart-user-42"), false);

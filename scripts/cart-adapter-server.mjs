@@ -53,6 +53,11 @@ const completedOperationRetentionMs = 30 * 24 * 60 * 60 * 1000;
 const startedOperationRetentionMs = 90 * 24 * 60 * 60 * 1000;
 const maximumOperationRecords = 2_000;
 const maximumOperationStateBytes = 16 * 1024 * 1024;
+// Camofox's non-proxy tab creation is bounded by browser launch (60s), page
+// recovery (two 10s attempts) and initial navigation (30s). Keep an extra
+// margin before trusting that a timed-out POST /tabs can no longer create a
+// late persistent session.
+const deferredBrowserCreateSettlementMs = 2 * 60 * 1000;
 const selectionKey = crypto.createHash("sha256").update(controlKey).digest();
 const stores = {
   auchan: ["ашан", "auchan"],
@@ -255,16 +260,38 @@ async function loadQuarantinedScopes() {
         const information = await stat(quarantineStateFile);
         if (information.size > 1_048_576) throw new Error("quarantine is too large");
         const parsed = JSON.parse(await readFile(quarantineStateFile, "utf8"));
+        // Older deployments stored a bare array. Preserve every lease and use
+        // the file timestamp as the earliest possible create dispatch time.
+        let entries = null;
+        if (Array.isArray(parsed)) {
+          entries = parsed.map((scope) => [
+            scope,
+            information.mtimeMs + deferredBrowserCreateSettlementMs,
+          ]);
+        } else if (
+          parsed?.version === 1
+          && parsed.scopes
+          && typeof parsed.scopes === "object"
+        ) {
+          entries = Object.entries(parsed.scopes);
+        }
         if (
-          !Array.isArray(parsed)
-          || parsed.length > 10_000
-          || parsed.some((scope) => !scopePattern.test(String(scope)))
+          !entries
+          || entries.length > 10_000
+          || entries.some(([scope, recoverAfter]) => (
+            !scopePattern.test(String(scope))
+            || !Number.isFinite(Number(recoverAfter))
+            || Number(recoverAfter) < 0
+          ))
         ) {
           throw new Error("invalid quarantine state");
         }
-        return new Set(parsed.map(String));
+        return new Map(entries.map(([scope, recoverAfter]) => [
+          String(scope),
+          Number(recoverAfter),
+        ]));
       } catch (error) {
-        if (error?.code === "ENOENT") return new Set();
+        if (error?.code === "ENOENT") return new Map();
         throw quarantineError("Журнал карантина профилей недоступен.");
       }
     })();
@@ -273,7 +300,12 @@ async function loadQuarantinedScopes() {
 }
 
 async function persistQuarantinedScopes(scopes) {
-  const serialized = JSON.stringify([...scopes].sort());
+  const serialized = JSON.stringify({
+    version: 1,
+    scopes: Object.fromEntries([...scopes.entries()].sort(([left], [right]) => (
+      left.localeCompare(right)
+    ))),
+  });
   if (Buffer.byteLength(serialized) > 1_048_576) throw quarantineError();
   await durableWriteState(quarantineStateFile, serialized);
 }
@@ -281,18 +313,33 @@ async function persistQuarantinedScopes(scopes) {
 async function quarantineScope(scope) {
   const write = quarantineWriteQueue.then(async () => {
     const scopes = await loadQuarantinedScopes();
-    scopes.add(scope);
+    scopes.set(scope, Date.now());
     await persistQuarantinedScopes(scopes);
   });
   quarantineWriteQueue = write.catch(() => {});
   await write;
 }
 
+async function deferScopeRecovery(scope, now = Date.now()) {
+  const recoverAfter = now + deferredBrowserCreateSettlementMs;
+  let effectiveRecoverAfter = recoverAfter;
+  const write = quarantineWriteQueue.then(async () => {
+    const scopes = await loadQuarantinedScopes();
+    if (!scopes.has(scope)) throw quarantineError();
+    effectiveRecoverAfter = Math.max(scopes.get(scope) || 0, recoverAfter);
+    scopes.set(scope, effectiveRecoverAfter);
+    await persistQuarantinedScopes(scopes);
+  });
+  quarantineWriteQueue = write.catch(() => {});
+  await write;
+  return effectiveRecoverAfter;
+}
+
 async function releaseScopeQuarantine(scope) {
   const write = quarantineWriteQueue.then(async () => {
     const scopes = await loadQuarantinedScopes();
     if (!scopes.has(scope)) return;
-    const remaining = new Set(scopes);
+    const remaining = new Map(scopes);
     remaining.delete(scope);
     await persistQuarantinedScopes(remaining);
     scopes.delete(scope);
@@ -306,8 +353,19 @@ async function isScopeQuarantined(scope) {
   return (await loadQuarantinedScopes()).has(scope);
 }
 
+async function scopeRecoveryAt(scope) {
+  await quarantineWriteQueue;
+  return (await loadQuarantinedScopes()).get(scope) ?? null;
+}
+
 async function recoverQuarantinedScope(scope) {
-  if (!await isScopeQuarantined(scope)) return;
+  const recoverAfter = await scopeRecoveryAt(scope);
+  if (recoverAfter === null) return;
+  if (Date.now() < recoverAfter) {
+    throw quarantineError(
+      "Браузер завершает предыдущую операцию; повторите попытку через несколько минут.",
+    );
+  }
   try {
     const identity = await camofoxIdentity(scope);
     await closeBrowser(identity.user_id);
@@ -499,6 +557,10 @@ async function camofoxIdentity(scope) {
 
 async function openBrowser(scope, initialUrl = "https://eda.yandex.ru/retail") {
   const identity = await camofoxIdentity(scope);
+  // Extend the durable lease before dispatching POST /tabs. If the adapter or
+  // connection dies, recovery cannot release the profile until every bounded
+  // part of Camofox's abandoned create request has had time to settle.
+  await deferScopeRecovery(scope);
   let opened;
   try {
     opened = await camofoxRequest("/tabs", {
@@ -1578,6 +1640,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   errorBody,
   boundedOperationTimeout,
+  deferScopeRecovery,
   durableWriteState,
   finalBrowserError,
   isScopeQuarantined,
@@ -1588,9 +1651,11 @@ export {
   preserveMutationUncertainty,
   quarantineScope,
   readOperationRecord,
+  recoverQuarantinedScope,
   releaseScopeQuarantine,
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
+  scopeRecoveryAt,
   storeOperationRecord,
 };

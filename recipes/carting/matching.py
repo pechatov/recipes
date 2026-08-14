@@ -136,7 +136,9 @@ def _unit(value: Any) -> tuple[str, Decimal] | None:
     return UNIT_KIND_AND_FACTOR.get(aliases.get(normalized, normalized))
 
 
-def _package_amount(candidate: dict[str, Any]) -> tuple[str, Decimal] | None:
+def _package_amount(
+    candidate: dict[str, Any], expected_kind: str | None = None
+) -> tuple[str, Decimal] | None:
     for source in (candidate.get("weight"), candidate.get("name")):
         normalized = _normalized_text(source)
         multipack = MULTIPACK_PATTERN.search(normalized)
@@ -147,6 +149,8 @@ def _package_amount(candidate: dict[str, Any]) -> tuple[str, Decimal] | None:
         amount = _decimal(match.group("amount"))
         if unit and amount:
             kind, factor = unit
+            if expected_kind is not None and kind != expected_kind:
+                continue
             count = _decimal(match.group("count")) if multipack else Decimal("1")
             return kind, amount * factor * (count or Decimal("1"))
     return None
@@ -159,12 +163,12 @@ def _required_packages(
     requested_unit = _unit(ingredient.get("unit"))
     if quantity is None or requested_unit is None:
         return 1, "Не удалось точно сопоставить единицы; выбрана одна упаковка."
-    package = _package_amount(candidate)
+    requested_kind, requested_factor = requested_unit
+    package = _package_amount(candidate, requested_kind)
     if package is None:
         if requested_unit[0] == "count":
             return 1, "Размер штучной упаковки не указан; выбрана одна упаковка."
         return 1, "Размер упаковки не указан; выбрана одна упаковка."
-    requested_kind, requested_factor = requested_unit
     package_kind, package_value = package
     if requested_kind != package_kind:
         return None, ""

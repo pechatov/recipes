@@ -874,6 +874,20 @@ class CartProductMatchingTests(SimpleTestCase):
         self.assertEqual(match["quality"], "substitute")
         self.assertEqual(match["package_count"], 2)
 
+    def test_uses_count_from_name_when_weight_has_incompatible_unit(self):
+        match = choose_product(
+            {
+                "name": "Яйца",
+                "search_query": "яйца",
+                "quantity": "12",
+                "unit": "шт",
+            },
+            [self.candidate(name="Яйца куриные 10 шт", weight="600 г")],
+        )
+
+        self.assertEqual(match["quality"], "substitute")
+        self.assertEqual(match["package_count"], 2)
+
     def test_unknown_count_pack_size_never_multiplies_packages(self):
         match = choose_product(
             {
