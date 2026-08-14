@@ -126,7 +126,7 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("sku_id: item.sku_id", server)
         self.assertIn("candidate.place_slug === context.place_slug", server)
         self.assertIn("data.cart_places_list.length === 0", server)
-        self.assertIn("existing !== item.before_quantity", server)
+        self.assertIn("existing > item.before_quantity", server)
         self.assertIn('createCipheriv("aes-256-gcm"', server)
         self.assertIn("rawLatitude === null || rawLongitude === null", server)
         self.assertNotIn('url.pathname === "/evaluate"', server)

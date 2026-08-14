@@ -419,9 +419,8 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
         mutation_possible=True,
     )
     apply_status = str(apply_result.get("status") or "")
-    if apply_status in {"login_required", "blocked"} and not apply_result.get(
-        "mutation_possible"
-    ):
+    reported_mutation = apply_result.get("mutation_possible")
+    if apply_status in {"login_required", "blocked"} and reported_mutation is False:
         return _adapter_status_result(
             apply_status,
             str(apply_result.get("summary") or "Нужно открыть Яндекс Еду вручную."),
@@ -430,20 +429,53 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
     if apply_status != "applied":
         raise CartAgentError(
             str(apply_result.get("summary") or "Изменение корзины не было подтверждено."),
-            mutation_possible=bool(apply_result.get("mutation_possible")),
+            # The apply request crossed the mutation boundary. Only an
+            # explicit false from the completed adapter response can prove it
+            # safe; missing/invalid compatibility fields remain uncertain.
+            mutation_possible=(
+                reported_mutation
+                if isinstance(reported_mutation, bool)
+                else True
+            ),
         )
 
     additions = {}
-    if isinstance(apply_result.get("additions"), list):
-        for addition in apply_result["additions"]:
-            if not isinstance(addition, dict):
-                continue
-            product_id = str(addition.get("product_id") or "")
-            try:
-                count = max(0, int(addition.get("added_quantity") or 0))
-            except (TypeError, ValueError):
-                count = 0
-            additions[product_id] = min(100, count)
+    raw_additions = apply_result.get("additions")
+    expected_product_ids = {str(match.get("product_id") or "") for match in selected}
+    if not isinstance(raw_additions, list):
+        raise CartAgentError(
+            "Адаптер не вернул подтверждённый журнал добавлений.",
+            mutation_possible=True,
+        )
+    for addition in raw_additions:
+        if not isinstance(addition, dict):
+            raise CartAgentError(
+                "Адаптер вернул повреждённый журнал добавлений.",
+                mutation_possible=True,
+            )
+        product_id = str(addition.get("product_id") or "")
+        try:
+            count = int(addition.get("added_quantity"))
+        except (TypeError, ValueError):
+            count = -1
+        if product_id not in expected_product_ids or not 0 <= count <= 100:
+            raise CartAgentError(
+                "Адаптер вернул повреждённый журнал добавлений.",
+                mutation_possible=True,
+            )
+        total_count = additions.get(product_id, 0) + count
+        if total_count > 100:
+            raise CartAgentError(
+                "Адаптер вернул повреждённый журнал добавлений.",
+                mutation_possible=True,
+            )
+        additions[product_id] = total_count
+    if set(additions) != expected_product_ids:
+        raise CartAgentError(
+            "Адаптер вернул неполный журнал добавлений.",
+            mutation_possible=True,
+        )
+    total_added = sum(additions.values())
     for match in matches:
         product_id = match.get("product_id", "")
         available = additions.get(product_id, 0)
@@ -475,6 +507,11 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
         "apply": apply_result.get("elapsed_ms"),
     }
     cleanup_token = str(apply_result.get("cleanup_token") or "").strip()
+    if total_added and not cleanup_token:
+        raise CartAgentError(
+            "Адаптер не вернул журнал безопасной проверки корзины.",
+            mutation_possible=True,
+        )
     result["cleanup_token"] = (
         cleanup_token if len(cleanup_token) <= 60_000 else ""
     )

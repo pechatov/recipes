@@ -1052,7 +1052,7 @@ async function cleanup(body) {
     let outstanding = 0;
     for (const item of cleanupRequest.items) {
       const existing = quantityInCart(cart, item.product_id, item.sku_id);
-      if (existing !== item.before_quantity) outstanding += 1;
+      if (existing > item.before_quantity) outstanding += 1;
     }
     if (outstanding === 0) {
       return { status: "cleared", summary: "Добавления этой сборки уже удалены из корзины." };

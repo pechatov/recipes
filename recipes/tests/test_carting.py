@@ -1172,7 +1172,10 @@ class CartPipelineTests(TestCase):
                     }
                 ],
             },
-            CartAgentError("Связь оборвалась", mutation_possible=True),
+            {
+                "status": "failed",
+                "summary": "Несовместимый ответ без признака мутации",
+            },
         ]
         run = self.make_run()
 
@@ -1229,6 +1232,52 @@ class CartPipelineTests(TestCase):
             assemble_store_cart(run, "auchan")
 
         self.assertFalse(raised.exception.mutation_possible)
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_incomplete_successful_apply_requires_manual_check(
+        self, adapter_task, run_task
+    ):
+        product_id = "12345678-1234-1234-1234-123456789abc"
+        adapter_task.side_effect = [
+            {
+                "status": "ready",
+                "selection_token": "signed-selection",
+                "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
+                "results": [
+                    {
+                        "index": 0,
+                        "candidates": [
+                            {
+                                "product_id": product_id,
+                                "sku_id": product_id,
+                                "name": "Спагетти 450 г",
+                                "weight": "450 g",
+                                "available": True,
+                                "in_stock": 8,
+                                "product_url": (
+                                    "https://eda.yandex.ru/retail/auchan/product/"
+                                    f"{product_id}?placeSlug=auchan-nearby"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            },
+            {"status": "applied", "cart_url": "https://eda.yandex.ru/cart"},
+        ]
+        run = self.make_run()
+
+        with self.assertRaises(CartAgentError) as raised:
+            assemble_store_cart(run, "auchan")
+
+        self.assertTrue(raised.exception.mutation_possible)
+        run_task.assert_not_called()
 
     @override_settings(
         CART_ADAPTER_BASE_URL="http://adapter.example",
