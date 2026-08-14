@@ -1,9 +1,19 @@
+from importlib import import_module
 from pathlib import Path
 
 from django.test import SimpleTestCase
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class MigrationDeploymentContractTests(SimpleTestCase):
+    def test_single_store_data_migration_commits_before_partial_index(self):
+        migration = import_module(
+            "recipes.migrations.0015_alter_storepreference_options_and_more"
+        )
+
+        self.assertFalse(migration.Migration.atomic)
 
 
 class BrowserLoginDeploymentContractTests(SimpleTestCase):
