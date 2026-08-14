@@ -7,8 +7,10 @@ process.env.HERMES_HOME = "/tmp/test-hermes-home";
 
 const {
   errorBody,
+  finalBrowserError,
   preserveMutationUncertainty,
   runExclusiveOperation,
+  sameLocation,
 } = await import("./cart-adapter-server.mjs");
 
 const internalError = preserveMutationUncertainty(
@@ -22,6 +24,28 @@ assert.deepEqual(errorBody(internalError), {
   error: "internal_error",
   mutation_possible: true,
 });
+
+const searchError = new Error("search failed");
+assert.equal(
+  finalBrowserError(searchError, new Error("close failed"), false),
+  searchError,
+);
+assert.equal(searchError.mutationPossible, true);
+
+assert.equal(
+  sameLocation(
+    { latitude: 55.7558, longitude: 37.6173 },
+    { latitude: 55.755805, longitude: 37.617295 },
+  ),
+  true,
+);
+assert.equal(
+  sameLocation(
+    { latitude: 55.7558, longitude: 37.6173 },
+    { latitude: 55.7568, longitude: 37.6173 },
+  ),
+  false,
+);
 
 let releaseFirst;
 const firstMayFinish = new Promise((resolve) => {

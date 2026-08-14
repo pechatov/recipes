@@ -51,6 +51,18 @@ function preserveMutationUncertainty(error, mutationPossible) {
   return preserved;
 }
 
+function finalBrowserError(operationError, closeError, mutationPossible) {
+  if (closeError) {
+    // Even a read-only operation is no longer safe to hand to Hermes when the
+    // adapter could not release its persistent profile. Preserve the useful
+    // original error code while making the ownership uncertainty explicit.
+    return preserveMutationUncertainty(operationError || closeError, true);
+  }
+  return operationError
+    ? preserveMutationUncertainty(operationError, mutationPossible)
+    : null;
+}
+
 const activeScopes = new Set();
 
 async function runExclusiveOperation(scope, operation) {
@@ -274,6 +286,7 @@ async function withBrowser(
 ) {
   const browser = await openBrowser(scope, initialUrl);
   let operationError = null;
+  let closeError = null;
   let result;
   try {
     result = await operation(browser, mutationState);
@@ -283,11 +296,14 @@ async function withBrowser(
   try {
     await closeBrowser(browser.identity.user_id);
   } catch (error) {
-    if (!operationError) operationError = error;
+    closeError = error;
   }
-  if (operationError) {
-    throw preserveMutationUncertainty(operationError, mutationState.possible);
-  }
+  const failure = finalBrowserError(
+    operationError,
+    closeError,
+    mutationState.possible,
+  );
+  if (failure) throw failure;
   return result;
 }
 
@@ -451,6 +467,15 @@ function validatedContext(value) {
   return context;
 }
 
+function sameLocation(left, right) {
+  const latitude = Number(left?.latitude);
+  const longitude = Number(left?.longitude);
+  return Number.isFinite(latitude)
+    && Number.isFinite(longitude)
+    && Math.abs(latitude - right.latitude) <= 0.00001
+    && Math.abs(longitude - right.longitude) <= 0.00001;
+}
+
 async function validateSignedStore(browser, context) {
   let state = null;
   let ready = false;
@@ -461,7 +486,12 @@ async function validateSignedStore(browser, context) {
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
     try {
       const current = new URL(state?.url || "");
-      if (current.hostname === "eda.yandex.ru" && current.searchParams.get("placeSlug") === context.place_slug) {
+      if (
+        current.hostname === "eda.yandex.ru"
+        && current.searchParams.get("placeSlug") === context.place_slug
+        && Number.isFinite(state?.latitude)
+        && Number.isFinite(state?.longitude)
+      ) {
         ready = true;
         break;
       }
@@ -469,10 +499,21 @@ async function validateSignedStore(browser, context) {
     await sleep(300);
   }
   if (!ready) throw new OperationError("store_unavailable", "Витрина магазина не загрузилась.");
+  if (!sameLocation(state, context)) {
+    throw new OperationError(
+      "invalid_selection",
+      "Адрес доставки изменился после поиска; соберите корзину заново.",
+    );
+  }
+  const currentContext = {
+    ...context,
+    latitude: Number(state.latitude),
+    longitude: Number(state.longitude),
+  };
   const catalog = await evaluate(browser, catalogExpression({
-    latitude: context.latitude,
-    longitude: context.longitude,
-    placeSlug: context.place_slug,
+    latitude: currentContext.latitude,
+    longitude: currentContext.longitude,
+    placeSlug: currentContext.place_slug,
   }));
   classifyApiStatus(Number(catalog?.status || 0), "Каталог магазина недоступен.");
   const groupSlug = String(catalog?.place?.brandSlug || new URL(context.store_url).pathname.split("/").filter(Boolean)[1] || "");
@@ -483,7 +524,7 @@ async function validateSignedStore(browser, context) {
   ) {
     throw new OperationError("invalid_selection", "Витрина магазина изменилась после поиска.");
   }
-  return context;
+  return currentContext;
 }
 
 function cartParams(context) {
@@ -1150,4 +1191,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
 }
 
-export { errorBody, preserveMutationUncertainty, runExclusiveOperation };
+export {
+  errorBody,
+  finalBrowserError,
+  preserveMutationUncertainty,
+  runExclusiveOperation,
+  sameLocation,
+};
