@@ -769,6 +769,10 @@ def claim_cleanup_run():
         if browser_login_session_blocks_worker():
             return None
         if CartRun.objects.filter(
+            browser_operation_started_at__isnull=False,
+        ).exclude(pk=run.pk).exists():
+            return None
+        if CartRun.objects.filter(
             status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING]
         ).exclude(pk=run.pk).exists():
             return None
@@ -844,6 +848,10 @@ def claim_cart_run():
         # A human and the agent must never drive the shared Camofox process at
         # the same time. Even expired rows block until remote close is confirmed.
         if browser_login_session_blocks_worker():
+            return None
+        if CartRun.objects.filter(
+            browser_operation_started_at__isnull=False,
+        ).exclude(pk=run.pk).exists():
             return None
         # One persistent browser profile must not be shared by concurrent jobs.
         if CartRun.objects.filter(

@@ -108,7 +108,7 @@
       {% if run.can_stop %}
         <form method="post" action="{% url 'cart-stop' run.pk %}">
           {% csrf_token %}
-          <button class="button button-danger" type="submit"{% if run.stop_is_pending %} disabled{% endif %}>{% if run.stop_is_pending %}Остановка запрошена{% else %}Остановить сборку{% endif %}</button>
+          <button class="button button-danger" type="submit">{% if run.stop_is_pending %}Проверить остановку ещё раз{% else %}Остановить сборку{% endif %}</button>
         </form>
       {% endif %}
     </div>

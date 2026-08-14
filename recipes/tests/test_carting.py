@@ -37,6 +37,7 @@ from recipes.carting.client import (
 )
 from recipes.carting.coordination import browser_login_session_blocks_worker
 from recipes.carting.matching import choose_product, enforce_aggregate_stock
+from recipes.management.commands.run_cart_worker import Command as CartWorkerCommand
 from recipes.models import (
     BrowserLoginSession,
     CartAttempt,
@@ -970,6 +971,23 @@ class CartViewTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
 
+    def test_pending_stop_can_be_rechecked_from_cart_page(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            browser_operation_started_at=timezone.now(),
+            cancellation_requested_at=timezone.now(),
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Проверить остановку ещё раз")
+        self.assertNotContains(response, "Остановка запрошена</button>")
+
     def test_processing_without_a_browser_reservation_stops_immediately(self):
         run = CartRun.objects.create(
             recipe=self.recipe,
@@ -1682,6 +1700,78 @@ class CartPipelineTests(TestCase):
         pending_run.refresh_from_db()
         self.assertEqual(pending_run.status, CartRun.Status.PENDING)
         stop_session.assert_not_called()
+
+    @patch("recipes.carting.coordination.stop_session")
+    def test_transition_without_timestamp_is_reconciled(self, stop_session):
+        pending_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.STOPPING,
+            transition_started_at=None,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        claimed = claim_cart_run()
+
+        login_session.refresh_from_db()
+        self.assertEqual(claimed, pending_run)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.FAILED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
+
+    def test_stale_worker_with_browser_reservation_requires_manual_check(self):
+        uncertain_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            started_at=timezone.now() - timedelta(minutes=31),
+            browser_operation_started_at=timezone.now() - timedelta(minutes=31),
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        pending_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        self.assertEqual(CartWorkerCommand.recover_stale_jobs(), 1)
+
+        uncertain_run.refresh_from_db()
+        self.assertEqual(uncertain_run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNotNone(uncertain_run.browser_operation_started_at)
+        self.assertIn("Проверьте корзину вручную", uncertain_run.error)
+        self.assertIsNone(claim_cart_run())
+        pending_run.refresh_from_db()
+        self.assertEqual(pending_run.status, CartRun.Status.PENDING)
+
+    def test_stale_worker_without_browser_reservation_can_be_requeued(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            started_at=timezone.now() - timedelta(minutes=31),
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        self.assertEqual(CartWorkerCommand.recover_stale_jobs(), 1)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertIsNone(run.browser_operation_started_at)
 
     @patch("recipes.carting.client.run_store_cart_task")
     def test_single_ingredient_keeps_legacy_agent_call(self, run_task):

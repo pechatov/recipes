@@ -29,26 +29,40 @@ class Command(BaseCommand):
 
     @staticmethod
     def recover_stale_jobs():
-        cutoff = timezone.now() - timedelta(minutes=30)
+        now = timezone.now()
+        cutoff = now - timedelta(minutes=30)
+        uncertain_mutations = CartRun.objects.filter(
+            status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING],
+            started_at__lt=cutoff,
+            browser_operation_started_at__isnull=False,
+        ).update(
+            status=CartRun.Status.MANUAL_CHECK,
+            started_at=None,
+            finished_at=now,
+            error=(
+                "Worker был прерван во время операции с Яндекс Едой. "
+                "Проверьте корзину вручную перед следующим запуском."
+            ),
+        )
         recovered_runs = CartRun.objects.filter(
             status=CartRun.Status.PROCESSING,
             started_at__lt=cutoff,
+            browser_operation_started_at__isnull=True,
         ).update(
             status=CartRun.Status.PENDING,
             started_at=None,
-            browser_operation_started_at=None,
             error="",
         )
         recovered_cleanups = CartRun.objects.filter(
             status=CartRun.Status.CLEANING,
             started_at__lt=cutoff,
+            browser_operation_started_at__isnull=True,
         ).update(
             status=CartRun.Status.CLEANUP_PENDING,
             started_at=None,
-            browser_operation_started_at=None,
             error="",
         )
-        return recovered_runs + recovered_cleanups
+        return uncertain_mutations + recovered_runs + recovered_cleanups
 
     def handle(self, *args, **options):
         recovered = self.recover_stale_jobs()

@@ -62,7 +62,10 @@ def reconcile_expired_browser_login_sessions() -> bool:
                     BrowserLoginSession.Status.STOPPING,
                     BrowserLoginSession.Status.COMPLETING,
                 ],
-                transition_started_at__lte=transition_cutoff,
+            )
+            & (
+                Q(transition_started_at__isnull=True)
+                | Q(transition_started_at__lte=transition_cutoff)
             )
             | Q(
                 status__in=[

@@ -1410,7 +1410,7 @@ def cart_stop(request, pk):
 
         now = timezone.now()
         run.cancellation_requested_at = now
-        stale_reservation = False
+        stale_reservation = bool(run.browser_operation_started_at)
         if run.status in {CartRun.Status.PROCESSING, CartRun.Status.CLEANING}:
             maximum_operation_seconds = max(
                 settings.CART_AI_TIMEOUT_SECONDS,
@@ -1428,7 +1428,6 @@ def cart_stop(request, pk):
                     "после чего сборка остановится.",
                 )
                 return redirect("cart-detail", pk=run.pk)
-            stale_reservation = bool(run.browser_operation_started_at)
 
         attempt = None
         attempts = CartAttempt.objects.select_for_update()
@@ -1516,11 +1515,13 @@ def cart_manual_resolved(request, pk):
 
         run.error = ""
         run.status = CartRun.Status.CANCELLED
+        run.browser_operation_started_at = None
         run.cleaned_at = now
         run.finished_at = now
         run.confirmation_deadline = None
         fields = [
             "status",
+            "browser_operation_started_at",
             "cleaned_at",
             "finished_at",
             "confirmation_deadline",
