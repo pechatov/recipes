@@ -13,6 +13,7 @@ from recipes.carting.pipeline import (
     finish_requested_cart_stop,
     process_cart_cleanup,
     process_cart_run,
+    record_unexpected_browser_failure,
 )
 from recipes.models import CartRun
 
@@ -38,9 +39,22 @@ class Command(BaseCommand):
         ).update(
             status=CartRun.Status.MANUAL_CHECK,
             started_at=None,
+            browser_operation_started_at=None,
             finished_at=now,
             error=(
                 "Worker был прерван во время операции с Яндекс Едой. "
+                "Проверьте корзину вручную перед следующим запуском."
+            ),
+        )
+        orphaned_terminal_reservations = CartRun.objects.filter(
+            status=CartRun.Status.FAILED,
+            browser_operation_started_at__isnull=False,
+        ).update(
+            status=CartRun.Status.MANUAL_CHECK,
+            browser_operation_started_at=None,
+            finished_at=now,
+            error=(
+                "Worker завершился с ошибкой во время операции с Яндекс Едой. "
                 "Проверьте корзину вручную перед следующим запуском."
             ),
         )
@@ -62,7 +76,12 @@ class Command(BaseCommand):
             started_at=None,
             error="",
         )
-        return uncertain_mutations + recovered_runs + recovered_cleanups
+        return (
+            uncertain_mutations
+            + orphaned_terminal_reservations
+            + recovered_runs
+            + recovered_cleanups
+        )
 
     def handle(self, *args, **options):
         recovered = self.recover_stale_jobs()
@@ -108,8 +127,15 @@ class Command(BaseCommand):
                     if not stopped_after_error:
                         action = "cleanup" if cleaning else "assembly"
                         self.stderr.write(f"Cart {action} {run.pk} failed: {error}")
-                except Exception:
+                except Exception as error:
                     if not finish_requested_cart_stop(run, mutation_unknown=True):
+                        recovered_browser_failure = record_unexpected_browser_failure(
+                            run,
+                            error=error,
+                        )
+                    else:
+                        recovered_browser_failure = True
+                    if not recovered_browser_failure:
                         run.status = CartRun.Status.FAILED
                         run.error = "Внутренняя ошибка сборки. Подробности сохранены в журнале."
                         run.finished_at = timezone.now()

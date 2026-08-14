@@ -292,6 +292,70 @@ def _release_browser_operation(run: CartRun) -> None:
     run.browser_operation_started_at = None
 
 
+def record_unexpected_browser_failure(
+    run: CartRun,
+    *,
+    attempt: CartAttempt | None = None,
+    error: Exception | None = None,
+) -> bool:
+    """Durably release a reservation into a user-resolvable safety state."""
+    with transaction.atomic():
+        locked_run = CartRun.objects.select_for_update().get(pk=run.pk)
+        if not locked_run.browser_operation_started_at:
+            run.browser_operation_started_at = None
+            return False
+        attempt_id = attempt.pk if attempt else locked_run.selected_attempt_id
+        locked_attempt = None
+        if attempt_id:
+            locked_attempt = CartAttempt.objects.select_for_update().filter(
+                pk=attempt_id,
+                run=locked_run,
+            ).first()
+        if not locked_attempt:
+            locked_attempt = (
+                CartAttempt.objects.select_for_update()
+                .filter(run=locked_run)
+                .order_by("-started_at")
+                .first()
+            )
+        diagnostic = _text(error, 500)
+        if locked_attempt:
+            result = dict(locked_attempt.result or {})
+            result["mutation_unknown"] = True
+            if diagnostic:
+                result["error"] = diagnostic
+            locked_attempt.status = CartAttempt.Status.FAILED
+            locked_attempt.summary = diagnostic or "Внутренняя ошибка browser-операции."
+            locked_attempt.result = result
+            locked_attempt.finished_at = timezone.now()
+            locked_attempt.save(
+                update_fields=["status", "summary", "result", "finished_at"]
+            )
+        locked_run.status = CartRun.Status.MANUAL_CHECK
+        locked_run.selected_attempt = locked_attempt or locked_run.selected_attempt
+        locked_run.browser_operation_started_at = None
+        locked_run.finished_at = timezone.now()
+        locked_run.confirmation_deadline = None
+        locked_run.error = (
+            "Операция с Яндекс Едой завершилась неожиданно. Проверьте корзину "
+            "вручную перед следующим запуском."
+        )
+        locked_run.save(
+            update_fields=[
+                "status",
+                "selected_attempt",
+                "browser_operation_started_at",
+                "finished_at",
+                "confirmation_deadline",
+                "error",
+            ]
+        )
+    run.refresh_from_db()
+    if attempt:
+        attempt.refresh_from_db()
+    return True
+
+
 def _mark_attempt_cleaned(attempt: CartAttempt, summary: str = "") -> None:
     result = dict(attempt.result or {})
     result["cart_cleared"] = True
@@ -380,21 +444,45 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
             cleanup_token=cleanup_token,
         )
     except CartAgentError as error:
-        if error.mutation_possible:
+        try:
+            if error.mutation_possible:
+                result = dict(attempt.result or {})
+                result["mutation_unknown"] = True
+                attempt.result = result
+                attempt.save(update_fields=["result"])
+        except Exception as persistence_error:
+            record_unexpected_browser_failure(
+                run,
+                attempt=attempt,
+                error=persistence_error,
+            )
+            raise CartAgentError(
+                "Не удалось сохранить результат browser-операции.",
+                mutation_possible=True,
+            ) from persistence_error
+        _release_browser_operation(run)
+        raise
+    except Exception as error:
+        record_unexpected_browser_failure(run, attempt=attempt, error=error)
+        raise CartAgentError(
+            "Browser-операция завершилась неожиданно.",
+            mutation_possible=True,
+        ) from error
+    try:
+        status = _text(data.get("status"), 24)
+        if status == "cleared":
+            _mark_attempt_cleaned(attempt, data.get("summary", ""))
+        elif data.get("mutation_possible"):
             result = dict(attempt.result or {})
             result["mutation_unknown"] = True
             attempt.result = result
             attempt.save(update_fields=["result"])
-        _release_browser_operation(run)
-        raise
-    status = _text(data.get("status"), 24)
-    if status == "cleared":
-        _mark_attempt_cleaned(attempt, data.get("summary", ""))
-    elif data.get("mutation_possible"):
-        result = dict(attempt.result or {})
-        result["mutation_unknown"] = True
-        attempt.result = result
-        attempt.save(update_fields=["result"])
+    except Exception as error:
+        record_unexpected_browser_failure(run, attempt=attempt, error=error)
+        raise CartAgentError(
+            "Не удалось сохранить результат browser-операции.",
+            mutation_possible=True,
+        ) from error
     # As with assembly, publish an idle run only after the cleanup outcome is
     # durable so a concurrent stop cannot make a decision from stale journal data.
     _release_browser_operation(run)
@@ -557,7 +645,20 @@ def process_cart_run(run: CartRun) -> None:
                 )
                 return
             raise
-        _save_result(attempt, data)
+        except Exception as error:
+            record_unexpected_browser_failure(run, attempt=attempt, error=error)
+            raise CartAgentError(
+                "Browser-операция завершилась неожиданно.",
+                mutation_possible=True,
+            ) from error
+        try:
+            _save_result(attempt, data)
+        except Exception as error:
+            record_unexpected_browser_failure(run, attempt=attempt, error=error)
+            raise CartAgentError(
+                "Не удалось сохранить результат browser-операции.",
+                mutation_possible=True,
+            ) from error
         # The result journal must be committed before cart_stop can observe an
         # idle run; otherwise it can incorrectly claim that no additions remain.
         _release_browser_operation(run)
@@ -768,6 +869,10 @@ def claim_cleanup_run():
             return None
         if browser_login_session_blocks_worker():
             return None
+        if CartRun.objects.filter(status=CartRun.Status.MANUAL_CHECK).exclude(
+            pk=run.pk
+        ).exists():
+            return None
         if CartRun.objects.filter(
             browser_operation_started_at__isnull=False,
         ).exclude(pk=run.pk).exists():
@@ -848,6 +953,10 @@ def claim_cart_run():
         # A human and the agent must never drive the shared Camofox process at
         # the same time. Even expired rows block until remote close is confirmed.
         if browser_login_session_blocks_worker():
+            return None
+        if CartRun.objects.filter(status=CartRun.Status.MANUAL_CHECK).exclude(
+            pk=run.pk
+        ).exists():
             return None
         if CartRun.objects.filter(
             browser_operation_started_at__isnull=False,

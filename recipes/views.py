@@ -1444,6 +1444,7 @@ def cart_stop(request, pk):
         )
         additions_may_remain = bool(
             stale_reservation
+            or run.status == CartRun.Status.MANUAL_CHECK
             or mutation_unknown
             or attempt_needs_cleanup(attempt)
             or (not attempt and run.cleanup_requested_at and not run.cleaned_at)

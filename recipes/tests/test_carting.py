@@ -1750,7 +1750,7 @@ class CartPipelineTests(TestCase):
 
         uncertain_run.refresh_from_db()
         self.assertEqual(uncertain_run.status, CartRun.Status.MANUAL_CHECK)
-        self.assertIsNotNone(uncertain_run.browser_operation_started_at)
+        self.assertIsNone(uncertain_run.browser_operation_started_at)
         self.assertIn("Проверьте корзину вручную", uncertain_run.error)
         self.assertIsNone(claim_cart_run())
         pending_run.refresh_from_db()
@@ -1772,6 +1772,88 @@ class CartPipelineTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.PENDING)
         self.assertIsNone(run.browser_operation_started_at)
+
+    def test_failed_run_with_orphaned_reservation_is_recoverable(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.FAILED,
+            browser_operation_started_at=timezone.now() - timedelta(minutes=31),
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        self.assertEqual(CartWorkerCommand.recover_stale_jobs(), 1)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNone(run.browser_operation_started_at)
+        self.assertIn("Проверьте корзину вручную", run.error)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_unexpected_assembly_error_releases_reservation_to_manual_check(
+        self,
+        assemble,
+    ):
+        assemble.side_effect = RuntimeError("malformed browser response")
+        run = self.make_run()
+
+        with self.assertRaises(CartAgentError) as caught:
+            process_cart_run(run)
+
+        run.refresh_from_db()
+        attempt = run.attempts.get()
+        self.assertTrue(caught.exception.mutation_possible)
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNone(run.browser_operation_started_at)
+        self.assertEqual(run.selected_attempt, attempt)
+        self.assertTrue(attempt.result["mutation_unknown"])
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    def test_unexpected_cleanup_error_releases_reservation_to_manual_check(
+        self,
+        cleanup,
+    ):
+        cleanup.side_effect = RuntimeError("malformed cleanup response")
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.CLEANING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+            cleanup_requested_at=timezone.now(),
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            cart_url="https://eda.yandex.ru/cart",
+            result={
+                "added_items": [
+                    {
+                        "product_name": "Спагетти 450 г",
+                        "product_url": "https://eda.yandex.ru/product/sku-pasta-12345678",
+                        "product_id": "sku-pasta-12345678",
+                        "package_count": 1,
+                        "added_package_count": 1,
+                    }
+                ]
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        with self.assertRaises(CartAgentError) as caught:
+            process_cart_cleanup(run)
+
+        run.refresh_from_db()
+        attempt.refresh_from_db()
+        self.assertTrue(caught.exception.mutation_possible)
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNone(run.browser_operation_started_at)
+        self.assertTrue(attempt.result["mutation_unknown"])
 
     @patch("recipes.carting.client.run_store_cart_task")
     def test_single_ingredient_keeps_legacy_agent_call(self, run_task):
