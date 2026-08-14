@@ -559,6 +559,7 @@ class CartRun(models.Model):
     confirmed_at = models.DateTimeField(null=True, blank=True)
     cleanup_requested_at = models.DateTimeField(null=True, blank=True)
     cleaned_at = models.DateTimeField(null=True, blank=True)
+    cancellation_requested_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -577,6 +578,24 @@ class CartRun(models.Model):
             self.Status.CLEANING,
             self.Status.MANUAL_CHECK,
         }
+
+    @property
+    def can_stop(self):
+        return self.status in {
+            self.Status.PENDING,
+            self.Status.PROCESSING,
+            self.Status.CLEANUP_PENDING,
+            self.Status.CLEANING,
+            self.Status.MANUAL_CHECK,
+            self.Status.LOGIN_REQUIRED,
+        }
+
+    @property
+    def stop_is_pending(self):
+        return bool(
+            self.cancellation_requested_at
+            and self.status in {self.Status.PROCESSING, self.Status.CLEANING}
+        )
 
 
 class BrowserLoginSession(models.Model):

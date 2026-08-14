@@ -10,6 +10,7 @@ from recipes.carting.pipeline import (
     claim_cart_run,
     claim_cleanup_run,
     expire_unconfirmed_cart_runs,
+    finish_requested_cart_stop,
     process_cart_cleanup,
     process_cart_run,
 )
@@ -65,8 +66,15 @@ class Command(BaseCommand):
                         process_cart_cleanup(run)
                     else:
                         process_cart_run(run)
+                    finish_requested_cart_stop(run)
                 except CartAgentError as error:
-                    if error.mutation_possible:
+                    if finish_requested_cart_stop(
+                        run,
+                        mutation_unknown=error.mutation_possible,
+                    ):
+                        action = "cleanup" if cleaning else "assembly"
+                        self.stdout.write(f"Cart {action} {run.pk} stopped")
+                    elif error.mutation_possible:
                         run.status = CartRun.Status.MANUAL_CHECK
                         run.error = (
                             "Результат изменения корзины неизвестен. Откройте "
@@ -77,14 +85,16 @@ class Command(BaseCommand):
                         run.error = str(error)[:2000]
                     run.finished_at = timezone.now()
                     run.save(update_fields=["status", "error", "finished_at"])
-                    action = "cleanup" if cleaning else "assembly"
-                    self.stderr.write(f"Cart {action} {run.pk} failed: {error}")
+                    if run.status != CartRun.Status.CANCELLED:
+                        action = "cleanup" if cleaning else "assembly"
+                        self.stderr.write(f"Cart {action} {run.pk} failed: {error}")
                 except Exception:
-                    run.status = CartRun.Status.FAILED
-                    run.error = "Внутренняя ошибка сборки. Подробности сохранены в журнале."
-                    run.finished_at = timezone.now()
-                    run.save(update_fields=["status", "error", "finished_at"])
-                    logger.exception("Cart run %s failed unexpectedly", run.pk)
+                    if not finish_requested_cart_stop(run, mutation_unknown=True):
+                        run.status = CartRun.Status.FAILED
+                        run.error = "Внутренняя ошибка сборки. Подробности сохранены в журнале."
+                        run.finished_at = timezone.now()
+                        run.save(update_fields=["status", "error", "finished_at"])
+                        logger.exception("Cart run %s failed unexpectedly", run.pk)
             if options["once"]:
                 return
             if not run:

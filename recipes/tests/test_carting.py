@@ -14,6 +14,7 @@ from django.utils import timezone
 from recipes.carting.pipeline import (
     claim_cart_run,
     expire_unconfirmed_cart_runs,
+    finish_requested_cart_stop,
     process_cart_cleanup,
     process_cart_run,
 )
@@ -120,8 +121,40 @@ class CartViewTests(TestCase):
 
         response = self.client.get(reverse("cart-detail", args=[run.pk]))
 
-        self.assertContains(response, reverse("cart-browser-login-start", args=[run.pk]))
+        self.assertContains(
+            response,
+            f'{reverse("yandex-connection")}?run={run.pk}',
+        )
         self.assertNotContains(response, "cart-browser-login-pi.sh")
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    def test_yandex_connection_has_a_dedicated_link_button(self):
+        response = self.client.get(reverse("yandex-connection"))
+
+        self.assertContains(response, "Привязать Яндекс Еду")
+        self.assertContains(response, reverse("browser-login-start"))
+        self.assertContains(response, "Аккаунт ещё не привязан")
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    def test_yandex_connection_remembers_a_completed_profile(self):
+        BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.COMPLETED,
+            expires_at=timezone.now(),
+            finished_at=timezone.now(),
+        )
+
+        response = self.client.get(reverse("yandex-connection"))
+
+        self.assertContains(response, "Аккаунт привязан")
+        self.assertContains(response, "Обновить привязку")
 
     @override_settings(
         CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
@@ -292,7 +325,7 @@ class CartViewTests(TestCase):
 
         response = self.client.get(reverse("browser-login", args=[stale_session.pk]))
 
-        self.assertRedirects(response, reverse("store-preferences"))
+        self.assertRedirects(response, reverse("yandex-connection"))
         stale_session.refresh_from_db()
         self.assertEqual(stale_session.status, BrowserLoginSession.Status.FAILED)
         stop_session.assert_called_once_with(stale_session.remote_session_id)
@@ -769,6 +802,87 @@ class CartViewTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
         self.assertIsNotNone(run.cleaned_at)
+
+    def test_manual_check_without_attempt_can_be_resolved(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        response = self.client.post(reverse("cart-manual-resolved", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNotNone(run.cleaned_at)
+
+    def test_pending_cart_job_can_be_stopped_immediately(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        response = self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNotNone(run.cancellation_requested_at)
+        self.assertIsNotNone(run.cleaned_at)
+
+    def test_manual_check_can_be_stopped_without_blocking_future_carts(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+            cleanup_requested_at=timezone.now(),
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.FAILED,
+            result={"mutation_unknown": True},
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNone(run.cleanup_requested_at)
+        self.assertIsNone(run.cleaned_at)
+        self.assertIn("могли остаться товары", run.error)
+
+    def test_processing_cart_stop_is_finished_cooperatively(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PROCESSING)
+        self.assertIsNotNone(run.cancellation_requested_at)
+        self.assertTrue(finish_requested_cart_stop(run))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
 
 
 class CartProductMatchingTests(SimpleTestCase):

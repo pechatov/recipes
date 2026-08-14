@@ -197,6 +197,56 @@ def attempt_needs_cleanup(attempt: CartAttempt | None) -> bool:
     return bool(attempt_added_items(attempt))
 
 
+def finish_requested_cart_stop(
+    run: CartRun,
+    *,
+    attempt: CartAttempt | None = None,
+    mutation_unknown: bool = False,
+) -> bool:
+    """Finish a cooperative stop after any in-flight browser call has returned."""
+    run.refresh_from_db()
+    if not run.cancellation_requested_at:
+        return False
+    if run.status == CartRun.Status.CANCELLED:
+        return True
+
+    attempt = attempt or run.selected_attempt or run.attempts.order_by("-started_at").first()
+    attempt_result = attempt.result if attempt and isinstance(attempt.result, dict) else {}
+    additions_may_remain = bool(
+        mutation_unknown
+        or attempt_result.get("mutation_unknown")
+        or attempt_needs_cleanup(attempt)
+        or (not attempt and run.cleanup_requested_at and not run.cleaned_at)
+    )
+    now = timezone.now()
+    run.status = CartRun.Status.CANCELLED
+    run.selected_attempt = attempt or run.selected_attempt
+    run.finished_at = now
+    run.confirmation_deadline = None
+    run.cleanup_requested_at = None
+    if additions_may_remain:
+        run.cleaned_at = None
+        run.error = (
+            "Сборка остановлена по вашему запросу. В Яндекс Еде могли "
+            "остаться товары этой попытки — проверьте корзину перед новым запуском."
+        )
+    else:
+        run.cleaned_at = now
+        run.error = ""
+    run.save(
+        update_fields=[
+            "status",
+            "selected_attempt",
+            "finished_at",
+            "confirmation_deadline",
+            "cleanup_requested_at",
+            "cleaned_at",
+            "error",
+        ]
+    )
+    return True
+
+
 def _mark_attempt_cleaned(attempt: CartAttempt, summary: str = "") -> None:
     result = dict(attempt.result or {})
     result["cart_cleared"] = True
@@ -385,6 +435,8 @@ def _best_attempt(run: CartRun):
 
 
 def process_cart_run(run: CartRun) -> None:
+    if finish_requested_cart_stop(run):
+        return
     while run.next_store_index < len(run.store_priority):
         store = run.store_priority[run.next_store_index]
         attempt, _ = CartAttempt.objects.update_or_create(
@@ -410,6 +462,12 @@ def process_cart_run(run: CartRun) -> None:
             }
             attempt.finished_at = timezone.now()
             attempt.save(update_fields=["status", "summary", "result", "finished_at"])
+            if finish_requested_cart_stop(
+                run,
+                attempt=attempt,
+                mutation_unknown=error.mutation_possible,
+            ):
+                return
             if error.mutation_possible:
                 run.status = CartRun.Status.MANUAL_CHECK
                 run.selected_attempt = attempt
@@ -429,6 +487,8 @@ def process_cart_run(run: CartRun) -> None:
                 return
             raise
         _save_result(attempt, data)
+        if finish_requested_cart_stop(run, attempt=attempt):
+            return
         run.next_store_index += 1
         run.save(update_fields=["next_store_index"])
 
@@ -640,6 +700,8 @@ def claim_cleanup_run():
 
 
 def process_cart_cleanup(run: CartRun) -> None:
+    if finish_requested_cart_stop(run):
+        return
     attempt = run.selected_attempt
     if not attempt:
         raise CartAgentError("Для очистки не найден журнал добавленных товаров.")
@@ -654,6 +716,8 @@ def process_cart_cleanup(run: CartRun) -> None:
         return
 
     status = _cleanup_attempt(run, attempt)
+    if finish_requested_cart_stop(run, attempt=attempt):
+        return
     if status != "cleared":
         raise CartAgentError(
             "Агент не смог подтвердить полную очистку корзины.",
