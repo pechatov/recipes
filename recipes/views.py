@@ -1315,6 +1315,7 @@ def cart_cancel(request, pk):
 def cart_stop(request, pk):
     login_session = None
     previous_login_status = None
+    stop_requested_at = None
     with transaction.atomic():
         acquire_application_lock(CART_BROWSER_LOCK)
         if not reconcile_expired_browser_login_sessions():
@@ -1347,8 +1348,11 @@ def cart_stop(request, pk):
                 )
                 return redirect("cart-detail", pk=run.pk)
             previous_login_status = login_session.status
+            stop_requested_at = timezone.now()
+            run.cancellation_requested_at = stop_requested_at
+            run.save(update_fields=["cancellation_requested_at"])
             login_session.status = BrowserLoginSession.Status.STOPPING
-            login_session.transition_started_at = timezone.now()
+            login_session.transition_started_at = stop_requested_at
             login_session.error = "Окно входа закрывается при остановке сборки."
             login_session.save(
                 update_fields=["status", "transition_started_at", "error"]
@@ -1368,6 +1372,11 @@ def cart_stop(request, pk):
                     transition_started_at=None,
                     error="",
                 )
+                CartRun.objects.select_for_update().filter(
+                    pk=run.pk,
+                    requested_by=request.user,
+                    cancellation_requested_at=stop_requested_at,
+                ).update(cancellation_requested_at=None)
             messages.error(
                 request,
                 f"Не удалось закрыть окно Яндекс Еды: {error}",

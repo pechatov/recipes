@@ -278,8 +278,12 @@ def _reserve_browser_operation(run: CartRun) -> bool:
     """Serialize an external browser dispatch against a concurrent stop request."""
     with transaction.atomic():
         locked_run = CartRun.objects.select_for_update().get(pk=run.pk)
-        if locked_run.cancellation_requested_at:
+        if locked_run.cancellation_requested_at or locked_run.status not in {
+            CartRun.Status.PROCESSING,
+            CartRun.Status.CLEANING,
+        }:
             run.cancellation_requested_at = locked_run.cancellation_requested_at
+            run.status = locked_run.status
             return False
         locked_run.browser_operation_started_at = timezone.now()
         locked_run.save(update_fields=["browser_operation_started_at"])
@@ -288,8 +292,24 @@ def _reserve_browser_operation(run: CartRun) -> bool:
 
 
 def _release_browser_operation(run: CartRun) -> None:
-    CartRun.objects.filter(pk=run.pk).update(browser_operation_started_at=None)
+    CartRun.objects.filter(
+        pk=run.pk,
+        browser_operation_started_at=run.browser_operation_started_at,
+    ).update(browser_operation_started_at=None)
     run.browser_operation_started_at = None
+
+
+def _browser_operation_is_current(run: CartRun) -> bool:
+    if not run.browser_operation_started_at:
+        return False
+    current = CartRun.objects.filter(
+        pk=run.pk,
+        status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING],
+        browser_operation_started_at=run.browser_operation_started_at,
+    ).exists()
+    if not current:
+        run.refresh_from_db()
+    return current
 
 
 def record_unexpected_browser_failure(
@@ -444,6 +464,8 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
             cleanup_token=cleanup_token,
         )
     except CartAgentError as error:
+        if not _browser_operation_is_current(run):
+            return "stopped"
         try:
             if error.mutation_possible:
                 result = dict(attempt.result or {})
@@ -463,11 +485,15 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
         _release_browser_operation(run)
         raise
     except Exception as error:
+        if not _browser_operation_is_current(run):
+            return "stopped"
         record_unexpected_browser_failure(run, attempt=attempt, error=error)
         raise CartAgentError(
             "Browser-операция завершилась неожиданно.",
             mutation_possible=True,
         ) from error
+    if not _browser_operation_is_current(run):
+        return "stopped"
     try:
         status = _text(data.get("status"), 24)
         if status == "cleared":
@@ -609,6 +635,8 @@ def process_cart_run(run: CartRun) -> None:
         try:
             data = assemble_store_cart(run, store)
         except CartAgentError as error:
+            if not _browser_operation_is_current(run):
+                return
             diagnostic = _text(str(error), 500)
             attempt.status = CartAttempt.Status.FAILED
             attempt.summary = diagnostic or "Сервис не завершил одноэтапную сборку."
@@ -646,11 +674,15 @@ def process_cart_run(run: CartRun) -> None:
                 return
             raise
         except Exception as error:
+            if not _browser_operation_is_current(run):
+                return
             record_unexpected_browser_failure(run, attempt=attempt, error=error)
             raise CartAgentError(
                 "Browser-операция завершилась неожиданно.",
                 mutation_possible=True,
             ) from error
+        if not _browser_operation_is_current(run):
+            return
         try:
             _save_result(attempt, data)
         except Exception as error:
@@ -859,9 +891,13 @@ def claim_cleanup_run():
         acquire_application_lock(CART_BROWSER_LOCK)
         if not reconcile_expired_browser_login_sessions():
             return None
+        users_requiring_manual_check = CartRun.objects.filter(
+            status=CartRun.Status.MANUAL_CHECK
+        ).values("requested_by_id")
         run = (
             CartRun.objects.select_for_update(skip_locked=True)
             .filter(status=CartRun.Status.CLEANUP_PENDING)
+            .exclude(requested_by_id__in=users_requiring_manual_check)
             .order_by("cleanup_requested_at", "created_at")
             .first()
         )
@@ -869,12 +905,9 @@ def claim_cleanup_run():
             return None
         if browser_login_session_blocks_worker():
             return None
-        if CartRun.objects.filter(status=CartRun.Status.MANUAL_CHECK).exclude(
-            pk=run.pk
-        ).exists():
-            return None
         if CartRun.objects.filter(
             browser_operation_started_at__isnull=False,
+            requested_by=run.requested_by,
         ).exclude(pk=run.pk).exists():
             return None
         if CartRun.objects.filter(
@@ -942,9 +975,13 @@ def claim_cart_run():
         acquire_application_lock(CART_BROWSER_LOCK)
         if not reconcile_expired_browser_login_sessions():
             return None
+        users_requiring_manual_check = CartRun.objects.filter(
+            status=CartRun.Status.MANUAL_CHECK
+        ).values("requested_by_id")
         run = (
             CartRun.objects.select_for_update(skip_locked=True)
             .filter(status=CartRun.Status.PENDING)
+            .exclude(requested_by_id__in=users_requiring_manual_check)
             .order_by("created_at")
             .first()
         )
@@ -954,12 +991,9 @@ def claim_cart_run():
         # the same time. Even expired rows block until remote close is confirmed.
         if browser_login_session_blocks_worker():
             return None
-        if CartRun.objects.filter(status=CartRun.Status.MANUAL_CHECK).exclude(
-            pk=run.pk
-        ).exists():
-            return None
         if CartRun.objects.filter(
             browser_operation_started_at__isnull=False,
+            requested_by=run.requested_by,
         ).exclude(pk=run.pk).exists():
             return None
         # One persistent browser profile must not be shared by concurrent jobs.

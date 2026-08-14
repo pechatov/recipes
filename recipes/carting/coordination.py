@@ -96,6 +96,33 @@ def reconcile_expired_browser_login_sessions() -> bool:
             update_fields=["status", "transition_started_at", "finished_at", "error"]
         )
         if (
+            previous_status == BrowserLoginSession.Status.STOPPING
+            and login_session.run_id
+        ):
+            run = CartRun.objects.select_for_update().get(pk=login_session.run_id)
+            if run.cancellation_requested_at and run.can_stop:
+                run.status = CartRun.Status.CANCELLED
+                run.finished_at = now
+                run.confirmation_deadline = None
+                run.cleanup_requested_at = None
+                run.browser_operation_started_at = None
+                run.cleaned_at = None
+                run.error = (
+                    "Сборка остановлена по вашему запросу. В Яндекс Еде могли "
+                    "остаться товары этой попытки — проверьте корзину перед новым запуском."
+                )
+                run.save(
+                    update_fields=[
+                        "status",
+                        "finished_at",
+                        "confirmation_deadline",
+                        "cleanup_requested_at",
+                        "browser_operation_started_at",
+                        "cleaned_at",
+                        "error",
+                    ]
+                )
+        if (
             previous_status == BrowserLoginSession.Status.COMPLETING
             and login_session.run_id
         ):

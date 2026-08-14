@@ -1079,11 +1079,13 @@ class CartViewTests(TestCase):
 
         def observe_committed_transition(_remote_session_id):
             login_session.refresh_from_db()
+            run.refresh_from_db()
             self.assertEqual(
                 login_session.status,
                 BrowserLoginSession.Status.STOPPING,
             )
             self.assertIsNotNone(login_session.transition_started_at)
+            self.assertIsNotNone(run.cancellation_requested_at)
             self.assertTrue(browser_login_session_blocks_worker())
 
         stop_session.side_effect = observe_committed_transition
@@ -1129,6 +1131,7 @@ class CartViewTests(TestCase):
         run.refresh_from_db()
         login_session.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
+        self.assertIsNone(run.cancellation_requested_at)
         self.assertEqual(login_session.status, BrowserLoginSession.Status.ACTIVE)
         self.assertIsNone(login_session.transition_started_at)
 
@@ -1620,6 +1623,15 @@ class CartPipelineTests(TestCase):
         self,
         stop_session,
     ):
+        stopping_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            cancellation_requested_at=timezone.now() - timedelta(seconds=31),
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
         pending_run = CartRun.objects.create(
             recipe=self.recipe,
             requested_by=self.user,
@@ -1630,6 +1642,7 @@ class CartPipelineTests(TestCase):
         )
         login_session = BrowserLoginSession.objects.create(
             user=self.user,
+            run=stopping_run,
             remote_session_id="remote-session-id-1234567890",
             status=BrowserLoginSession.Status.STOPPING,
             transition_started_at=timezone.now() - timedelta(seconds=31),
@@ -1639,8 +1652,12 @@ class CartPipelineTests(TestCase):
         claimed = claim_cart_run()
 
         login_session.refresh_from_db()
+        stopping_run.refresh_from_db()
         self.assertEqual(claimed, pending_run)
         self.assertEqual(login_session.status, BrowserLoginSession.Status.FAILED)
+        self.assertEqual(stopping_run.status, CartRun.Status.CANCELLED)
+        self.assertIsNone(stopping_run.cleaned_at)
+        self.assertIn("могли остаться товары", stopping_run.error)
         stop_session.assert_called_once_with(login_session.remote_session_id)
 
     @patch("recipes.carting.coordination.stop_session")
@@ -1701,6 +1718,53 @@ class CartPipelineTests(TestCase):
         self.assertEqual(pending_run.status, CartRun.Status.PENDING)
         stop_session.assert_not_called()
 
+    def test_recent_browser_operation_is_not_recovered_from_old_run_start(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            started_at=timezone.now() - timedelta(minutes=31),
+            browser_operation_started_at=timezone.now(),
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        self.assertEqual(CartWorkerCommand.recover_stale_jobs(), 0)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PROCESSING)
+        self.assertIsNotNone(run.browser_operation_started_at)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_old_worker_does_not_persist_after_its_operation_is_recovered(
+        self,
+        assemble,
+    ):
+        run = self.make_run()
+
+        def recover_during_browser_call(*_args):
+            CartRun.objects.filter(pk=run.pk).update(
+                browser_operation_started_at=timezone.now() - timedelta(minutes=31)
+            )
+            self.assertEqual(CartWorkerCommand.recover_stale_jobs(), 1)
+            return {
+                "status": "exact",
+                "cart_url": "https://eda.yandex.ru/cart",
+                "items": [],
+            }
+
+        assemble.side_effect = recover_during_browser_call
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        attempt = run.attempts.get()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertEqual(run.next_store_index, 0)
+        self.assertEqual(attempt.status, CartAttempt.Status.PROCESSING)
+        self.assertEqual(attempt.result, {})
+
     @patch("recipes.carting.coordination.stop_session")
     def test_transition_without_timestamp_is_reconciled(self, stop_session):
         pending_run = CartRun.objects.create(
@@ -1755,6 +1819,23 @@ class CartPipelineTests(TestCase):
         self.assertIsNone(claim_cart_run())
         pending_run.refresh_from_db()
         self.assertEqual(pending_run.status, CartRun.Status.PENDING)
+
+        other_user = get_user_model().objects.create_user(username="other-cook")
+        other_recipe = Recipe.objects.create(
+            title="Суп",
+            servings=2,
+            created_by=other_user,
+        )
+        other_run = CartRun.objects.create(
+            recipe=other_recipe,
+            requested_by=other_user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        self.assertEqual(claim_cart_run(), other_run)
 
     def test_stale_worker_without_browser_reservation_can_be_requeued(self):
         run = CartRun.objects.create(

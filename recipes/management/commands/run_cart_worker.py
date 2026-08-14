@@ -2,6 +2,7 @@ import logging
 import time
 from datetime import timedelta
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
@@ -32,10 +33,16 @@ class Command(BaseCommand):
     def recover_stale_jobs():
         now = timezone.now()
         cutoff = now - timedelta(minutes=30)
+        operation_cutoff = now - timedelta(
+            seconds=max(
+                settings.CART_AI_TIMEOUT_SECONDS,
+                settings.CART_ADAPTER_TIMEOUT_SECONDS,
+            )
+            + 60
+        )
         uncertain_mutations = CartRun.objects.filter(
             status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING],
-            started_at__lt=cutoff,
-            browser_operation_started_at__isnull=False,
+            browser_operation_started_at__lte=operation_cutoff,
         ).update(
             status=CartRun.Status.MANUAL_CHECK,
             started_at=None,
