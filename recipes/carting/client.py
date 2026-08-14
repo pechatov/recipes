@@ -17,9 +17,16 @@ from .matching import choose_product, enforce_aggregate_stock
 class CartAgentError(Exception):
     """A safe, user-facing cart-agent failure."""
 
-    def __init__(self, message: str, *, mutation_possible: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        mutation_possible: bool = False,
+        operation_uncertain: bool = False,
+    ):
         super().__init__(message)
         self.mutation_possible = mutation_possible
+        self.operation_uncertain = operation_uncertain
 
 
 STORE_INSTRUCTIONS = {
@@ -253,6 +260,7 @@ def run_store_cart_task(
         raise CartAgentError(
             "Браузерный агент недоступен или не завершил сборку.",
             mutation_possible=True,
+            operation_uncertain=True,
         ) from error
     try:
         content = response.json()["choices"][0]["message"]["content"]
@@ -300,6 +308,7 @@ def _run_adapter_task(
             # adapter released the persistent browser profile. Starting
             # Hermes now could race the still-running adapter even for search.
             mutation_possible=True,
+            operation_uncertain=True,
         ) from error
     try:
         data = response.json()

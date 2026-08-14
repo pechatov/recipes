@@ -6,6 +6,7 @@ IMAGE="recipes:check"
 
 cd "$ROOT"
 bash -n scripts/*.sh scripts/deploy/*.sh
+node --check scripts/browser-login-server.mjs
 node --check scripts/cart-adapter-server.mjs
 node scripts/cart-adapter-server.test.mjs
 python3 -m py_compile scripts/deploy/render-compose.py

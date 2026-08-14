@@ -18,13 +18,21 @@ const hermesPython = `${hermesRoot}/venv/bin/python`;
 const camofoxUrl = "http://127.0.0.1:9377";
 const noVncUrl = "http://127.0.0.1:6080";
 const statePath = process.env.BROWSER_LOGIN_STATE_PATH || "";
+const recoveryUnits = (process.env.BROWSER_RECOVERY_UNITS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 const publicPrefix = "/browser-login";
 const scopePattern = /^recipes-cart-user-[1-9][0-9]*$/;
 const idPattern = /^[A-Za-z0-9_-]{20,128}$/;
+const systemdUnitPattern = /^[A-Za-z0-9_.@-]+\.service$/;
 const proxy = httpProxy.createProxyServer({ target: noVncUrl, ws: true });
 
 if (!controlKey || !hermesRoot || !hermesHome || !statePath || !Number.isInteger(port)) {
   throw new Error("Browser login service environment is incomplete");
+}
+if (recoveryUnits.some((unit) => !systemdUnitPattern.test(unit))) {
+  throw new Error("Browser recovery service list is invalid");
 }
 
 let activeSession = null;
@@ -175,6 +183,35 @@ async function closeCamofoxUser(userId) {
   if (!response.ok && response.status !== 404) throw new Error(`camofox_stop_${response.status}`);
 }
 
+async function systemctlRecoveryUnits(action) {
+  if (!recoveryUnits.length) throw new Error("browser_recovery_not_configured");
+  await execFileAsync(
+    "/usr/bin/systemctl",
+    ["--user", action, ...recoveryUnits],
+    { timeout: 45_000, maxBuffer: 16_384 },
+  );
+}
+
+async function recoverAutomationScope(scope) {
+  const identity = await camofoxIdentity(scope);
+  let recoveryError = null;
+  try {
+    // Stopping both request producers is the fencing boundary: after systemd
+    // confirms it, neither an abandoned adapter call nor Hermes can open a
+    // late tab. Only then is closing the persistent profile conclusive.
+    await systemctlRecoveryUnits("stop");
+    await closeCamofoxUser(identity.user_id);
+  } catch (error) {
+    recoveryError = error;
+  }
+  try {
+    await systemctlRecoveryUnits("start");
+  } catch (error) {
+    recoveryError ||= error;
+  }
+  if (recoveryError) throw recoveryError;
+}
+
 async function recoverInterruptedSession() {
   let recovery;
   try {
@@ -263,6 +300,21 @@ async function handleControl(request, response, url) {
         startingSession = false;
       }
       return sendJson(response, 201, { session_id: activeSession.id });
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/recoveries") {
+    const body = await readJson(request);
+    const scope = String(body.scope || "");
+    if (!scopePattern.test(scope)) {
+      return sendJson(response, 400, { error: "invalid_request" });
+    }
+    return serializeControlMutation(async () => {
+      if (startingSession || activeSession) {
+        return sendJson(response, 409, { error: "browser_busy" });
+      }
+      await recoverAutomationScope(scope);
+      return sendJson(response, 200, { status: "recovered" });
     });
   }
 

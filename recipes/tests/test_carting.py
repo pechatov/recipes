@@ -25,6 +25,7 @@ from recipes.carting.browser_login import (
     BrowserLoginError,
     BrowserLoginSessionNotFound,
     issue_access,
+    recover_scope,
 )
 from recipes.carting.client import (
     ASSEMBLE_PROMPT,
@@ -34,6 +35,7 @@ from recipes.carting.client import (
     cart_browser_session_key,
     cleanup_store_cart,
     _run_adapter_task,
+    run_store_cart_task,
 )
 from recipes.carting.coordination import browser_login_session_blocks_worker
 from recipes.carting.matching import choose_product, enforce_aggregate_stock
@@ -264,6 +266,29 @@ class CartViewTests(TestCase):
             15,
             login_session.remote_session_id,
         )
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+        CART_BROWSER_LOGIN_MINUTES=15,
+    )
+    @patch("recipes.views.start_browser_login_session")
+    def test_uncertain_cart_operation_blocks_manual_browser_start(self, start_session):
+        CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            browser_operation_started_at=timezone.now(),
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        response = self.client.post(reverse("browser-login-start"))
+
+        self.assertRedirects(response, reverse("yandex-connection"))
+        self.assertFalse(BrowserLoginSession.objects.exists())
+        start_session.assert_not_called()
 
     @override_settings(
         CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
@@ -1040,7 +1065,11 @@ class CartViewTests(TestCase):
         CART_AI_TIMEOUT_SECONDS=900,
         CART_ADAPTER_TIMEOUT_SECONDS=210,
     )
-    def test_stale_browser_reservation_is_abandoned_with_a_warning(self):
+    @patch("recipes.views.recover_browser_scope")
+    def test_stale_browser_reservation_requires_confirmed_remote_recovery(
+        self,
+        recover_scope,
+    ):
         run = CartRun.objects.create(
             recipe=self.recipe,
             requested_by=self.user,
@@ -1054,10 +1083,42 @@ class CartViewTests(TestCase):
         self.client.post(reverse("cart-stop", args=[run.pk]))
 
         run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNotNone(run.browser_operation_started_at)
+        self.assertIsNone(run.cleaned_at)
+        self.assertIn("не подтверждено", run.error)
+
+        self.client.post(reverse("cart-manual-resolved", args=[run.pk]))
+
+        run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
         self.assertIsNone(run.browser_operation_started_at)
-        self.assertIsNone(run.cleaned_at)
-        self.assertIn("могли остаться товары", run.error)
+        self.assertIsNotNone(run.cleaned_at)
+        recover_scope.assert_called_once_with(cart_browser_session_key(self.user.pk))
+
+    @patch("recipes.views.recover_browser_scope")
+    def test_failed_remote_recovery_keeps_global_reservation(self, recover_scope):
+        recover_scope.side_effect = BrowserLoginError("controller unavailable")
+        started_at = timezone.now() - timedelta(minutes=17)
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            browser_operation_started_at=started_at,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        response = self.client.post(
+            reverse("cart-manual-resolved", args=[run.pk]),
+            follow=True,
+        )
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertEqual(run.browser_operation_started_at, started_at)
+        self.assertContains(response, "Не удалось подтвердить остановку")
 
     @patch("recipes.views.stop_browser_login_session")
     def test_stopping_login_required_closes_its_browser_session(self, stop_session):
@@ -1375,6 +1436,42 @@ class CartPipelineTests(TestCase):
         )
         self.assertIn("pyaterochka", STORE_INSTRUCTIONS)
         self.assertNotIn("kuper.ru", repr(STORE_INSTRUCTIONS))
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    @patch("recipes.carting.browser_login.httpx.Client")
+    def test_scope_recovery_requires_controller_confirmation(self, client):
+        response = client.return_value.__enter__.return_value.request.return_value
+        response.status_code = 200
+        response.json.return_value = {"status": "recovered"}
+
+        recover_scope(cart_browser_session_key(self.user.pk))
+
+        client.assert_called_once_with(timeout=120, trust_env=False)
+        client.return_value.__enter__.return_value.request.assert_called_once_with(
+            "POST",
+            "http://browser.internal:9380/v1/recoveries",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={"scope": cart_browser_session_key(self.user.pk)},
+        )
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    @patch("recipes.carting.browser_login.httpx.Client")
+    def test_scope_recovery_rejects_unconfirmed_response(self, client):
+        response = client.return_value.__enter__.return_value.request.return_value
+        response.status_code = 200
+        response.json.return_value = {"status": "pending"}
+
+        with self.assertRaisesMessage(
+            BrowserLoginError,
+            "Сервис браузера не подтвердил остановку операции.",
+        ):
+            recover_scope(cart_browser_session_key(self.user.pk))
 
     def test_agent_checks_store_delivery_before_searching_products(self):
         availability_check = ASSEMBLE_PROMPT.index("первым действием")
@@ -1814,7 +1911,7 @@ class CartPipelineTests(TestCase):
 
         uncertain_run.refresh_from_db()
         self.assertEqual(uncertain_run.status, CartRun.Status.MANUAL_CHECK)
-        self.assertIsNone(uncertain_run.browser_operation_started_at)
+        self.assertIsNotNone(uncertain_run.browser_operation_started_at)
         self.assertIn("Проверьте корзину вручную", uncertain_run.error)
         self.assertIsNone(claim_cart_run())
         pending_run.refresh_from_db()
@@ -1835,7 +1932,43 @@ class CartPipelineTests(TestCase):
             ingredient_snapshot=self.snapshot,
         )
 
+        self.assertIsNone(claim_cart_run())
+
+    def test_regular_manual_check_only_blocks_its_user(self):
+        CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.MANUAL_CHECK,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        blocked_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        other_user = get_user_model().objects.create_user(username="manual-other-cook")
+        other_recipe = Recipe.objects.create(
+            title="Салат",
+            servings=2,
+            created_by=other_user,
+        )
+        other_run = CartRun.objects.create(
+            recipe=other_recipe,
+            requested_by=other_user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
         self.assertEqual(claim_cart_run(), other_run)
+        blocked_run.refresh_from_db()
+        self.assertEqual(blocked_run.status, CartRun.Status.PENDING)
 
     def test_stale_worker_without_browser_reservation_can_be_requeued(self):
         run = CartRun.objects.create(
@@ -1869,8 +2002,27 @@ class CartPipelineTests(TestCase):
 
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
-        self.assertIsNone(run.browser_operation_started_at)
+        self.assertIsNotNone(run.browser_operation_started_at)
         self.assertIn("Проверьте корзину вручную", run.error)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_uncertain_remote_assembly_keeps_global_reservation(
+        self,
+        assemble,
+    ):
+        assemble.side_effect = CartAgentError(
+            "controller timeout",
+            mutation_possible=True,
+            operation_uncertain=True,
+        )
+        run = self.make_run()
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNotNone(run.browser_operation_started_at)
+        self.assertTrue(run.selected_attempt.result["operation_uncertain"])
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_unexpected_assembly_error_releases_reservation_to_manual_check(
@@ -1935,6 +2087,50 @@ class CartPipelineTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
         self.assertIsNone(run.browser_operation_started_at)
         self.assertTrue(attempt.result["mutation_unknown"])
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    def test_uncertain_remote_cleanup_keeps_global_reservation(self, cleanup):
+        cleanup.side_effect = CartAgentError(
+            "controller timeout",
+            mutation_possible=True,
+            operation_uncertain=True,
+        )
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.CLEANING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+            cleanup_requested_at=timezone.now(),
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            cart_url="https://eda.yandex.ru/cart",
+            result={
+                "added_items": [
+                    {
+                        "product_name": "Спагетти 450 г",
+                        "product_url": "https://eda.yandex.ru/product/sku-pasta-12345678",
+                        "product_id": "sku-pasta-12345678",
+                        "package_count": 1,
+                        "added_package_count": 1,
+                    }
+                ]
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        process_cart_cleanup(run)
+
+        run.refresh_from_db()
+        attempt.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertIsNotNone(run.browser_operation_started_at)
+        self.assertTrue(attempt.result["operation_uncertain"])
 
     @patch("recipes.carting.client.run_store_cart_task")
     def test_single_ingredient_keeps_legacy_agent_call(self, run_task):
@@ -2098,11 +2294,28 @@ class CartPipelineTests(TestCase):
             )
 
         self.assertTrue(caught.exception.mutation_possible)
+        self.assertTrue(caught.exception.operation_uncertain)
         client.assert_called_once_with(
             timeout=settings.CART_ADAPTER_TIMEOUT_SECONDS,
             trust_env=False,
             verify=True,
         )
+
+    @override_settings(
+        CART_AI_BASE_URL="https://agent.example",
+        CART_AI_MODEL="browser-agent",
+    )
+    @patch("recipes.carting.client.httpx.Client")
+    def test_agent_transport_timeout_marks_operation_uncertain(self, client):
+        client.return_value.__enter__.return_value.post.side_effect = (
+            httpx.ReadTimeout("agent timed out")
+        )
+
+        with self.assertRaises(CartAgentError) as caught:
+            run_store_cart_task(self.make_run(), "auchan", "assemble")
+
+        self.assertTrue(caught.exception.mutation_possible)
+        self.assertTrue(caught.exception.operation_uncertain)
 
     @override_settings(
         CART_ADAPTER_BASE_URL="http://adapter.example",

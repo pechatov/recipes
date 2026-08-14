@@ -46,7 +46,6 @@ class Command(BaseCommand):
         ).update(
             status=CartRun.Status.MANUAL_CHECK,
             started_at=None,
-            browser_operation_started_at=None,
             finished_at=now,
             error=(
                 "Worker был прерван во время операции с Яндекс Едой. "
@@ -58,7 +57,6 @@ class Command(BaseCommand):
             browser_operation_started_at__isnull=False,
         ).update(
             status=CartRun.Status.MANUAL_CHECK,
-            browser_operation_started_at=None,
             finished_at=now,
             error=(
                 "Worker завершился с ошибкой во время операции с Яндекс Едой. "

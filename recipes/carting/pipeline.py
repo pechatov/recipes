@@ -209,6 +209,12 @@ def finish_requested_cart_stop(
         if not locked_run.cancellation_requested_at:
             run.cancellation_requested_at = None
             return False
+        if (
+            locked_run.status == CartRun.Status.MANUAL_CHECK
+            and locked_run.browser_operation_started_at
+        ):
+            run.refresh_from_db()
+            return True
         attempt = (
             attempt
             or locked_run.selected_attempt
@@ -465,11 +471,12 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
         )
     except CartAgentError as error:
         if not _browser_operation_is_current(run):
-            return "stopped"
+            return "manual_check"
         try:
             if error.mutation_possible:
                 result = dict(attempt.result or {})
                 result["mutation_unknown"] = True
+                result["operation_uncertain"] = error.operation_uncertain
                 attempt.result = result
                 attempt.save(update_fields=["result"])
         except Exception as persistence_error:
@@ -482,6 +489,18 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
                 "Не удалось сохранить результат browser-операции.",
                 mutation_possible=True,
             ) from persistence_error
+        if error.operation_uncertain:
+            run.status = CartRun.Status.MANUAL_CHECK
+            run.selected_attempt = attempt
+            run.finished_at = timezone.now()
+            run.error = (
+                "Связь с browser controller оборвалась во время очистки. "
+                "Проверьте корзину вручную."
+            )
+            run.save(
+                update_fields=["status", "selected_attempt", "finished_at", "error"]
+            )
+            return "manual_check"
         _release_browser_operation(run)
         raise
     except Exception as error:
@@ -642,10 +661,23 @@ def process_cart_run(run: CartRun) -> None:
             attempt.summary = diagnostic or "Сервис не завершил одноэтапную сборку."
             attempt.result = {
                 "mutation_unknown": error.mutation_possible,
+                "operation_uncertain": error.operation_uncertain,
                 "error": diagnostic,
             }
             attempt.finished_at = timezone.now()
             attempt.save(update_fields=["status", "summary", "result", "finished_at"])
+            if error.operation_uncertain:
+                run.status = CartRun.Status.MANUAL_CHECK
+                run.selected_attempt = attempt
+                run.finished_at = timezone.now()
+                run.error = (
+                    "Связь с browser controller оборвалась. Удалённая операция "
+                    "могла продолжить работу — проверьте корзину вручную."
+                )
+                run.save(
+                    update_fields=["status", "selected_attempt", "finished_at", "error"]
+                )
+                return
             # Keep the reservation until the mutation outcome is durable. A
             # concurrent stop can now safely derive its warning from attempt.
             _release_browser_operation(run)
@@ -714,7 +746,7 @@ def process_cart_run(run: CartRun) -> None:
                         "ответа о недоступности магазина.",
                     )
                     raise
-                if cleanup_status == "stopped":
+                if cleanup_status in {"stopped", "manual_check"}:
                     return
                 if cleanup_status != "cleared":
                     _record_outstanding_cleanup(
@@ -805,7 +837,7 @@ def process_cart_run(run: CartRun) -> None:
                         "Не удалось очистить товары после неудачной сборки.",
                     )
                     raise
-                if cleanup_status == "stopped":
+                if cleanup_status in {"stopped", "manual_check"}:
                     return
                 if cleanup_status != "cleared":
                     _record_outstanding_cleanup(
@@ -834,7 +866,7 @@ def process_cart_run(run: CartRun) -> None:
                     "Не удалось очистить неполную корзину.",
                 )
                 raise
-            if cleanup_status == "stopped":
+            if cleanup_status in {"stopped", "manual_check"}:
                 return
             if cleanup_status != "cleared":
                 _record_outstanding_cleanup(
@@ -907,7 +939,6 @@ def claim_cleanup_run():
             return None
         if CartRun.objects.filter(
             browser_operation_started_at__isnull=False,
-            requested_by=run.requested_by,
         ).exclude(pk=run.pk).exists():
             return None
         if CartRun.objects.filter(
@@ -946,6 +977,8 @@ def process_cart_cleanup(run: CartRun) -> None:
         return
 
     status = _cleanup_attempt(run, attempt)
+    if status == "manual_check":
+        return
     if finish_requested_cart_stop(run, attempt=attempt):
         return
     if status != "cleared":
@@ -993,7 +1026,6 @@ def claim_cart_run():
             return None
         if CartRun.objects.filter(
             browser_operation_started_at__isnull=False,
-            requested_by=run.requested_by,
         ).exclude(pk=run.pk).exists():
             return None
         # One persistent browser profile must not be shared by concurrent jobs.

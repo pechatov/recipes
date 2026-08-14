@@ -355,6 +355,7 @@ Environment=PATH={home}/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin
 Environment=BROWSER_LOGIN_BIND_HOST={os.environ['PI_ADDRESS']}
 Environment=BROWSER_LOGIN_PORT=9380
 Environment=BROWSER_LOGIN_STATE_PATH={home}/.local/share/recipes-browser-login/active-session.json
+Environment=BROWSER_RECOVERY_UNITS=recipes-cart-adapter.service,hermes-gateway-{profile}.service
 Environment=HERMES_ROOT={home}/.hermes/hermes-agent
 Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
 EnvironmentFile={home}/.hermes/profiles/{profile}/.env

@@ -39,8 +39,9 @@ jobs:
           python manage.py check
           python manage.py makemigrations --check --dry-run
 
-      - name: Cart adapter safety tests
+      - name: Cart automation safety tests
         run: |
+          node --check scripts/browser-login-server.mjs
           node --check scripts/cart-adapter-server.mjs
           node scripts/cart-adapter-server.test.mjs
 

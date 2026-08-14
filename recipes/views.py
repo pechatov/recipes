@@ -27,6 +27,7 @@ from .carting.browser_login import (
     BrowserLoginSessionNotFound,
     is_configured as browser_login_is_configured,
     issue_access as issue_browser_login_access,
+    recover_scope as recover_browser_scope,
     start_session as start_browser_login_session,
     stop_session as stop_browser_login_session,
 )
@@ -1332,6 +1333,15 @@ def cart_stop(request, pk):
         if not run.can_stop:
             messages.info(request, "Эта сборка уже завершена.")
             return redirect("cart-detail", pk=run.pk)
+        if (
+            run.status == CartRun.Status.MANUAL_CHECK
+            and run.browser_operation_started_at
+        ):
+            messages.info(
+                request,
+                "Сначала проверьте корзину Яндекс Еды и подтвердите ручную проверку.",
+            )
+            return redirect("cart-detail", pk=run.pk)
         login_session = BrowserLoginSession.objects.select_for_update().filter(
             user=request.user,
             run=run,
@@ -1437,6 +1447,29 @@ def cart_stop(request, pk):
                     "после чего сборка остановится.",
                 )
                 return redirect("cart-detail", pk=run.pk)
+            if run.browser_operation_started_at:
+                run.status = CartRun.Status.MANUAL_CHECK
+                run.finished_at = now
+                run.confirmation_deadline = None
+                run.error = (
+                    "Остановка запрошена, но завершение удалённой browser-операции "
+                    "не подтверждено. Проверьте корзину вручную."
+                )
+                run.save(
+                    update_fields=[
+                        "status",
+                        "cancellation_requested_at",
+                        "finished_at",
+                        "confirmation_deadline",
+                        "error",
+                    ]
+                )
+                messages.warning(
+                    request,
+                    "Сборка больше не продолжится. Перед новым запуском подтвердите "
+                    "ручную проверку корзины.",
+                )
+                return redirect("cart-detail", pk=run.pk)
 
         attempt = None
         attempts = CartAttempt.objects.select_for_update()
@@ -1496,7 +1529,9 @@ def cart_stop(request, pk):
 @login_required
 @require_POST
 def cart_manual_resolved(request, pk):
+    reservation_started_at = None
     with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
         run = get_object_or_404(
             CartRun.objects.select_for_update(),
             pk=pk,
@@ -1505,7 +1540,37 @@ def cart_manual_resolved(request, pk):
         if run.status != CartRun.Status.MANUAL_CHECK:
             messages.info(request, "Ручная проверка уже завершена.")
             return redirect("cart-detail", pk=run.pk)
+        reservation_started_at = run.browser_operation_started_at
 
+    if reservation_started_at:
+        try:
+            recover_browser_scope(cart_browser_session_key(request.user.id))
+        except BrowserLoginError as error:
+            messages.error(
+                request,
+                f"Не удалось подтвердить остановку браузерной операции: {error}",
+            )
+            return redirect("cart-detail", pk=run.pk)
+
+    with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
+        run = get_object_or_404(
+            CartRun.objects.select_for_update(),
+            pk=pk,
+            requested_by=request.user,
+        )
+        if run.status != CartRun.Status.MANUAL_CHECK:
+            messages.info(request, "Ручная проверка уже завершена.")
+            return redirect("cart-detail", pk=run.pk)
+        if (
+            reservation_started_at
+            and run.browser_operation_started_at != reservation_started_at
+        ):
+            messages.error(
+                request,
+                "Состояние браузерной операции изменилось. Обновите страницу и повторите.",
+            )
+            return redirect("cart-detail", pk=run.pk)
         attempt = None
         if run.selected_attempt_id:
             attempt = CartAttempt.objects.select_for_update().filter(
@@ -1607,9 +1672,14 @@ def browser_login_start(request, pk=None):
                 return redirect("cart-detail", pk=run.pk)
             messages.info(request, "У вас уже открыто окно входа в Яндекс Еду.")
             return redirect("browser-login", pk=active.pk)
-        if CartRun.objects.filter(
-            status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING]
-        ).exists():
+        if (
+            CartRun.objects.filter(
+                status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING]
+            ).exists()
+            or CartRun.objects.filter(
+                browser_operation_started_at__isnull=False
+            ).exists()
+        ):
             messages.error(request, "Дождитесь завершения текущей операции с корзиной.")
             return redirect("cart-detail", pk=run.pk) if run else redirect("yandex-connection")
 
