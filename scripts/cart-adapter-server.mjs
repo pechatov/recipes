@@ -60,11 +60,11 @@ const maximumOperationStateBytes = 16 * 1024 * 1024;
 const deferredBrowserCreateSettlementMs = 2 * 60 * 1000;
 const selectionKey = crypto.createHash("sha256").update(controlKey).digest();
 const stores = {
-  auchan: ["ашан", "auchan"],
-  perekrestok: ["перекресток", "perekrestok"],
-  pyaterochka: ["пятерочка", "pyaterochka"],
-  magnit: ["магнит", "magnit"],
-  lavka: ["яндекс лавка", "лавка", "yandex lavka"],
+  auchan: { aliases: ["ашан", "auchan"], groupSlugs: ["asan_giper"] },
+  perekrestok: { aliases: ["перекресток", "perekrestok"], groupSlugs: ["perekrestok"] },
+  pyaterochka: { aliases: ["пятерочка", "pyaterochka"], groupSlugs: ["paterocka"] },
+  magnit: { aliases: ["магнит", "magnit"], groupSlugs: ["magnit_celevaya"] },
+  lavka: { aliases: ["яндекс лавка", "лавка", "yandex lavka"], groupSlugs: ["lavka"] },
 };
 
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -744,15 +744,16 @@ async function waitForPageState(browser, { needLinks = false } = {}) {
 }
 
 function selectStoreLink(store, links) {
-  const aliases = stores[store];
+  const policy = stores[store];
   for (const link of links || []) {
     const label = normalize(link.text);
-    if (!aliases.some((alias) => label.includes(normalize(alias)))) continue;
+    if (!policy.aliases.some((alias) => label.includes(normalize(alias)))) continue;
     try {
       const url = new URL(link.href);
       const placeSlug = url.searchParams.get("placeSlug") || "";
-      if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru" || !url.pathname.startsWith("/retail/") || !slugPattern.test(placeSlug) || url.pathname.includes("/product/")) continue;
-      return { url: url.href, placeSlug, pathGroupSlug: url.pathname.split("/").filter(Boolean)[1] || "" };
+      const pathGroupSlug = url.pathname.split("/").filter(Boolean)[1] || "";
+      if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru" || !url.pathname.startsWith("/retail/") || !slugPattern.test(placeSlug) || url.pathname.includes("/product/") || !policy.groupSlugs.includes(pathGroupSlug)) continue;
+      return { url: url.href, placeSlug, pathGroupSlug };
     } catch {}
   }
   throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
@@ -792,7 +793,7 @@ async function resolveStore(browser, store) {
   }
   const groupSlug = String(catalog.place.brandSlug || selected.pathGroupSlug || "");
   const placeBusiness = String(catalog.place.business || "");
-  if (!slugPattern.test(groupSlug) || !businessPattern.test(placeBusiness)) {
+  if (!stores[store].groupSlugs.includes(groupSlug) || !businessPattern.test(placeBusiness)) {
     throw new OperationError("store_unavailable", "Витрина магазина не имеет стабильного идентификатора.");
   }
   return {
@@ -1662,6 +1663,7 @@ export {
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
+  selectStoreLink,
   scopeRecoveryAt,
   storeOperationRecord,
 };

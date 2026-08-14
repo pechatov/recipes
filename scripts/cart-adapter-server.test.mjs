@@ -25,6 +25,7 @@ const {
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
+  selectStoreLink,
   scopeRecoveryAt,
   storeOperationRecord,
 } = await import("./cart-adapter-server.mjs");
@@ -170,6 +171,31 @@ assert.equal(
     { latitude: 55.7568, longitude: 37.6173 },
   ),
   false,
+);
+
+assert.deepEqual(
+  selectStoreLink("magnit", [
+    {
+      text: "Магнит Косметик",
+      href: "https://eda.yandex.ru/retail/magnit_kosmetik?placeSlug=cosmetics-nearby",
+    },
+    {
+      text: "Магнит · доставка продуктов",
+      href: "https://eda.yandex.ru/retail/magnit_celevaya?placeSlug=grocery-nearby",
+    },
+  ]),
+  {
+    url: "https://eda.yandex.ru/retail/magnit_celevaya?placeSlug=grocery-nearby",
+    placeSlug: "grocery-nearby",
+    pathGroupSlug: "magnit_celevaya",
+  },
+);
+assert.throws(
+  () => selectStoreLink("magnit", [{
+    text: "Магнит Косметик",
+    href: "https://eda.yandex.ru/retail/magnit_kosmetik?placeSlug=cosmetics-nearby",
+  }]),
+  (error) => error.code === "store_unavailable",
 );
 
 let releaseFirst;
