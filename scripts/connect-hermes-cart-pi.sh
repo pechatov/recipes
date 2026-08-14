@@ -424,7 +424,7 @@ if not all(keys.get(name) for name in (\"cart\", \"browser\", \"adapter\")) or n
 values = {
     \"CART_ADAPTER_BASE_URL\": os.environ[\"CART_ADAPTER_URL\"],
     \"CART_ADAPTER_API_KEY\": keys[\"adapter\"],
-    \"CART_ADAPTER_TIMEOUT_SECONDS\": \"120\",
+    \"CART_ADAPTER_TIMEOUT_SECONDS\": \"210\",
     \"CART_ADAPTER_FALLBACK_TO_HERMES\": \"true\",
     \"CART_AI_BASE_URL\": os.environ[\"CART_BASE_URL\"],
     \"CART_AI_API_KEY\": keys[\"cart\"],

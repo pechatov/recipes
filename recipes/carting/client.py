@@ -266,7 +266,10 @@ def _run_adapter_task(
     except httpx.HTTPError as error:
         raise CartAgentError(
             "Адаптер корзины недоступен.",
-            mutation_possible=mutation_possible,
+            # A timeout or broken connection does not acknowledge that the
+            # adapter released the persistent browser profile. Starting
+            # Hermes now could race the still-running adapter even for search.
+            mutation_possible=True,
         ) from error
     try:
         data = response.json()

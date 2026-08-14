@@ -15,7 +15,6 @@ const camofoxUrl = (process.env.CAMOFOX_URL || "http://127.0.0.1:9377").replace(
 const camofoxAccessKey = process.env.CAMOFOX_ACCESS_KEY || process.env.CAMOFOX_API_KEY || "";
 const scopePattern = /^recipes-cart-user-[1-9][0-9]*$/;
 const productIdPattern = /^[A-Za-z0-9_-]{8,128}$/;
-const cartItemIdPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const businessPattern = /^[a-z][a-z0-9_-]{0,63}$/;
 const slugPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const tokenLifetimeMs = 10 * 60 * 1000;
@@ -43,11 +42,16 @@ class OperationError extends Error {
   }
 }
 
-let operationQueue = Promise.resolve();
+const operationQueues = new Map();
 
-function serializeOperation(operation) {
-  const result = operationQueue.then(operation, operation);
-  operationQueue = result.catch(() => {});
+function serializeOperation(scope, operation) {
+  const previous = operationQueues.get(scope) || Promise.resolve();
+  const result = previous.then(operation, operation);
+  const settled = result.catch(() => {});
+  operationQueues.set(scope, settled);
+  settled.then(() => {
+    if (operationQueues.get(scope) === settled) operationQueues.delete(scope);
+  });
   return result;
 }
 
@@ -472,13 +476,6 @@ function legacyCartParams(context) {
   };
 }
 
-function legacyExistingCartParams(context) {
-  return {
-    ...legacyCartParams(context),
-    placeSlug: context.place_slug,
-  };
-}
-
 function searchExpression(context, ingredients) {
   return `(async () => {
     const context = ${JSON.stringify(context)};
@@ -614,134 +611,47 @@ function cartExpression(context) {
   })()`;
 }
 
-function addLegacyItemExpression(context, productId, quantity) {
-  return `(async () => {
-    const context = ${JSON.stringify(context)};
-    const query = new URLSearchParams(${JSON.stringify(legacyCartParams(context))});
-    const response = await fetch('/api/v1/cart?' + query, {
-      method: 'POST',
-      headers: {'accept': 'application/json', 'content-type': 'application/json'},
-      body: JSON.stringify({
-        item_id: ${JSON.stringify(productId)},
-        quantity: ${quantity},
-        place_slug: context.place_slug,
-        place_business: context.place_business,
-      }),
-    });
-    let data = {};
-    try { data = await response.json(); } catch {}
-    const errorMessage = [
-      data?.message,
-      data?.description,
-      data?.err?.message,
-      data?.err?.description,
-      typeof data?.err === 'string' ? data.err : '',
-      data?.error?.message,
-      data?.error?.description,
-      typeof data?.error === 'string' ? data.error : '',
-    ].find((value) => typeof value === 'string' && value.trim());
-    return {
-      status: response.status,
-      error_code: String(data?.code || data?.error?.code || '').slice(0, 80),
-      error_message: String(errorMessage || '').slice(0, 240),
-      response_keys: Object.keys(data || {}).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).slice(0, 20),
-    };
-  })()`;
-}
-
 function addLegacyItemsExpression(context, items) {
   const payloadItems = items.map((item) => ({
     item_id: item.product_id,
-    quantity: item.target,
+    quantity: item.delta,
   }));
   return `(async () => {
     const context = ${JSON.stringify(context)};
     const items = ${JSON.stringify(payloadItems)};
     const query = new URLSearchParams(${JSON.stringify(legacyCartParams(context))});
-    const response = await fetch('/api/v1/cart/add_bulk?' + query, {
-      method: 'POST',
-      headers: {'accept': 'application/json', 'content-type': 'application/json'},
-      body: JSON.stringify({
-        items,
-        place_slug: context.place_slug,
-        place_business: context.place_business,
-      }),
-    });
-    let data = {};
-    try { data = await response.json(); } catch {}
-    const errorMessage = [
-      data?.message,
-      data?.description,
-      data?.err?.message,
-      data?.err?.description,
-      typeof data?.err === 'string' ? data.err : '',
-      data?.error?.message,
-      data?.error?.description,
-      typeof data?.error === 'string' ? data.error : '',
-    ].find((value) => typeof value === 'string' && value.trim());
-    return {
-      status: response.status,
-      error_code: String(data?.code || data?.error?.code || '').slice(0, 80),
-      error_message: String(errorMessage || '').slice(0, 240),
-      response_keys: Object.keys(data || {}).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).slice(0, 20),
-    };
-  })()`;
-}
-
-function changeLegacyItemExpression(context, cartItemId, quantity) {
-  return `(async () => {
-    const query = new URLSearchParams(${JSON.stringify(legacyExistingCartParams(context))});
-    const response = await fetch('/api/v1/cart/' + encodeURIComponent(${JSON.stringify(cartItemId)}) + '?' + query, {
-      method: 'PUT',
-      headers: {'accept': 'application/json', 'content-type': 'application/json'},
-      body: JSON.stringify({quantity: ${quantity}}),
-    });
-    let data = {};
-    try { data = await response.json(); } catch {}
-    const errorMessage = [
-      data?.message,
-      data?.description,
-      data?.err?.message,
-      data?.err?.description,
-      typeof data?.err === 'string' ? data.err : '',
-      data?.error?.message,
-      data?.error?.description,
-      typeof data?.error === 'string' ? data.error : '',
-    ].find((value) => typeof value === 'string' && value.trim());
-    return {
-      status: response.status,
-      error_code: String(data?.code || data?.error?.code || '').slice(0, 80),
-      error_message: String(errorMessage || '').slice(0, 240),
-      response_keys: Object.keys(data || {}).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).slice(0, 20),
-    };
-  })()`;
-}
-
-function removeLegacyItemExpression(context, cartItemId) {
-  return `(async () => {
-    const query = new URLSearchParams(${JSON.stringify(legacyExistingCartParams(context))});
-    const response = await fetch('/api/v1/cart/' + encodeURIComponent(${JSON.stringify(cartItemId)}) + '?' + query, {
-      method: 'DELETE',
-      headers: {'accept': 'application/json'},
-    });
-    let data = {};
-    try { data = await response.json(); } catch {}
-    const errorMessage = [
-      data?.message,
-      data?.description,
-      data?.err?.message,
-      data?.err?.description,
-      typeof data?.err === 'string' ? data.err : '',
-      data?.error?.message,
-      data?.error?.description,
-      typeof data?.error === 'string' ? data.error : '',
-    ].find((value) => typeof value === 'string' && value.trim());
-    return {
-      status: response.status,
-      error_code: String(data?.code || data?.error?.code || '').slice(0, 80),
-      error_message: String(errorMessage || '').slice(0, 240),
-      response_keys: Object.keys(data || {}).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).slice(0, 20),
-    };
+    const results = await Promise.all(items.map(async (item) => {
+      const response = await fetch('/api/v1/cart?' + query, {
+        method: 'POST',
+        headers: {'accept': 'application/json', 'content-type': 'application/json'},
+        body: JSON.stringify({
+          item_id: item.item_id,
+          quantity: item.quantity,
+          place_slug: context.place_slug,
+          place_business: context.place_business,
+        }),
+      });
+      let data = {};
+      try { data = await response.json(); } catch {}
+      const errorMessage = [
+        data?.message,
+        data?.description,
+        data?.err?.message,
+        data?.err?.description,
+        typeof data?.err === 'string' ? data.err : '',
+        data?.error?.message,
+        data?.error?.description,
+        typeof data?.error === 'string' ? data.error : '',
+      ].find((value) => typeof value === 'string' && value.trim());
+      return {
+        status: response.status,
+        error_code: String(data?.code || data?.error?.code || '').slice(0, 80),
+        error_message: String(errorMessage || '').slice(0, 240),
+        response_keys: Object.keys(data || {}).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).slice(0, 20),
+      };
+    }));
+    return results.find((result) => result.status < 200 || result.status >= 300)
+      || {status: 200, error_code: '', error_message: '', response_keys: []};
   })()`;
 }
 
@@ -752,16 +662,9 @@ function quantityInCart(cart, ...identifiers) {
   ), 0);
 }
 
-function rowsInCart(cart, ...identifiers) {
-  const expected = new Set(identifiers.map(String));
-  return (cart?.items || []).filter((item) => (
-    item.ids?.some((identifier) => expected.has(String(identifier)))
-  ));
-}
-
 async function dispatchCartMutation(browser, expression, mutationState) {
   // Once the request is dispatched, no HTTP status or transport error proves
-  // that Yandex applied none of it (especially for add_bulk). Never retry the
+  // that Yandex applied none of it. Never retry the
   // mutation or allow a Hermes fallback after crossing this boundary.
   mutationState.possible = true;
   return evaluate(browser, expression);
@@ -995,26 +898,17 @@ async function applySelection(body) {
     const context = await validateSignedStore(browser, signedContext);
     const before = await readCart(browser, context);
     const quantitiesBefore = new Map();
-    const newItems = [];
-    const existingItems = [];
+    const quantitiesExpected = new Map();
+    const itemsToAdd = [];
     for (const item of requested) {
       const existing = quantityInCart(before, item.product_id, item.sku_id);
-      const matchingRows = rowsInCart(before, item.product_id, item.sku_id);
       quantitiesBefore.set(item.product_id, existing);
       const target = Math.max(existing, item.quantity);
+      quantitiesExpected.set(item.product_id, target);
       if (target === existing) continue;
-      if (existing > 0) {
-        const cartItemId = String(matchingRows[0]?.cart_item_id || "");
-        if (matchingRows.length !== 1 || !cartItemIdPattern.test(cartItemId)) {
-          throw new OperationError(
-            "verification_failed",
-            "Точный товар в корзине нельзя безопасно изменить.",
-          );
-        }
-        existingItems.push({ ...item, target, cart_item_id: cartItemId });
-      } else {
-        newItems.push({ ...item, target });
-      }
+      // POST applies a positive delta. Never write an absolute
+      // quantity here: a user may increase this SKU after the preceding read.
+      itemsToAdd.push({ ...item, delta: target - existing });
     }
 
     const runMutation = async (mutationExpression) => {
@@ -1040,33 +934,19 @@ async function applySelection(body) {
       );
     };
 
-    if (newItems.length === 1) {
-      await runMutation(addLegacyItemExpression(
-        context,
-        newItems[0].product_id,
-        newItems[0].target,
-      ));
-    } else if (newItems.length > 1) {
-      await runMutation(addLegacyItemsExpression(context, newItems));
-    }
-    for (const item of existingItems) {
-      await runMutation(changeLegacyItemExpression(
-        context,
-        item.cart_item_id,
-        item.target,
-      ));
-      await sleep(500);
+    if (itemsToAdd.length > 0) {
+      await runMutation(addLegacyItemsExpression(context, itemsToAdd));
     }
     const after = await readCartUntil(browser, context, (cart) => requested.every((item) => {
-      const beforeQuantity = quantitiesBefore.get(item.product_id) || 0;
-      return quantityInCart(cart, item.product_id, item.sku_id) >= Math.max(beforeQuantity, item.quantity);
+      const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
+      return quantityInCart(cart, item.product_id, item.sku_id) === expectedQuantity;
     }));
     const additions = [];
     for (const item of requested) {
       const beforeQuantity = quantitiesBefore.get(item.product_id) || 0;
       const afterQuantity = quantityInCart(after, item.product_id, item.sku_id);
-      const target = Math.max(beforeQuantity, item.quantity);
-      if (afterQuantity < target || afterQuantity < beforeQuantity) {
+      const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
+      if (afterQuantity !== expectedQuantity) {
         throw new OperationError("verification_failed", "Количество товара в корзине не удалось подтвердить.", { mutationPossible: mutationState.possible });
       }
       additions.push({
@@ -1150,68 +1030,26 @@ function validateCleanup(body, scope, store) {
 async function cleanup(body) {
   const { scope, store } = validateBaseRequest(body);
   const cleanupRequest = validateCleanup(body, scope, store);
-  const mutationState = { possible: false };
   return withBrowser(scope, async (browser) => {
     const context = await validateSignedStore(browser, cleanupRequest.context);
-    const before = await readCart(browser, context);
-    const targets = [];
-    // Preflight every item before changing any of them. Cleanup is allowed
-    // only from the exact post-assembly state, or from the already-restored
-    // baseline after a previous (possibly partially acknowledged) request.
+    const cart = await readCart(browser, context);
+    let outstanding = 0;
     for (const item of cleanupRequest.items) {
-      const existing = quantityInCart(before, item.product_id, item.sku_id);
-      const matchingRows = rowsInCart(before, item.product_id, item.sku_id);
-      const cartItemId = String(matchingRows[0]?.cart_item_id || "");
-      if (existing !== item.before_quantity && existing !== item.after_quantity) {
-        throw new OperationError(
-          "verification_failed",
-          "Количество товара изменилось после сборки; автоматическая очистка остановлена.",
-        );
-      }
-      targets.push({ ...item, existing, cart_item_id: cartItemId });
-      if (existing === item.before_quantity) continue;
-      if (matchingRows.length !== 1 || !cartItemIdPattern.test(cartItemId)) {
-        throw new OperationError(
-          "verification_failed",
-          "Точный товар в корзине нельзя безопасно изменить.",
-        );
-      }
+      const existing = quantityInCart(cart, item.product_id, item.sku_id);
+      if (existing !== item.before_quantity) outstanding += 1;
     }
-    for (const item of targets) {
-      if (item.existing === item.before_quantity) continue;
-      const changed = await dispatchCartMutation(
-        browser,
-        item.before_quantity === 0
-          ? removeLegacyItemExpression(context, item.cart_item_id)
-          : changeLegacyItemExpression(context, item.cart_item_id, item.before_quantity),
-        mutationState,
-      );
-      const changedStatus = Number(changed?.status || 0);
-      const errorCode = text(changed?.error_code, 80);
-      const errorMessage = text(changed?.error_message, 240);
-      if (changedStatus < 200 || changedStatus >= 300) {
-        console.warn("Yandex legacy cart cleanup rejected", {
-          status: changedStatus,
-          code: errorCode,
-          message: errorMessage,
-          response_keys: Array.isArray(changed?.response_keys) ? changed.response_keys : [],
-        });
-      }
-      classifyApiStatus(
-        changedStatus,
-        `Яндекс Еда не смогла уменьшить точно выбранный товар${errorCode ? ` (${errorCode})` : ""}${errorMessage ? `: ${errorMessage}` : ""}.`,
-      );
+    if (outstanding === 0) {
+      return { status: "cleared", summary: "Добавления этой сборки уже удалены из корзины." };
     }
-    const after = await readCartUntil(browser, context, (cart) => targets.every(
-      (item) => quantityInCart(cart, item.product_id, item.sku_id) === item.before_quantity,
-    ));
-    for (const item of targets) {
-      if (quantityInCart(after, item.product_id, item.sku_id) !== item.before_quantity) {
-        throw new OperationError("verification_failed", "Очистку точного SKU не удалось подтвердить.", { mutationPossible: mutationState.possible });
-      }
-    }
-    return { status: "cleared", summary: "Добавления этой сборки удалены из корзины." };
-  }, mutationState, cleanupRequest.context.store_url);
+    // Yandex exposes no conditional/versioned decrement. An automatic PUT or
+    // DELETE could overwrite a change made by the user after this read, so the
+    // adapter deliberately performs no downward mutation.
+    return {
+      status: "login_required",
+      summary: `Удалите вручную добавления этой сборки (${outstanding} поз.).`,
+      mutation_possible: false,
+    };
+  }, { possible: false }, cleanupRequest.context.store_url);
 }
 
 function errorBody(error) {
@@ -1244,7 +1082,11 @@ const server = http.createServer(async (request, response) => {
       : url.pathname === "/v1/cart-state" ? () => cartState(body)
       : url.pathname === "/v1/apply" ? () => applySelection(body)
         : () => cleanup(body);
-    return sendJson(response, 200, await serializeOperation(operation));
+    return sendJson(
+      response,
+      200,
+      await serializeOperation(text(body?.scope, 80), operation),
+    );
   } catch (error) {
     const body = errorBody(error);
     const status = error instanceof OperationError && error.code === "invalid_request" ? 400 : 200;

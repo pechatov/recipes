@@ -1,6 +1,7 @@
 from datetime import timedelta
 from unittest.mock import patch
 
+import httpx
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError
@@ -28,6 +29,7 @@ from recipes.carting.client import (
     assemble_store_cart,
     cart_browser_session_key,
     cleanup_store_cart,
+    _run_adapter_task,
 )
 from recipes.carting.matching import choose_product
 from recipes.models import (
@@ -1095,6 +1097,25 @@ class CartPipelineTests(TestCase):
     @override_settings(
         CART_ADAPTER_BASE_URL="http://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client.httpx.Client")
+    def test_adapter_transport_timeout_never_allows_concurrent_fallback(self, client):
+        client.return_value.__enter__.return_value.post.side_effect = (
+            httpx.ReadTimeout("adapter timed out")
+        )
+
+        with self.assertRaises(CartAgentError) as caught:
+            _run_adapter_task(
+                "/v1/search",
+                {"scope": "recipes-cart-user-1", "store": "auchan"},
+                mutation_possible=False,
+            )
+
+        self.assertTrue(caught.exception.mutation_possible)
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
     @patch("recipes.carting.client.run_store_cart_task")
@@ -1258,6 +1279,30 @@ class CartPipelineTests(TestCase):
             )
 
         self.assertTrue(caught.exception.mutation_possible)
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_safe_adapter_cleanup_requests_manual_removal(self, adapter_task):
+        adapter_task.return_value = {
+            "status": "login_required",
+            "summary": "Удалите добавления вручную",
+            "mutation_possible": False,
+        }
+        run = self.make_run()
+
+        result = cleanup_store_cart(
+            run,
+            "auchan",
+            [{"product_id": "product-12345678", "package_count": 2}],
+            "https://eda.yandex.ru/cart",
+            cleanup_token="signed-cleanup",
+        )
+
+        self.assertEqual(result["status"], "login_required")
+        self.assertFalse(result["mutation_possible"])
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_exact_cart_is_built_in_one_agent_call(self, assemble):
