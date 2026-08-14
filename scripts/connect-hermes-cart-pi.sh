@@ -68,27 +68,37 @@ install -d -m 0700 "$PROFILE_HOME/camofox-profiles"
 
 ADAPTER_TLS_ROOT="$HOME/.local/share/recipes-cart-adapter/tls"
 install -d -m 0700 "$ADAPTER_TLS_ROOT"
+ADAPTER_TLS_CURRENT="$ADAPTER_TLS_ROOT/current"
 certificate_is_current=false
-if [[ -s "$ADAPTER_TLS_ROOT/server.key" && -s "$ADAPTER_TLS_ROOT/server.crt" ]] \
+if [[ -L "$ADAPTER_TLS_CURRENT" \
+  && -s "$ADAPTER_TLS_CURRENT/server.key" \
+  && -s "$ADAPTER_TLS_CURRENT/server.crt" ]] \
   && openssl x509 -checkend 2592000 -noout \
-    -in "$ADAPTER_TLS_ROOT/server.crt" >/dev/null 2>&1; then
+    -in "$ADAPTER_TLS_CURRENT/server.crt" >/dev/null 2>&1 \
+  && cmp -s \
+    <(openssl x509 -pubkey -noout -in "$ADAPTER_TLS_CURRENT/server.crt" 2>/dev/null) \
+    <(openssl pkey -pubout -in "$ADAPTER_TLS_CURRENT/server.key" 2>/dev/null); then
   if openssl x509 -noout -ext subjectAltName \
-    -in "$ADAPTER_TLS_ROOT/server.crt" 2>/dev/null \
+    -in "$ADAPTER_TLS_CURRENT/server.crt" 2>/dev/null \
     | grep -F "IP Address:$PI_ADDRESS" >/dev/null; then
     certificate_is_current=true
   fi
 fi
 if [[ "$certificate_is_current" != true ]]; then
-  tls_staging="$(mktemp -d)"
+  tls_staging="$(mktemp -d "$ADAPTER_TLS_ROOT/pair.XXXXXX")"
   openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 825 \
     -subj "/CN=recipes-cart-adapter" \
     -addext "subjectAltName=IP:$PI_ADDRESS" \
     -keyout "$tls_staging/server.key" \
     -out "$tls_staging/server.crt" >/dev/null 2>&1
-  install -m 0600 "$tls_staging/server.key" "$ADAPTER_TLS_ROOT/server.key"
-  install -m 0644 "$tls_staging/server.crt" "$ADAPTER_TLS_ROOT/server.crt"
-  rm -f "$tls_staging/server.key" "$tls_staging/server.crt"
-  rmdir "$tls_staging"
+  chmod 0600 "$tls_staging/server.key"
+  chmod 0644 "$tls_staging/server.crt"
+  staged_name="${tls_staging##*/}"
+  staged_link="$ADAPTER_TLS_ROOT/.current-$staged_name"
+  ln -s "$staged_name" "$staged_link"
+  # Renaming one symlink is atomic: interruption leaves either the complete old
+  # pair or the complete new pair visible to systemd and the certificate copy.
+  mv -Tf "$staged_link" "$ADAPTER_TLS_CURRENT"
 fi
 
 # The upstream no-proxy defaults identify every context as en-US in Los
@@ -376,8 +386,8 @@ After=recipes-camofox.service recipes-browser-login.service network-online.targe
 Environment=PATH={home}/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CART_ADAPTER_BIND_HOST={os.environ['PI_ADDRESS']}
 Environment=CART_ADAPTER_PORT={os.environ['PI_ADAPTER_PORT']}
-Environment=CART_ADAPTER_TLS_CERT={home}/.local/share/recipes-cart-adapter/tls/server.crt
-Environment=CART_ADAPTER_TLS_KEY={home}/.local/share/recipes-cart-adapter/tls/server.key
+Environment=CART_ADAPTER_TLS_CERT={home}/.local/share/recipes-cart-adapter/tls/current/server.crt
+Environment=CART_ADAPTER_TLS_KEY={home}/.local/share/recipes-cart-adapter/tls/current/server.key
 Environment=HERMES_ROOT={home}/.hermes/hermes-agent
 Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
 EnvironmentFile={home}/.hermes/profiles/{profile}/.env
@@ -427,7 +437,7 @@ for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:9377/health" >/dev/null 2>&1 \
     && curl -fsS "http://$PI_ADDRESS:$PI_API_PORT/health" >/dev/null 2>&1 \
     && curl -fsS "http://$PI_ADDRESS:9380/healthz" >/dev/null 2>&1 \
-    && curl --cacert "$ADAPTER_TLS_ROOT/server.crt" -fsS \
+    && curl --cacert "$ADAPTER_TLS_CURRENT/server.crt" -fsS \
       "https://$PI_ADDRESS:$PI_ADAPTER_PORT/healthz" >/dev/null 2>&1; then
     exit 0
   fi
@@ -438,7 +448,7 @@ exit 1
 REMOTE
 
 # Pass the bearer keys directly from Pi to the root-owned TrueNAS env file.
-ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import base64, json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); certificate=(Path.home()/'.local/share/recipes-cart-adapter/tls/server.crt').read_bytes(); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY'], 'adapter': values['CART_ADAPTER_CONTROL_KEY'], 'adapter_ca': base64.b64encode(certificate).decode()}))\"" \
+ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import base64, json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); certificate=(Path.home()/'.local/share/recipes-cart-adapter/tls/current/server.crt').read_bytes(); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY'], 'adapter': values['CART_ADAPTER_CONTROL_KEY'], 'adapter_ca': base64.b64encode(certificate).decode()}))\"" \
   | ssh "$TRUENAS_SSH_HOST" "sudo env TRUENAS_ENV='$TRUENAS_ENV' CART_BASE_URL='http://$PI_ADDRESS:$PI_API_PORT/v1' CART_ADAPTER_URL='https://$PI_ADDRESS:$PI_ADAPTER_PORT' python3 -c '
 import json
 import os

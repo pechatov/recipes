@@ -100,7 +100,12 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("CART_ADAPTER_TLS_KEY", script)
         self.assertIn("CART_ADAPTER_CA_CERT_B64", script)
         self.assertIn("CART_ADAPTER_URL='https://$PI_ADDRESS:$PI_ADAPTER_PORT'", script)
-        self.assertIn('--cacert "$ADAPTER_TLS_ROOT/server.crt"', script)
+        self.assertIn('--cacert "$ADAPTER_TLS_CURRENT/server.crt"', script)
+        self.assertIn("cmp -s", script)
+        self.assertIn("openssl pkey -pubout", script)
+        self.assertIn('mv -Tf "$staged_link" "$ADAPTER_TLS_CURRENT"', script)
+        self.assertIn("tls/current/server.crt", script)
+        self.assertIn("tls/current/server.key", script)
         self.assertNotIn(
             "CART_ADAPTER_URL='http://$PI_ADDRESS:$PI_ADAPTER_PORT'",
             script,

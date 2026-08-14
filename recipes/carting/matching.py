@@ -56,18 +56,17 @@ IGNORED_TOKENS = {
 }
 # These words materially change a grocery item. An unexpected modifier should
 # not silently turn a generic query into an "exact" match.
-SENSITIVE_MODIFIERS = {
-    "безлактозн",
-    "безглютен",
-    "козий",
-    "козье",
-    "кокосов",
-    "обезжир",
-    "овсян",
-    "рисов",
-    "соев",
-    "цельнозерн",
-}
+SENSITIVE_MODIFIER_GROUPS = (
+    ("безлактозн",),
+    ("безглютен",),
+    ("козий", "козье", "козь"),
+    ("кокосов",),
+    ("обезжир",),
+    ("овсян",),
+    ("рисов",),
+    ("соев",),
+    ("цельнозерн",),
+)
 
 
 def _normalized_text(value: Any) -> str:
@@ -95,6 +94,23 @@ def _word_matches(left: str, right: str) -> bool:
 
 def _contains_token(tokens: list[str], expected: str) -> bool:
     return any(_word_matches(token, expected) for token in tokens)
+
+
+def _sensitive_modifier_groups(tokens: list[str]) -> set[int]:
+    groups = {
+        index
+        for index, prefixes in enumerate(SENSITIVE_MODIFIER_GROUPS)
+        if any(token.startswith(prefixes) for token in tokens)
+    }
+    for index, token in enumerate(tokens[:-1]):
+        if token != "без":
+            continue
+        following = tokens[index + 1]
+        if following.startswith("лактоз"):
+            groups.add(0)
+        if following.startswith("глютен"):
+            groups.add(1)
+    return groups
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -193,12 +209,10 @@ def _candidate_score(query_tokens: list[str], candidate: dict[str, Any], rank: i
         return 0.0, 0.0, []
     matched = [token for token in query_tokens if _contains_token(name_tokens, token)]
     coverage = len(matched) / len(query_tokens)
-    unexpected_modifiers = [
-        modifier
-        for modifier in SENSITIVE_MODIFIERS
-        if any(token.startswith(modifier) for token in name_tokens)
-        and not any(token.startswith(modifier) for token in query_tokens)
-    ]
+    unexpected_modifiers = list(
+        _sensitive_modifier_groups(name_tokens)
+        - _sensitive_modifier_groups(query_tokens)
+    )
     query_words = [
         token
         for token in query_tokens
@@ -300,6 +314,7 @@ def choose_product(
         ingredient.get("search_query") or ingredient.get("name") or ""
     ).strip()
     query_tokens = _tokens(query)
+    required_modifiers = _sensitive_modifier_groups(query_tokens)
     choices = []
     for rank, candidate in enumerate(candidates[:12]):
         if not isinstance(candidate, dict):
@@ -309,6 +324,12 @@ def choose_product(
         product_name = str(candidate.get("name") or "").strip()
         product_url = str(candidate.get("product_url") or "").strip()
         if not product_id or not sku_id or not product_name or not product_url:
+            continue
+        if not required_modifiers.issubset(
+            _sensitive_modifier_groups(_tokens(product_name))
+        ):
+            # Dietary constraints in the request are mandatory. Omitting one
+            # is not a reviewable substitute because it can be unsafe.
             continue
         package_count, package_warning = _required_packages(ingredient, candidate)
         if package_count is None or package_count > 100:

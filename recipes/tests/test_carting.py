@@ -842,6 +842,26 @@ class CartProductMatchingTests(SimpleTestCase):
         self.assertEqual(match["quality"], "substitute")
         self.assertTrue(match["warning"])
 
+    def test_required_dietary_modifier_cannot_be_dropped(self):
+        for query, candidate_name in (
+            ("молоко козье", "Молоко коровье 900 мл"),
+            ("молоко без лактозы", "Молоко коровье 900 мл"),
+            ("макароны безглютеновые", "Макароны пшеничные 450 г"),
+        ):
+            with self.subTest(query=query):
+                match = choose_product(
+                    {
+                        "name": query.title(),
+                        "search_query": query,
+                        "quantity": "400",
+                        "unit": "г",
+                    },
+                    [self.candidate(name=candidate_name, weight="400 г")],
+                )
+
+                self.assertEqual(match["quality"], "missing")
+                self.assertEqual(match["package_count"], 0)
+
     def test_understands_yandex_english_multipack_weight(self):
         match = choose_product(
             {
