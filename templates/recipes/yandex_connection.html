@@ -26,7 +26,14 @@
     </div>
     <div class="connection-actions">
       {% if active_session %}
-        <a class="button" href="{% url 'browser-login' active_session.pk %}">Вернуться ко входу</a>
+        {% if run %}
+          <form method="post" action="{% url 'cart-browser-login-start' run.pk %}">
+            {% csrf_token %}
+            <button class="button" type="submit">Вернуться ко входу</button>
+          </form>
+        {% else %}
+          <a class="button" href="{% url 'browser-login' active_session.pk %}">Вернуться ко входу</a>
+        {% endif %}
       {% elif browser_login_configured %}
         <form method="post" action="{% if run %}{% url 'cart-browser-login-start' run.pk %}{% else %}{% url 'browser-login-start' %}{% endif %}">
           {% csrf_token %}

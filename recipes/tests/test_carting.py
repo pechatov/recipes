@@ -159,6 +159,37 @@ class CartViewTests(TestCase):
     @override_settings(
         CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
         CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    def test_yandex_connection_attaches_an_open_session_through_start_endpoint(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.get(f'{reverse("yandex-connection")}?run={run.pk}')
+
+        self.assertContains(
+            response,
+            f'action="{reverse("cart-browser-login-start", args=[run.pk])}"',
+        )
+        self.assertNotContains(
+            response,
+            f'href="{reverse("browser-login", args=[login_session.pk])}"',
+        )
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
         CART_BROWSER_LOGIN_MINUTES=15,
     )
     @patch("recipes.views.start_browser_login_session")
