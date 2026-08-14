@@ -154,6 +154,8 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("function markProfileUncertain", server)
         self.assertIn("await recoverQuarantinedScope(scope)", server)
         self.assertIn("await quarantineScope(scope)", server)
+        self.assertIn("const result = await operation()", server)
+        self.assertIn("await releaseScopeQuarantine(scope)", server)
         self.assertIn("await closeBrowser(identity.user_id)", server)
         self.assertIn("itemsToAdd.push({ ...item, delta: item.quantity })", server)
         self.assertIn("const expected = existing + item.quantity", server)

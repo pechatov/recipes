@@ -152,15 +152,17 @@ const firstHasStarted = new Promise((resolve) => {
   announceFirstStart = resolve;
 });
 let starts = 0;
-const first = runExclusiveOperation("same-cart", async () => {
+const exclusiveScope = "recipes-cart-user-77";
+const first = runExclusiveOperation(exclusiveScope, async () => {
   starts += 1;
   announceFirstStart();
   await firstMayFinish;
   return "first";
 });
 await firstHasStarted;
+assert.equal(await isScopeQuarantined(exclusiveScope), true);
 await assert.rejects(
-  runExclusiveOperation("same-cart", async () => {
+  runExclusiveOperation(exclusiveScope, async () => {
     starts += 1;
     return "queued";
   }),
@@ -169,11 +171,13 @@ await assert.rejects(
 assert.equal(starts, 1, "a busy operation must fail instead of being queued");
 releaseFirst();
 assert.equal(await first, "first");
+assert.equal(await isScopeQuarantined(exclusiveScope), false);
 assert.equal(
-  await runExclusiveOperation("same-cart", async () => {
+  await runExclusiveOperation(exclusiveScope, async () => {
     starts += 1;
     return "next";
   }),
   "next",
 );
 assert.equal(starts, 2, "the scope must be released after completion");
+await unlink(process.env.CART_ADAPTER_QUARANTINE_FILE);

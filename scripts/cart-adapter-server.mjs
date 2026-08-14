@@ -320,15 +320,25 @@ async function runExclusiveOperation(scope, operation) {
     );
   }
   activeScopes.add(scope);
+  let leased = false;
   try {
     await recoverQuarantinedScope(scope);
-    return await operation();
+    // Persist exclusive ownership before any operation can open Camofox. If
+    // this process dies, the next one observes the lease and closes the old
+    // session before doing any work with the same profile.
+    await quarantineScope(scope);
+    leased = true;
+    const result = await operation();
+    await releaseScopeQuarantine(scope);
+    leased = false;
+    return result;
   } catch (error) {
-    if (error?.profileUncertain) {
+    if (leased && !error?.profileUncertain) {
       try {
-        await quarantineScope(scope);
-      } catch (quarantineFailure) {
-        throw quarantineError(quarantineFailure?.message);
+        await releaseScopeQuarantine(scope);
+        leased = false;
+      } catch (releaseFailure) {
+        throw quarantineError(releaseFailure?.message);
       }
     }
     throw error;
