@@ -1053,6 +1053,7 @@ class CartPipelineTests(TestCase):
                 "cart_url": "https://eda.yandex.ru/retail/auchan?placeSlug=auchan-nearby",
                 "elapsed_ms": 300,
                 "additions": [{"product_id": product_id, "added_quantity": 1}],
+                "cleanup_token": "signed-cleanup",
             },
         ]
         run = self.make_run()
@@ -1063,6 +1064,7 @@ class CartPipelineTests(TestCase):
         self.assertEqual(result["provider"], "yandex_api_adapter")
         self.assertEqual(result["items"][0]["package_count"], 1)
         self.assertEqual(result["items"][0]["added_package_count"], 1)
+        self.assertEqual(result["cleanup_token"], "signed-cleanup")
         self.assertEqual(result["timings_ms"], {"search": 450, "apply": 300})
         self.assertEqual(adapter_task.call_count, 2)
         self.assertEqual(adapter_task.call_args_list[0].args[0], "/v1/search")
@@ -1219,6 +1221,7 @@ class CartPipelineTests(TestCase):
             "auchan",
             [{"product_id": "product-12345678", "package_count": 2}],
             "https://eda.yandex.ru/cart",
+            cleanup_token="signed-cleanup",
         )
 
         self.assertEqual(result["status"], "cleared")
@@ -1227,12 +1230,34 @@ class CartPipelineTests(TestCase):
             {
                 "scope": "recipes-cart-user-1",
                 "store": "auchan",
-                "items": [
-                    {"product_id": "product-12345678", "package_count": 2}
-                ],
+                "cleanup_token": "signed-cleanup",
             },
             mutation_possible=True,
         )
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_uncertain_adapter_cleanup_block_requires_manual_check(self, adapter_task):
+        adapter_task.return_value = {
+            "status": "blocked",
+            "summary": "Нужна ручная проверка",
+            "mutation_possible": True,
+        }
+        run = self.make_run()
+
+        with self.assertRaises(CartAgentError) as caught:
+            cleanup_store_cart(
+                run,
+                "auchan",
+                [{"product_id": "product-12345678", "package_count": 2}],
+                "https://eda.yandex.ru/cart",
+                cleanup_token="signed-cleanup",
+            )
+
+        self.assertTrue(caught.exception.mutation_possible)
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_exact_cart_is_built_in_one_agent_call(self, assemble):
@@ -1320,6 +1345,7 @@ class CartPipelineTests(TestCase):
                     "product_url": "https://eda.yandex.ru/product/legitimate",
                     "product_id": "legitimate",
                     "package_count": 2,
+                    "added_package_count": 2,
                 }
             ],
         )
@@ -1595,7 +1621,7 @@ class CartPipelineTests(TestCase):
         cleanup.assert_called_once()
 
     @patch("recipes.carting.pipeline.cleanup_store_cart")
-    def test_expired_cart_is_cleaned_from_recorded_journal(self, cleanup):
+    def test_expired_cart_uses_signed_cleanup_and_actual_added_quantity(self, cleanup):
         run = self.make_run()
         run.status = CartRun.Status.COMPLETED
         run.confirmation_deadline = timezone.now() - timedelta(minutes=1)
@@ -1607,11 +1633,13 @@ class CartPipelineTests(TestCase):
             cart_url="https://eda.yandex.ru/cart",
             result={
                 "cart_cleared": False,
+                "cleanup_token": "signed-cleanup",
                 "added_items": [
                     {
                         "product_name": "Спагетти",
                         "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
-                        "package_count": 2,
+                        "package_count": 50,
+                        "added_package_count": 2,
                     }
                 ],
             },
@@ -1640,9 +1668,11 @@ class CartPipelineTests(TestCase):
                     "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
                     "product_id": "sku-pasta-1",
                     "package_count": 2,
+                    "added_package_count": 2,
                 }
             ],
             "https://eda.yandex.ru/cart",
+            cleanup_token="signed-cleanup",
         )
 
     @patch("recipes.carting.pipeline.cleanup_store_cart")

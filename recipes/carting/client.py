@@ -463,6 +463,10 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
         "search": search.get("elapsed_ms"),
         "apply": apply_result.get("elapsed_ms"),
     }
+    cleanup_token = str(apply_result.get("cleanup_token") or "").strip()
+    result["cleanup_token"] = (
+        cleanup_token if len(cleanup_token) <= 60_000 else ""
+    )
     return result
 
 
@@ -492,30 +496,29 @@ def cleanup_store_cart(
     store: str,
     added_items: list[dict[str, Any]],
     cart_url: str,
+    *,
+    cleanup_token: str = "",
 ) -> dict[str, Any]:
-    if settings.CART_ADAPTER_BASE_URL:
+    cleanup_token = str(cleanup_token or "").strip()
+    if settings.CART_ADAPTER_BASE_URL and cleanup_token:
         data = _run_adapter_task(
             "/v1/cleanup",
             {
                 "scope": cart_browser_session_key(run.requested_by_id),
                 "store": store,
-                "items": [
-                    {
-                        "product_id": item.get("product_id", ""),
-                        "package_count": item.get("package_count", 0),
-                    }
-                    for item in added_items
-                    if isinstance(item, dict)
-                ],
+                "cleanup_token": cleanup_token,
             },
             mutation_possible=True,
         )
         status = str(data.get("status") or "")
-        if status in {"cleared", "login_required", "blocked"}:
+        mutation_possible = bool(data.get("mutation_possible"))
+        if status == "cleared" or (
+            status in {"login_required", "blocked"} and not mutation_possible
+        ):
             return data
         raise CartAgentError(
             str(data.get("summary") or "Очистка корзины не была подтверждена."),
-            mutation_possible=True,
+            mutation_possible=mutation_possible,
         )
     return run_store_cart_task(
         run,

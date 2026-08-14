@@ -19,6 +19,7 @@ const cartItemIdPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const businessPattern = /^[a-z][a-z0-9_-]{0,63}$/;
 const slugPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const tokenLifetimeMs = 10 * 60 * 1000;
+const cleanupTokenLifetimeMs = 7 * 24 * 60 * 60 * 1000;
 const selectionKey = crypto.createHash("sha256").update(controlKey).digest();
 const stores = {
   auchan: ["ашан", "auchan"],
@@ -522,9 +523,56 @@ function cartExpression(context) {
     const response = await fetch('/eats/v1/cart/v2/full-carts?' + query, {method: 'POST', headers: {'content-type': 'application/json'}, body: '{}'});
     let data = {};
     try { data = await response.json(); } catch {}
-    const candidates = [data?.cart?.items, data?.place_cart?.items, data?.placeCart?.items];
-    for (const entry of data?.cart_places_list || []) candidates.push(entry?.items, entry?.cart?.items);
-    const items = candidates.find((value) => Array.isArray(value) && value.length) || (Array.isArray(data?.cart?.items) ? data.cart.items : []);
+    const describe = (source, value) => {
+      if (!value || typeof value !== 'object') return null;
+      const cart = value.cart && typeof value.cart === 'object' ? value.cart : value;
+      const place = value.place || cart.place || {};
+      const placeSlug = String(
+        value.place_slug ?? value.placeSlug ?? cart.place_slug ?? cart.placeSlug ?? place.slug ?? ''
+      );
+      const placeBusiness = String(
+        value.place_business ?? value.placeBusiness ?? cart.place_business ?? cart.placeBusiness ?? place.business ?? ''
+      );
+      return {
+        source,
+        place_slug: placeSlug,
+        place_business: placeBusiness,
+        cart_id: String(cart.id ?? value.id ?? ''),
+        items: Array.isArray(cart.items) ? cart.items : [],
+      };
+    };
+    const candidates = [
+      describe('cart', data?.cart),
+      describe('place_cart', data?.place_cart),
+      describe('placeCart', data?.placeCart),
+      ...(Array.isArray(data?.cart_places_list)
+        ? data.cart_places_list.map((entry) => describe('cart_places_list', entry))
+        : []),
+    ].filter(Boolean);
+    const matching = candidates.filter((candidate) => (
+      candidate.place_slug === context.place_slug
+      && (!candidate.place_business || candidate.place_business === context.place_business)
+    ));
+    // Yandex represents a completely empty cart as one unscoped empty cart
+    // plus an empty cart_places_list. It contains no row that could belong
+    // to another store, so it is safe to treat only this exact shape as empty.
+    const unscopedEmpty = matching.length === 0
+      && candidates.length === 1
+      && candidates[0].source === 'cart'
+      && !candidates[0].place_slug
+      && !candidates[0].place_business
+      && !candidates[0].cart_id
+      && candidates[0].items.length === 0
+      && Array.isArray(data?.cart_places_list)
+      && data.cart_places_list.length === 0;
+    const selected = matching[0] || (unscopedEmpty ? candidates[0] : null);
+    const conflicting = selected && matching.some((candidate) => (
+      candidate !== selected
+      && candidate.cart_id
+      && selected.cart_id
+      && candidate.cart_id !== selected.cart_id
+    ));
+    const items = selected?.items || [];
     const identifiers = (item) => {
       const keys = ['item_uid', 'itemUid', 'public_id', 'publicId', 'sku_id', 'skuId', 'uid'];
       const values = [];
@@ -544,6 +592,17 @@ function cartExpression(context) {
     };
     return {
       status: response.status,
+      matched: Boolean(selected) && !conflicting,
+      diagnostic: Boolean(selected) && !conflicting ? null : {
+        response_keys: Object.keys(data || {}).slice(0, 30),
+        candidates: candidates.map((candidate) => ({
+          source: candidate.source,
+          place_slug: candidate.place_slug,
+          place_business: candidate.place_business,
+          has_cart_id: Boolean(candidate.cart_id),
+          items_count: candidate.items.length,
+        })),
+      },
       items: items.map((item) => ({
         ids: identifiers(item),
         cart_item_id: String(item.id ?? item.cart_item_id ?? item.cartItemId ?? ''),
@@ -713,6 +772,13 @@ async function evaluateCartMutation(browser, expression) {
 async function readCart(browser, context) {
   const cart = await evaluate(browser, cartExpression(context));
   classifyApiStatus(Number(cart?.status || 0), "Корзина Яндекс Еды недоступна.");
+  if (!cart?.matched) {
+    console.warn("Yandex cart did not match the selected store", cart?.diagnostic || {});
+    throw new OperationError(
+      "verification_failed",
+      "Корзину выбранного магазина нельзя однозначно определить.",
+    );
+  }
   return cart;
 }
 
@@ -761,6 +827,50 @@ function openSelection(token) {
   } catch {}
   if (!payload || !Number.isFinite(payload.expires_at) || payload.expires_at < Date.now()) {
     throw new OperationError("invalid_selection", "Срок действия поиска истёк; запустите сборку ещё раз.");
+  }
+  return payload;
+}
+
+function sealCleanup(payload) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", selectionKey, iv);
+  cipher.setAAD(Buffer.from("recipes-cart-cleanup-v1"));
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify(payload), "utf8"),
+    cipher.final(),
+  ]);
+  return [
+    iv.toString("base64url"),
+    encrypted.toString("base64url"),
+    cipher.getAuthTag().toString("base64url"),
+  ].join(".");
+}
+
+function openCleanup(token) {
+  const value = text(token, 60_000);
+  const [rawIv, rawEncrypted, rawTag, extra] = value.split(".");
+  if (!rawIv || !rawEncrypted || !rawTag || extra) {
+    throw new OperationError("invalid_cleanup", "Журнал очистки недействителен.");
+  }
+  let payload;
+  try {
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      selectionKey,
+      Buffer.from(rawIv, "base64url"),
+    );
+    decipher.setAAD(Buffer.from("recipes-cart-cleanup-v1"));
+    decipher.setAuthTag(Buffer.from(rawTag, "base64url"));
+    payload = JSON.parse(Buffer.concat([
+      decipher.update(Buffer.from(rawEncrypted, "base64url")),
+      decipher.final(),
+    ]).toString("utf8"));
+  } catch {}
+  if (!payload || !Number.isFinite(payload.expires_at) || payload.expires_at < Date.now()) {
+    throw new OperationError(
+      "invalid_cleanup",
+      "Срок действия журнала очистки истёк; проверьте корзину вручную.",
+    );
   }
   return payload;
 }
@@ -972,61 +1082,111 @@ async function applySelection(body) {
         added_quantity: Math.max(0, afterQuantity - beforeQuantity),
       });
     }
+    const cleanupItems = additions.filter((item) => item.added_quantity > 0);
+    const cleanupToken = cleanupItems.length ? sealCleanup({
+      scope,
+      store,
+      context,
+      operation_id: crypto.randomUUID(),
+      items: cleanupItems.map((item) => ({
+        product_id: item.product_id,
+        before_quantity: item.before_quantity,
+        after_quantity: item.after_quantity,
+      })),
+      expires_at: Date.now() + cleanupTokenLifetimeMs,
+    }) : "";
     return {
       status: "applied",
       cart_url: context.store_url,
       additions,
+      cleanup_token: cleanupToken,
       elapsed_ms: Date.now() - started,
     };
   }, mutationState, signedContext.store_url);
 }
 
-function validateCleanupItems(body) {
-  if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 24) {
-    throw new OperationError("invalid_request", "Неверный журнал очистки.");
+function validateCleanup(body, scope, store) {
+  const cleanup = openCleanup(body.cleanup_token);
+  if (cleanup.scope !== scope || cleanup.store !== store) {
+    throw new OperationError(
+      "invalid_cleanup",
+      "Журнал очистки относится к другому пользователю или магазину.",
+    );
   }
-  const grouped = new Map();
-  for (const item of body.items) {
+  const context = validatedContext(cleanup.context);
+  if (!/^[a-f0-9-]{36}$/.test(String(cleanup.operation_id || ""))) {
+    throw new OperationError("invalid_cleanup", "Журнал очистки не содержит операцию.");
+  }
+  if (!Array.isArray(cleanup.items) || cleanup.items.length < 1 || cleanup.items.length > 24) {
+    throw new OperationError("invalid_cleanup", "Неверный журнал очистки.");
+  }
+  const seen = new Set();
+  const items = [];
+  for (const item of cleanup.items) {
     const productId = text(item?.product_id, 128);
-    const quantity = Number(item?.package_count);
-    if (!productIdPattern.test(productId) || !Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
-      throw new OperationError("invalid_request", "Журнал очистки не содержит точный товар.");
+    const beforeQuantity = Number(item?.before_quantity);
+    const afterQuantity = Number(item?.after_quantity);
+    if (
+      !productIdPattern.test(productId)
+      || seen.has(productId)
+      || !Number.isInteger(beforeQuantity)
+      || beforeQuantity < 0
+      || beforeQuantity > 100
+      || !Number.isInteger(afterQuantity)
+      || afterQuantity <= beforeQuantity
+      || afterQuantity > 100
+    ) {
+      throw new OperationError("invalid_cleanup", "Журнал очистки не содержит точный товар.");
     }
-    const total = (grouped.get(productId) || 0) + quantity;
-    if (total > 100) throw new OperationError("invalid_request", "Журнал очистки слишком велик.");
-    grouped.set(productId, total);
+    seen.add(productId);
+    items.push({
+      product_id: productId,
+      before_quantity: beforeQuantity,
+      after_quantity: afterQuantity,
+    });
   }
-  return [...grouped].map(([product_id, quantity]) => ({ product_id, quantity }));
+  return { context, items };
 }
 
 async function cleanup(body) {
   const { scope, store } = validateBaseRequest(body);
-  const requested = validateCleanupItems(body);
+  const cleanupRequest = validateCleanup(body, scope, store);
   const mutationState = { possible: false };
   return withBrowser(scope, async (browser) => {
-    const context = await resolveStore(browser, store);
+    const context = await validateSignedStore(browser, cleanupRequest.context);
     const before = await readCart(browser, context);
     const targets = [];
-    for (const item of requested) {
+    // Preflight every item before changing any of them. Cleanup is allowed
+    // only from the exact post-assembly state, or from the already-restored
+    // baseline after a previous (possibly partially acknowledged) request.
+    for (const item of cleanupRequest.items) {
       const existing = quantityInCart(before, item.product_id);
-      const target = Math.max(0, existing - item.quantity);
       const matchingRows = rowsInCart(before, item.product_id);
       const cartItemId = String(matchingRows[0]?.cart_item_id || "");
-      targets.push({ ...item, before: existing, target, cart_item_id: cartItemId });
-      if (target === existing) continue;
+      if (existing !== item.before_quantity && existing !== item.after_quantity) {
+        throw new OperationError(
+          "verification_failed",
+          "Количество товара изменилось после сборки; автоматическая очистка остановлена.",
+        );
+      }
+      targets.push({ ...item, existing, cart_item_id: cartItemId });
+      if (existing === item.before_quantity) continue;
       if (matchingRows.length !== 1 || !cartItemIdPattern.test(cartItemId)) {
         throw new OperationError(
           "verification_failed",
           "Точный товар в корзине нельзя безопасно изменить.",
         );
       }
+    }
+    for (const item of targets) {
+      if (item.existing === item.before_quantity) continue;
       const mutationWasPossible = mutationState.possible;
       mutationState.possible = true;
       const changed = await evaluateCartMutation(
         browser,
-        target === 0
-          ? removeLegacyItemExpression(context, cartItemId)
-          : changeLegacyItemExpression(context, cartItemId, target),
+        item.before_quantity === 0
+          ? removeLegacyItemExpression(context, item.cart_item_id)
+          : changeLegacyItemExpression(context, item.cart_item_id, item.before_quantity),
       );
       const changedStatus = Number(changed?.status || 0);
       if (changedStatus >= 400 && changedStatus < 500) {
@@ -1048,15 +1208,15 @@ async function cleanup(body) {
       );
     }
     const after = await readCartUntil(browser, context, (cart) => targets.every(
-      (item) => quantityInCart(cart, item.product_id) === item.target,
+      (item) => quantityInCart(cart, item.product_id) === item.before_quantity,
     ));
     for (const item of targets) {
-      if (quantityInCart(after, item.product_id) !== item.target) {
+      if (quantityInCart(after, item.product_id) !== item.before_quantity) {
         throw new OperationError("verification_failed", "Очистку точного SKU не удалось подтвердить.", { mutationPossible: mutationState.possible });
       }
     }
     return { status: "cleared", summary: "Добавления этой сборки удалены из корзины." };
-  }, mutationState);
+  }, mutationState, cleanupRequest.context.store_url);
 }
 
 function errorBody(error) {
