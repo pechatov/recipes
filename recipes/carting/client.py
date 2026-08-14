@@ -553,7 +553,12 @@ def cleanup_store_cart(
     cleanup_token: str = "",
 ) -> dict[str, Any]:
     cleanup_token = str(cleanup_token or "").strip()
-    if settings.CART_ADAPTER_BASE_URL and cleanup_token:
+    if cleanup_token:
+        if not settings.CART_ADAPTER_BASE_URL or not settings.CART_ADAPTER_API_KEY:
+            raise CartAgentError(
+                "Безопасный адаптер очистки недоступен; проверьте корзину вручную.",
+                mutation_possible=True,
+            )
         data = _run_adapter_task(
             "/v1/cleanup",
             {

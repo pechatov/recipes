@@ -267,6 +267,12 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
         )
     result = attempt.result if isinstance(attempt.result, dict) else {}
     cleanup_token = _text(result.get("cleanup_token"), 60_000)
+    if result.get("provider") == "yandex_api_adapter" and not cleanup_token:
+        raise CartAgentError(
+            "Подписанный журнал адаптерной сборки отсутствует; проверьте "
+            "корзину вручную.",
+            mutation_possible=True,
+        )
     data = cleanup_store_cart(
         run,
         attempt.store,

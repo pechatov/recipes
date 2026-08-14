@@ -1421,6 +1421,26 @@ class CartPipelineTests(TestCase):
         self.assertEqual(result["status"], "login_required")
         self.assertFalse(result["mutation_possible"])
 
+    @override_settings(
+        CART_ADAPTER_BASE_URL="",
+        CART_ADAPTER_API_KEY="",
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_signed_cleanup_never_falls_back_to_hermes(self, run_task):
+        run = self.make_run()
+
+        with self.assertRaises(CartAgentError) as caught:
+            cleanup_store_cart(
+                run,
+                "auchan",
+                [{"product_id": "product-12345678", "package_count": 2}],
+                "https://eda.yandex.ru/cart",
+                cleanup_token="signed-cleanup",
+            )
+
+        self.assertTrue(caught.exception.mutation_possible)
+        run_task.assert_not_called()
+
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_exact_cart_is_built_in_one_agent_call(self, assemble):
         result = {
@@ -1863,6 +1883,38 @@ class CartPipelineTests(TestCase):
         with self.assertRaisesMessage(CartAgentError, "нельзя однозначно"):
             process_cart_cleanup(run)
 
+        cleanup.assert_not_called()
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    def test_adapter_attempt_without_signed_cleanup_never_uses_hermes(self, cleanup):
+        run = self.make_run()
+        run.status = CartRun.Status.CLEANING
+        run.save(update_fields=["status"])
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            cart_url="https://eda.yandex.ru/cart",
+            result={
+                "provider": "yandex_api_adapter",
+                "cart_cleared": False,
+                "added_items": [
+                    {
+                        "product_name": "Спагетти",
+                        "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
+                        "package_count": 1,
+                        "added_package_count": 1,
+                    }
+                ],
+            },
+        )
+        run.selected_attempt = attempt
+        run.save(update_fields=["selected_attempt"])
+
+        with self.assertRaises(CartAgentError) as caught:
+            process_cart_cleanup(run)
+
+        self.assertTrue(caught.exception.mutation_possible)
         cleanup.assert_not_called()
 
     @patch("recipes.carting.pipeline.cleanup_store_cart")
