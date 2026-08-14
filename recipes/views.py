@@ -65,7 +65,13 @@ from .models import (
     RegistrationInvite,
     StorePreference,
 )
-from .services import build_shopping_items, get_store_preferences
+from .services import (
+    STORE_LINKS,
+    build_shopping_items,
+    get_selected_store,
+    get_store_preferences,
+    select_store,
+)
 
 
 SEARCH_CANDIDATE_LIMIT = 500
@@ -441,13 +447,17 @@ def _resume_cart_run_after_login(run: CartRun) -> None:
         fields = ["status", "finished_at", "error"]
     else:
         if run.status == CartRun.Status.FAILED:
-            blocked_stores = set(
-                run.attempts.filter(status=CartAttempt.Status.BLOCKED).values_list(
-                    "store", flat=True
+            retry_stores = {
+                attempt.store
+                for attempt in run.attempts.only("store", "status", "result")
+                if attempt.status == CartAttempt.Status.BLOCKED
+                or (
+                    isinstance(attempt.result, dict)
+                    and attempt.result.get("reason") == "store_unavailable"
                 )
-            )
+            }
             for index, store in enumerate(run.store_priority):
-                if store in blocked_stores:
+                if store in retry_stores:
                     run.next_store_index = index
                     break
         run.status = CartRun.Status.PENDING
@@ -994,11 +1004,17 @@ def shopping_list(request, slug):
     except (TypeError, ValueError):
         servings = recipe.servings
     servings = max(1, min(servings, 100))
-    preferences = get_store_preferences(request.user)
-    primary_store = next((item for item in preferences if item.enabled), None)
-    items = build_shopping_items(
-        recipe, servings, primary_store.store if primary_store else None
-    )
+    selected_store = get_selected_store(request.user)
+    store_options = [
+        {
+            "value": value,
+            "label": label,
+            "search_brand": STORE_LINKS[value][0],
+            "search_place": STORE_LINKS[value][1],
+        }
+        for value, label in StorePreference.Store.choices
+    ]
+    items = build_shopping_items(recipe, servings, selected_store.store)
     latest_cart_run = (
         CartRun.objects.filter(recipe=recipe, requested_by=request.user)
         .select_related("selected_attempt")
@@ -1012,9 +1028,8 @@ def shopping_list(request, slug):
             "servings": servings,
             "items": items,
             "has_pantry_items": any(item.ingredient.is_pantry for item in items),
-            "store_preferences": preferences,
-            "primary_store": primary_store,
-            "preferences_return_url": request.get_full_path(),
+            "store_options": store_options,
+            "selected_store": selected_store,
             "latest_cart_run": latest_cart_run,
         },
     )
@@ -1024,41 +1039,33 @@ def shopping_list(request, slug):
 @require_http_methods(["GET", "POST"])
 def store_preferences(request):
     preferences = get_store_preferences(request.user)
+    selected_store = next(
+        (item for item in preferences if item.enabled), preferences[0]
+    )
     if request.method == "POST":
-        posted_order = request.POST.getlist("store_order")
-        valid_stores = {preference.store for preference in preferences}
-        ordered_stores = [
-            store for store in posted_order if store in valid_stores
-        ]
-        ordered_stores.extend(
-            preference.store
-            for preference in preferences
-            if preference.store not in ordered_stores
+        try:
+            selected_store = select_store(request.user, request.POST.get("store", ""))
+        except ValueError:
+            messages.error(request, "Выберите магазин из списка.")
+            return redirect("store-preferences")
+        messages.success(
+            request,
+            f"Для заказа выбран магазин «{selected_store.get_store_display()}».",
         )
-        position_by_store = {
-            store: position for position, store in enumerate(ordered_stores)
-        }
-        updates = []
-        for preference in preferences:
-            if posted_order:
-                preference.position = position_by_store[preference.store]
-            else:
-                try:
-                    position = int(request.POST.get(f"position_{preference.store}", preference.position))
-                except (TypeError, ValueError):
-                    position = preference.position
-                preference.position = max(0, min(position, 99))
-            preference.enabled = f"enabled_{preference.store}" in request.POST
-            updates.append(preference)
-        StorePreference.objects.bulk_update(updates, ["position", "enabled"])
-        messages.success(request, "Приоритет магазинов сохранён.")
         next_url = request.POST.get("next", "")
         if next_url and url_has_allowed_host_and_scheme(
             next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()
         ):
             return redirect(next_url)
         return redirect("store-preferences")
-    return render(request, "recipes/store_preferences.html", {"preferences": preferences})
+    return render(
+        request,
+        "recipes/store_preferences.html",
+        {
+            "store_options": StorePreference.Store.choices,
+            "selected_store": selected_store,
+        },
+    )
 
 
 @login_required
@@ -1100,9 +1107,11 @@ def cart_start(request, slug):
         messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
         return redirect("cart-detail", pk=active.pk)
 
-    priority = [item.store for item in get_store_preferences(request.user) if item.enabled]
-    if not priority:
-        messages.error(request, "Включите хотя бы один магазин.")
+    requested_store = request.POST.get("store", "")
+    try:
+        selected_store = select_store(request.user, requested_store)
+    except ValueError:
+        messages.error(request, "Выберите магазин для заказа.")
         return redirect(
             f"{reverse('shopping-list', args=[recipe.slug])}?servings={servings}"
         )
@@ -1123,10 +1132,13 @@ def cart_start(request, slug):
         recipe=recipe,
         requested_by=request.user,
         servings=servings,
-        store_priority=priority,
+        store_priority=[selected_store.store],
         ingredient_snapshot=snapshot,
     )
-    messages.success(request, "Сборка запущена. Магазины будут проверены по приоритету.")
+    messages.success(
+        request,
+        f"Сборка запущена в магазине «{selected_store.get_store_display()}».",
+    )
     return redirect("cart-detail", pk=run.pk)
 
 

@@ -487,6 +487,11 @@ class StorePreference(models.Model):
     store = models.CharField("магазин", max_length=24, choices=Store.choices)
     position = models.PositiveSmallIntegerField("приоритет", default=0)
     enabled = models.BooleanField("использовать", default=True)
+    legacy_enabled_before_single_selection = models.BooleanField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
 
     class Meta:
         ordering = ["position", "pk"]
@@ -494,10 +499,15 @@ class StorePreference(models.Model):
             models.UniqueConstraint(
                 fields=["user", "store"],
                 name="unique_store_preference_per_user",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=models.Q(enabled=True),
+                name="unique_selected_store_per_user",
+            ),
         ]
-        verbose_name = "приоритет магазина"
-        verbose_name_plural = "приоритеты магазинов"
+        verbose_name = "магазин пользователя"
+        verbose_name_plural = "магазины пользователей"
 
     def __str__(self):
         return f"{self.user}: {self.get_store_display()}"

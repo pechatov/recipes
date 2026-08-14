@@ -30,39 +30,28 @@
     updatePantryToggle();
   }
 
-  const storeDialog = document.querySelector("[data-store-dialog]");
-  const openStoreDialog = document.querySelector("[data-store-dialog-open]");
-  if (storeDialog && openStoreDialog) {
-    openStoreDialog.addEventListener("click", () => storeDialog.showModal());
-    storeDialog.querySelectorAll("[data-store-dialog-close]").forEach(button => {
-      button.addEventListener("click", () => storeDialog.close());
-    });
-    storeDialog.addEventListener("click", event => {
-      if (event.target === storeDialog) storeDialog.close();
-    });
+  const storeSelect = document.querySelector("[data-store-select]");
+  if (storeSelect) {
+    const updateStoreLinks = () => {
+      const option = storeSelect.selectedOptions[0];
+      const storeName = option.textContent.trim();
+      const storeBrand = option.dataset.searchBrand;
+      const storePlace = option.dataset.searchPlace;
+      container.querySelectorAll("[data-store-search]").forEach(link => {
+        const query = encodeURIComponent(link.dataset.searchQuery.trim());
+        const parameters = new URLSearchParams();
+        if (storePlace) {
+          parameters.set("placeSlug", storePlace);
+          parameters.set("relatedBrandSlug", storeBrand);
+        }
+        parameters.set("query", link.dataset.searchQuery.trim());
+        link.href = `https://eda.yandex.ru/retail/${storeBrand}/search?${parameters}`;
+        link.textContent = `Найти в ${storeName} ↗`;
+      });
+    };
+    storeSelect.addEventListener("change", updateStoreLinks);
+    updateStoreLinks();
 
-    const priorityList = storeDialog.querySelector("[data-store-priority-list]");
-    let draggedRow = null;
-    priorityList.querySelectorAll("[data-store-row]").forEach(row => {
-      row.addEventListener("dragstart", () => {
-        draggedRow = row;
-        row.classList.add("is-dragging");
-      });
-      row.addEventListener("dragend", () => {
-        row.classList.remove("is-dragging");
-        draggedRow = null;
-      });
-    });
-    priorityList.addEventListener("dragover", event => {
-      event.preventDefault();
-      if (!draggedRow) return;
-      const rows = [...priorityList.querySelectorAll("[data-store-row]:not(.is-dragging)")];
-      const nextRow = rows.find(row => {
-        const bounds = row.getBoundingClientRect();
-        return event.clientY < bounds.top + bounds.height / 2;
-      });
-      priorityList.insertBefore(draggedRow, nextRow || null);
-    });
   }
 
   const copyButton = container.querySelector("[data-copy-list]");

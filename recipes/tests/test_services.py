@@ -3,7 +3,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from recipes.models import Recipe, RecipeIngredient
+from recipes.models import Recipe, RecipeIngredient, StorePreference
 from recipes.services import build_lavka_search_url, build_shopping_items, build_store_search_url
 
 
@@ -16,14 +16,41 @@ class ShoppingServiceTests(TestCase):
         url = build_lavka_search_url("сливки 20%")
         self.assertEqual(
             url,
-            "https://lavka.yandex.ru/search?text=%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
+            "https://lavka.yandex.ru/search?text="
+            "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
         )
 
-    def test_priority_store_url_uses_encoded_search_query(self):
-        self.assertEqual(
-            build_store_search_url("auchan", "сливки 20%"),
-            "https://www.auchan.ru/catalog/?q=%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
-        )
+    def test_store_urls_search_yandex_eda_brands(self):
+        expected_urls = {
+            StorePreference.Store.AUCHAN: (
+                "https://eda.yandex.ru/retail/asan_giper/search?"
+                "placeSlug=ashan_w5r8t&relatedBrandSlug=asan_giper&query="
+                "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25"
+            ),
+            StorePreference.Store.PEREKRESTOK: (
+                "https://eda.yandex.ru/retail/perekrestok/search?query="
+                "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25"
+            ),
+            StorePreference.Store.PYATEROCHKA: (
+                "https://eda.yandex.ru/retail/paterocka/search?query="
+                "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25"
+            ),
+            StorePreference.Store.MAGNIT: (
+                "https://eda.yandex.ru/retail/magnit_celevaya/search?query="
+                "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25"
+            ),
+            StorePreference.Store.LAVKA: (
+                "https://eda.yandex.ru/retail/lavka/search?query="
+                "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25"
+            ),
+        }
+
+        for store, expected_url in expected_urls.items():
+            with self.subTest(store=store):
+                self.assertEqual(
+                    build_store_search_url(store, "сливки 20%"),
+                    expected_url,
+                )
 
     def test_shopping_items_scale_quantities(self):
         ingredient = RecipeIngredient.objects.create(
@@ -39,9 +66,13 @@ class ShoppingServiceTests(TestCase):
         self.assertEqual(item.ingredient, ingredient)
         self.assertEqual(item.quantity, Decimal("500"))
         self.assertEqual(item.display_quantity, "500")
-        self.assertIn("%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25", item.search_url)
+        self.assertEqual(
+            item.search_url,
+            "https://lavka.yandex.ru/search?text="
+            "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25",
+        )
 
-    def test_lavka_priority_does_not_duplicate_the_default_search_link(self):
+    def test_selected_store_controls_the_single_search_link(self):
         RecipeIngredient.objects.create(
             recipe=self.recipe,
             name="Сливки",
@@ -52,11 +83,14 @@ class ShoppingServiceTests(TestCase):
         item = build_shopping_items(
             self.recipe,
             servings=2,
-            preferred_store="lavka",
+            selected_store="auchan",
         )[0]
 
-        self.assertTrue(item.search_url)
-        self.assertEqual(item.priority_search_url, "")
+        self.assertIn("lavka.yandex.ru/search?text=", item.search_url)
+        self.assertIn(
+            "/retail/asan_giper/search?placeSlug=ashan_w5r8t&",
+            item.selected_store_search_url,
+        )
 
     def test_missing_quantity_remains_unquantified(self):
         RecipeIngredient.objects.create(recipe=self.recipe, name="Соль")

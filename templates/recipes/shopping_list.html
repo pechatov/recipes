@@ -18,46 +18,24 @@
   <section class="cart-builder-intro">
     <div>
       <p class="eyebrow">Автосборка</p>
-      <h2>Готовая корзина в одном магазине</h2>
-      <p>Hermes за один проход подберёт упаковки и сразу добавит их в корзину. Неподтверждённые добавления будут автоматически удалены.</p>
+      <h2>Готовая корзина в выбранном магазине</h2>
+      <p>Hermes сначала проверит доставку по сохранённому адресу, затем подберёт упаковки и добавит их в корзину. Неподтверждённые добавления будут автоматически удалены.</p>
     </div>
-    <button class="button button-secondary" type="button" data-store-dialog-open>Приоритет магазинов</button>
-  </section>
-
-  <dialog class="store-dialog" data-store-dialog>
-    <form method="post" action="{% url 'store-preferences' %}" class="store-dialog-form">
-      {% csrf_token %}
-      <input type="hidden" name="next" value="{{ preferences_return_url }}">
-      <div class="store-dialog-heading">
-        <div><p class="eyebrow">Автосборка</p><h2>Приоритет магазинов</h2></div>
-        <button class="dialog-close" type="button" aria-label="Закрыть" data-store-dialog-close>×</button>
-      </div>
-      <p class="store-dialog-help">Перетащите магазины в нужном порядке. Первый включённый магазин используется для дополнительного поиска.</p>
-      <div class="store-priority-list" data-store-priority-list>
-        {% for preference in store_preferences %}
-          <div class="store-priority-row draggable" draggable="true" data-store-row>
-            <input type="hidden" name="store_order" value="{{ preference.store }}">
-            <span class="drag-handle" aria-hidden="true">⋮⋮</span>
-            <label class="store-enabled">
-              <input type="checkbox" name="enabled_{{ preference.store }}"{% if preference.enabled %} checked{% endif %}>
-              <strong>{{ preference.get_store_display }}</strong>
-            </label>
-            <span class="store-platform">через Яндекс Еду</span>
-          </div>
+    <label class="store-picker">
+      <span>Магазин для заказа</span>
+      <select name="store" form="shopping-list-form" data-store-select>
+        {% for option in store_options %}
+          <option value="{{ option.value }}" data-search-brand="{{ option.search_brand }}" data-search-place="{{ option.search_place }}"{% if option.value == selected_store.store %} selected{% endif %}>{{ option.label }}</option>
         {% endfor %}
-      </div>
-      <div class="store-dialog-actions">
-        <button class="button button-ghost" type="button" data-store-dialog-close>Отмена</button>
-        <button class="button" type="submit">Сохранить порядок</button>
-      </div>
-    </form>
-  </dialog>
+      </select>
+    </label>
+  </section>
 
   {% if latest_cart_run %}
     <p class="previous-cart-link"><a href="{% url 'cart-detail' latest_cart_run.pk %}">Последняя сборка: {{ latest_cart_run.get_status_display }} →</a></p>
   {% endif %}
 
-  <form class="shopping-card" method="post" action="{% url 'cart-start' recipe.slug %}" data-shopping-list>
+  <form id="shopping-list-form" class="shopping-card" method="post" action="{% url 'cart-start' recipe.slug %}" data-shopping-list>
     {% csrf_token %}
     <input type="hidden" name="servings" value="{{ servings }}">
     {% if has_pantry_items %}
@@ -93,8 +71,7 @@
               </span>
             </div>
             <div class="search-actions">
-              <a class="button search-button" href="{{ item.search_url }}" target="_blank" rel="noopener noreferrer">Найти в Лавке ↗</a>
-              {% if primary_store and item.priority_search_url %}<a class="button button-secondary search-button" href="{{ item.priority_search_url }}" target="_blank" rel="noopener noreferrer">Найти в {{ primary_store.get_store_display }} ↗</a>{% endif %}
+              <a class="button search-button" href="{{ item.selected_store_search_url }}" target="_blank" rel="noopener noreferrer" data-store-search data-search-query="{{ item.ingredient.effective_search_query }}">Найти в {{ selected_store.get_store_display }} ↗</a>
             </div>
           </li>{% endif %}
         {% endfor %}

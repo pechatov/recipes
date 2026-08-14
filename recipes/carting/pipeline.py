@@ -270,6 +270,72 @@ def _record_outstanding_cleanup(run: CartRun, attempt: CartAttempt, error: str) 
     run.save(update_fields=["selected_attempt", "cleanup_requested_at", "error"])
 
 
+def _is_clean_store_unavailable(attempt: CartAttempt) -> bool:
+    result = attempt.result if isinstance(attempt.result, dict) else {}
+    return (
+        attempt.status == CartAttempt.Status.FAILED
+        and result.get("reason") == "store_unavailable"
+        and result.get("cart_cleared") is True
+        and result.get("cart_mutated") is False
+        and result.get("items") == []
+        and not attempt_needs_cleanup(attempt)
+    )
+
+
+def _finish_store_unavailable_run(
+    run: CartRun,
+    attempt: CartAttempt,
+    *,
+    error: str = "",
+) -> None:
+    run.status = CartRun.Status.FAILED
+    run.selected_attempt = attempt
+    run.finished_at = timezone.now()
+    run.confirmation_deadline = None
+    run.error = error or attempt.summary or (
+        "Выбранный магазин недоступен для доставки по сохранённому адресу."
+    )
+    run.save(
+        update_fields=[
+            "status",
+            "selected_attempt",
+            "finished_at",
+            "confirmation_deadline",
+            "error",
+        ]
+    )
+
+
+def _mark_inconsistent_store_unavailable_for_manual_check(
+    run: CartRun,
+    attempt: CartAttempt,
+) -> None:
+    result = dict(attempt.result or {})
+    result["validation_error"] = "inconsistent_store_unavailable_result"
+    result["mutation_unknown"] = True
+    attempt.status = CartAttempt.Status.FAILED
+    attempt.result = result
+    attempt.save(update_fields=["status", "result"])
+
+    run.status = CartRun.Status.MANUAL_CHECK
+    run.selected_attempt = attempt
+    run.finished_at = timezone.now()
+    run.confirmation_deadline = None
+    run.error = (
+        "Агент сообщил, что магазин недоступен, но не подтвердил отсутствие "
+        "изменений корзины. Проверьте корзину вручную перед повтором."
+    )
+    run.save(
+        update_fields=[
+            "status",
+            "selected_attempt",
+            "finished_at",
+            "confirmation_deadline",
+            "error",
+        ]
+    )
+
+
 def _best_attempt(run: CartRun):
     candidates = list(
         run.attempts.exclude(
@@ -338,6 +404,53 @@ def process_cart_run(run: CartRun) -> None:
         _save_result(attempt, data)
         run.next_store_index += 1
         run.save(update_fields=["next_store_index"])
+
+        if data.get("reason") == "store_unavailable":
+            if _is_clean_store_unavailable(attempt):
+                _finish_store_unavailable_run(run, attempt)
+                return
+            if attempt_needs_cleanup(attempt):
+                try:
+                    cleanup_status = _cleanup_attempt(run, attempt)
+                except CartAgentError:
+                    _record_outstanding_cleanup(
+                        run,
+                        attempt,
+                        "Не удалось очистить товары после противоречивого "
+                        "ответа о недоступности магазина.",
+                    )
+                    raise
+                if cleanup_status != "cleared":
+                    _record_outstanding_cleanup(
+                        run,
+                        attempt,
+                        "Нужно завершить очистку после противоречивого ответа "
+                        "о недоступности магазина.",
+                    )
+                    raise CartAgentError(
+                        "Агент не смог подтвердить полную очистку после "
+                        "противоречивого ответа о недоступности магазина.",
+                        mutation_possible=True,
+                    )
+                cleaned_result = dict(attempt.result or {})
+                cleaned_result["validation_error"] = (
+                    "inconsistent_store_unavailable_result"
+                )
+                cleaned_result["mutation_unknown"] = False
+                attempt.status = CartAttempt.Status.FAILED
+                attempt.result = cleaned_result
+                attempt.save(update_fields=["status", "result"])
+                _finish_store_unavailable_run(
+                    run,
+                    attempt,
+                    error=(
+                        "Агент сообщил противоречивые сведения о доступности "
+                        "магазина. Добавленные товары удалены; повторите сборку."
+                    ),
+                )
+                return
+            _mark_inconsistent_store_unavailable_for_manual_check(run, attempt)
+            return
 
         if attempt.status in {
             CartAttempt.Status.EXACT,
