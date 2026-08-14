@@ -2,7 +2,14 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  open as openFile,
+  readFile,
+  rename,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -140,6 +147,32 @@ async function readOperationRecord(key) {
   return Object.hasOwn(records, key) ? records[key] : null;
 }
 
+async function durableWriteOperationState(serialized) {
+  const parent = dirname(operationStateFile);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const temporary = `${operationStateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let renamed = false;
+  try {
+    const file = await openFile(temporary, "w", 0o600);
+    try {
+      await file.writeFile(serialized);
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, operationStateFile);
+    renamed = true;
+    const directory = await openFile(parent, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  } finally {
+    if (!renamed) await unlink(temporary).catch(() => {});
+  }
+}
+
 async function storeOperationRecord(key, record) {
   const write = operationWriteQueue.then(async () => {
     const records = await loadOperationRecords();
@@ -151,14 +184,11 @@ async function storeOperationRecord(key, record) {
       throw operationStateError();
     }
     records[key] = record;
-    await mkdir(dirname(operationStateFile), { recursive: true, mode: 0o700 });
-    const temporary = `${operationStateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
     const serialized = JSON.stringify(records);
     if (Buffer.byteLength(serialized) > maximumOperationStateBytes) {
       throw operationStateError();
     }
-    await writeFile(temporary, serialized, { mode: 0o600 });
-    await rename(temporary, operationStateFile);
+    await durableWriteOperationState(serialized);
   });
   operationWriteQueue = write.catch(() => {});
   try {
@@ -1404,6 +1434,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   errorBody,
   boundedOperationTimeout,
+  durableWriteOperationState,
   finalBrowserError,
   OperationError,
   operationFingerprint,

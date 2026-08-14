@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 from django.conf import settings
 
-from .matching import choose_product
+from .matching import choose_product, enforce_aggregate_stock
 
 
 class CartAgentError(Exception):
@@ -399,10 +399,12 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
     ):
         raise CartAgentError("Быстрый поиск пропустил часть ингредиентов.")
 
-    matches = [
-        choose_product(ingredient, by_index[index])
-        for index, ingredient in enumerate(ingredients)
-    ]
+    matches = enforce_aggregate_stock(
+        [
+            choose_product(ingredient, by_index[index])
+            for index, ingredient in enumerate(ingredients)
+        ]
+    )
     missing_count = sum(match["quality"] == "missing" for match in matches)
     cleanup_threshold = max(2, math.ceil(len(matches) * 0.25))
     selected = [match for match in matches if match["quality"] != "missing"]

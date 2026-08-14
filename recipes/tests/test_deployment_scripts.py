@@ -146,10 +146,10 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn('status: "started"', server)
         self.assertIn('status: "completed"', server)
         self.assertIn("await storeOperationRecord(recordKey", server)
-        self.assertIn(
-            "await writeFile(temporary, serialized, { mode: 0o600 })",
-            server,
-        )
+        self.assertIn("await file.writeFile(serialized)", server)
+        self.assertIn("await file.sync()", server)
+        self.assertIn("await rename(temporary, operationStateFile)", server)
+        self.assertIn("await directory.sync()", server)
         self.assertIn("itemsToAdd.push({ ...item, delta: item.quantity })", server)
         self.assertIn("const expected = existing + item.quantity", server)
         self.assertNotIn("Math.max(existing, item.quantity)", server)

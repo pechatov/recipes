@@ -229,6 +229,7 @@ def _missing(ingredient: dict[str, Any], warning: str) -> dict[str, Any]:
         "product_url": "",
         "package_count": 0,
         "added_package_count": 0,
+        "available_stock": None,
         "quality": "missing",
         "warning": warning,
     }
@@ -238,6 +239,53 @@ def requested_quantity(ingredient: dict[str, Any]) -> str:
     quantity = str(ingredient.get("quantity") or "").strip()
     unit = str(ingredient.get("unit") or "").strip()
     return " ".join(part for part in (quantity, unit) if part)
+
+
+def enforce_aggregate_stock(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reject a shared SKU when all ingredient deltas exceed known stock."""
+    totals: dict[tuple[str, str], int] = {}
+    stocks: dict[tuple[str, str], int] = {}
+    for match in matches:
+        if match.get("quality") == "missing":
+            continue
+        key = (
+            str(match.get("product_id") or ""),
+            str(match.get("sku_id") or ""),
+        )
+        if not all(key):
+            continue
+        totals[key] = totals.get(key, 0) + int(match.get("package_count") or 0)
+        stock = match.get("available_stock")
+        if isinstance(stock, int) and not isinstance(stock, bool):
+            stocks[key] = min(stocks.get(key, stock), stock)
+
+    exhausted = {
+        key for key, total in totals.items() if total > stocks.get(key, total)
+    }
+    for match in matches:
+        key = (
+            str(match.get("product_id") or ""),
+            str(match.get("sku_id") or ""),
+        )
+        if key not in exhausted:
+            continue
+        match.update(
+            {
+                "product_id": "",
+                "sku_id": "",
+                "product_name": "",
+                "product_url": "",
+                "package_count": 0,
+                "added_package_count": 0,
+                "available_stock": None,
+                "quality": "missing",
+                "warning": (
+                    "Суммарное количество выбранного товара превышает "
+                    "подтверждённый остаток."
+                ),
+            }
+        )
+    return matches
 
 
 def choose_product(
@@ -306,6 +354,7 @@ def choose_product(
         "product_url": str(candidate.get("product_url") or "").strip(),
         "package_count": package_count,
         "added_package_count": 0,
+        "available_stock": _available_stock(candidate),
         "quality": quality,
         "warning": " ".join(warnings),
     }

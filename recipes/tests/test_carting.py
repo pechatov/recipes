@@ -31,7 +31,7 @@ from recipes.carting.client import (
     cleanup_store_cart,
     _run_adapter_task,
 )
-from recipes.carting.matching import choose_product
+from recipes.carting.matching import choose_product, enforce_aggregate_stock
 from recipes.models import (
     BrowserLoginSession,
     CartAttempt,
@@ -921,6 +921,26 @@ class CartProductMatchingTests(SimpleTestCase):
                 )
 
                 self.assertEqual(match["quality"], "substitute")
+
+    def test_shared_sku_must_have_stock_for_all_ingredient_deltas(self):
+        ingredient = {
+            "name": "Молоко",
+            "search_query": "молоко 3,2%",
+            "quantity": "1",
+            "unit": "л",
+        }
+        matches = [
+            choose_product(ingredient, [self.candidate(in_stock=3)]),
+            choose_product(ingredient, [self.candidate(in_stock=3)]),
+        ]
+
+        enforce_aggregate_stock(matches)
+
+        self.assertTrue(all(match["quality"] == "missing" for match in matches))
+        self.assertTrue(all(match["package_count"] == 0 for match in matches))
+        self.assertTrue(
+            all("Суммарное количество" in match["warning"] for match in matches)
+        )
 
 
 class CartPipelineTests(TestCase):
