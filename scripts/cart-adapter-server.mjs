@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { execFile } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 
@@ -40,6 +41,14 @@ class OperationError extends Error {
     this.code = code;
     this.mutationPossible = mutationPossible;
   }
+}
+
+function preserveMutationUncertainty(error, mutationPossible) {
+  const preserved = error instanceof Error
+    ? error
+    : new Error("Cart adapter operation failed");
+  if (mutationPossible) preserved.mutationPossible = true;
+  return preserved;
 }
 
 const operationQueues = new Map();
@@ -256,8 +265,7 @@ async function withBrowser(
     if (!operationError) operationError = error;
   }
   if (operationError) {
-    if (mutationState.possible) operationError.mutationPossible = true;
-    throw operationError;
+    throw preserveMutationUncertainty(operationError, mutationState.possible);
   }
   return result;
 }
@@ -1063,7 +1071,9 @@ async function cleanup(body) {
 function errorBody(error) {
   const known = error instanceof OperationError;
   const code = known ? error.code : "internal_error";
-  const mutationPossible = Boolean(known && error.mutationPossible);
+  // withBrowser also annotates ordinary Error instances raised after the
+  // mutation boundary. Never discard that uncertainty during serialization.
+  const mutationPossible = Boolean(error?.mutationPossible);
   if (code === "login_required") return { status: "login_required", summary: error.message, mutation_possible: mutationPossible };
   if (code === "blocked") return { status: "blocked", summary: error.message, mutation_possible: mutationPossible };
   if (code === "store_unavailable") return { status: "incomplete", summary: error.message, mutation_possible: false };
@@ -1113,6 +1123,10 @@ const server = http.createServer(async (request, response) => {
 
 server.requestTimeout = 180_000;
 server.headersTimeout = 10_000;
-server.listen(port, bindHost, () => {
-  console.log(`Recipes cart adapter listening on ${bindHost}:${port}`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen(port, bindHost, () => {
+    console.log(`Recipes cart adapter listening on ${bindHost}:${port}`);
+  });
+}
+
+export { errorBody, preserveMutationUncertainty };
