@@ -859,6 +859,51 @@ class CartProductMatchingTests(SimpleTestCase):
 
         self.assertEqual(match["package_count"], 1)
 
+    def test_understands_full_russian_count_unit(self):
+        match = choose_product(
+            {
+                "name": "Яйца",
+                "search_query": "яйца",
+                "quantity": "12",
+                "unit": "шт",
+            },
+            [self.candidate(name="Яйца куриные 10 штук", weight="")],
+        )
+
+        self.assertEqual(match["quality"], "exact")
+        self.assertEqual(match["package_count"], 2)
+
+    def test_unknown_count_pack_size_never_multiplies_packages(self):
+        match = choose_product(
+            {
+                "name": "Яйца",
+                "search_query": "яйца",
+                "quantity": "12",
+                "unit": "шт",
+            },
+            [self.candidate(name="Яйца фермерские", weight="")],
+        )
+
+        self.assertEqual(match["quality"], "substitute")
+        self.assertEqual(match["package_count"], 1)
+        self.assertIn("Размер штучной упаковки", match["warning"])
+
+    def test_non_finite_and_extreme_quantities_are_bounded(self):
+        for quantity in ("NaN", "Infinity", "1e999999", "9" * 100):
+            with self.subTest(quantity=quantity):
+                match = choose_product(
+                    {
+                        "name": "Яйца",
+                        "search_query": "яйца",
+                        "quantity": quantity,
+                        "unit": "шт",
+                    },
+                    [self.candidate(name="Яйца куриные 10 штук", weight="")],
+                )
+
+                self.assertEqual(match["quality"], "substitute")
+                self.assertEqual(match["package_count"], 1)
+
 
 class CartPipelineTests(TestCase):
     def setUp(self):

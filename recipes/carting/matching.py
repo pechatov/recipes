@@ -8,15 +8,16 @@ from typing import Any
 
 
 TOKEN_PATTERN = re.compile(r"[a-zа-яё0-9]+(?:[.,][0-9]+)?", re.IGNORECASE)
+COUNT_UNIT_PATTERN = r"шт(?:\.|ук(?:а|и)?)?|pcs?|pieces?"
 AMOUNT_PATTERN = re.compile(
     r"(?P<amount>[0-9]+(?:[.,][0-9]+)?)\s*"
-    r"(?P<unit>кг|гр?\.?|kg|g|мл|ml|л|l|шт\.?|pcs?|pieces?)\b",
+    rf"(?P<unit>кг|гр?\.?|kg|g|мл|ml|л|l|{COUNT_UNIT_PATTERN})\b",
     re.IGNORECASE,
 )
 MULTIPACK_PATTERN = re.compile(
     r"(?P<count>[0-9]+)\s*[xх×*]\s*"
     r"(?P<amount>[0-9]+(?:[.,][0-9]+)?)\s*"
-    r"(?P<unit>кг|гр?\.?|kg|g|мл|ml|л|l|шт\.?|pcs?|pieces?)\b",
+    rf"(?P<unit>кг|гр?\.?|kg|g|мл|ml|л|l|{COUNT_UNIT_PATTERN})\b",
     re.IGNORECASE,
 )
 UNIT_KIND_AND_FACTOR = {
@@ -45,6 +46,9 @@ IGNORED_TOKENS = {
     "с",
     "со",
     "шт",
+    "штук",
+    "штука",
+    "штуки",
     "g",
     "kg",
     "l",
@@ -94,11 +98,20 @@ def _contains_token(tokens: list[str], expected: str) -> bool:
 
 
 def _decimal(value: Any) -> Decimal | None:
+    raw = str(value).strip().replace(",", ".")
+    if len(raw) > 24 or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw):
+        return None
     try:
-        number = Decimal(str(value).strip().replace(",", "."))
+        number = Decimal(raw)
     except (InvalidOperation, ValueError, AttributeError):
         return None
-    return number if number > 0 else None
+    if (
+        not number.is_finite()
+        or number < Decimal("0.001")
+        or number > Decimal("1000000")
+    ):
+        return None
+    return number
 
 
 def _unit(value: Any) -> tuple[str, Decimal] | None:
@@ -149,7 +162,7 @@ def _required_packages(
     package = _package_amount(candidate)
     if package is None:
         if requested_unit[0] == "count":
-            return max(1, math.ceil(quantity)), ""
+            return 1, "Размер штучной упаковки не указан; выбрана одна упаковка."
         return 1, "Размер упаковки не указан; выбрана одна упаковка."
     requested_kind, requested_factor = requested_unit
     package_kind, package_value = package
@@ -166,7 +179,7 @@ def _available_stock(candidate: dict[str, Any]) -> int | None:
         return None if value else 0
     try:
         return max(0, int(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
