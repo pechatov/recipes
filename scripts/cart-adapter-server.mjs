@@ -201,10 +201,18 @@ async function closeBrowser(userId) {
       signal: AbortSignal.timeout(20_000),
     });
   } catch {
-    throw new OperationError("browser_close_failed", "Не удалось безопасно закрыть браузер.");
+    throw new OperationError(
+      "browser_close_failed",
+      "Не удалось безопасно закрыть браузер.",
+      { mutationPossible: true },
+    );
   }
   if (!response.ok && response.status !== 404) {
-    throw new OperationError("browser_close_failed", "Не удалось безопасно закрыть браузер.");
+    throw new OperationError(
+      "browser_close_failed",
+      "Не удалось безопасно закрыть браузер.",
+      { mutationPossible: true },
+    );
   }
 }
 

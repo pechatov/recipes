@@ -30,8 +30,8 @@
       <p>Автоматическая очистка отключена. Можно перейти в Яндекс Еду и оформить заказ вручную.</p>
     {% elif run.status == 'cleanup_pending' or run.status == 'cleaning' %}
       <div class="status-orb is-working">…</div>
-      <h2>Очищаем корзину</h2>
-      <p>Удаляем только товары и количества, добавленные этой попыткой.</p>
+      <h2>Проверяем корзину</h2>
+      <p>Проверяем товары этой попытки. Если они остались, потребуется удалить их вручную.</p>
     {% elif run.status == 'manual_check' %}
       <div class="status-orb is-error">!</div>
       <h2>Нужно вручную проверить корзину</h2>
@@ -51,7 +51,7 @@
     {% endif %}
 
     {% if run.confirmation_deadline and run.status != 'confirmed' %}
-      <p><small>Если не подтвердить корзину до {{ run.confirmation_deadline|date:"d.m.Y H:i" }}, добавленные этой попыткой товары будут удалены автоматически.</small></p>
+      <p><small>Если не подтвердить корзину до {{ run.confirmation_deadline|date:"d.m.Y H:i" }}, сервис проверит добавления и при необходимости попросит удалить их вручную.</small></p>
     {% endif %}
 
     <div class="action-row centered-actions">
@@ -66,7 +66,7 @@
         </form>
         <form method="post" action="{% url 'cart-cancel' run.pk %}">
           {% csrf_token %}
-          <button class="button button-secondary" type="submit">Отменить и очистить</button>
+          <button class="button button-secondary" type="submit">Отменить и проверить</button>
         </form>
         {% endif %}
       {% endif %}

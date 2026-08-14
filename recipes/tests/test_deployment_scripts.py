@@ -106,6 +106,7 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertNotIn("method: 'DELETE'", server)
         self.assertIn("performs no downward mutation", server)
         self.assertIn("dispatchCartMutation", server)
+        self.assertIn('{ mutationPossible: true }', server)
         self.assertIn("const operationQueues = new Map()", server)
         self.assertIn("serializeOperation(text(body?.scope, 80), operation)", server)
         self.assertNotIn("/eats/v1/sku-cart", server)
