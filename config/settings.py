@@ -147,9 +147,12 @@ CART_ADAPTER_FALLBACK_TO_HERMES = env_bool(
     "CART_ADAPTER_FALLBACK_TO_HERMES",
     True,
 )
-CART_CONFIRMATION_MINUTES = max(
-    5,
-    int(os.environ.get("CART_CONFIRMATION_MINUTES", "180")),
+CART_CONFIRMATION_MINUTES = min(
+    7 * 24 * 60,
+    max(
+        5,
+        int(os.environ.get("CART_CONFIRMATION_MINUTES", "180")),
+    ),
 )
 CART_BROWSER_CONTROL_URL = os.environ.get("CART_BROWSER_CONTROL_URL", "").strip().rstrip("/")
 CART_BROWSER_CONTROL_KEY = os.environ.get("CART_BROWSER_CONTROL_KEY", "").strip()

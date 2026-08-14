@@ -19,7 +19,9 @@ const cartItemIdPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const businessPattern = /^[a-z][a-z0-9_-]{0,63}$/;
 const slugPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const tokenLifetimeMs = 10 * 60 * 1000;
-const cleanupTokenLifetimeMs = 7 * 24 * 60 * 60 * 1000;
+// Django caps confirmation at seven days. The extra day ensures a journal
+// created before the worker persists its deadline still outlives that deadline.
+const cleanupTokenLifetimeMs = 8 * 24 * 60 * 60 * 1000;
 const selectionKey = crypto.createHash("sha256").update(controlKey).digest();
 const stores = {
   auchan: ["ашан", "auchan"],
@@ -757,16 +759,12 @@ function rowsInCart(cart, ...identifiers) {
   ));
 }
 
-async function evaluateCartMutation(browser, expression) {
-  let result = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    result = await evaluate(browser, expression);
-    if (Number(result?.status || 0) !== 429) return result;
-    // An explicit 429 cannot have applied the mutation, so retrying the exact
-    // request after a short bounded backoff is safe.
-    await sleep(1_500 * (attempt + 1));
-  }
-  return result;
+async function dispatchCartMutation(browser, expression, mutationState) {
+  // Once the request is dispatched, no HTTP status or transport error proves
+  // that Yandex applied none of it (especially for add_bulk). Never retry the
+  // mutation or allow a Hermes fallback after crossing this boundary.
+  mutationState.possible = true;
+  return evaluate(browser, expression);
 }
 
 async function readCart(browser, context) {
@@ -1020,16 +1018,12 @@ async function applySelection(body) {
     }
 
     const runMutation = async (mutationExpression) => {
-      const mutationWasPossible = mutationState.possible;
-      mutationState.possible = true;
-      const changed = await evaluateCartMutation(browser, mutationExpression);
+      const changed = await dispatchCartMutation(
+        browser,
+        mutationExpression,
+        mutationState,
+      );
       const changedStatus = Number(changed?.status || 0);
-      // A completed 4xx response means Yandex rejected this request before
-      // applying it. Preserve uncertainty from any earlier successful item,
-      // while avoiding a false manual-check state for the first rejected item.
-      if (changedStatus >= 400 && changedStatus < 500) {
-        mutationState.possible = mutationWasPossible;
-      }
       const errorCode = text(changed?.error_code, 80);
       const errorMessage = text(changed?.error_message, 240);
       if (changedStatus < 200 || changedStatus >= 300) {
@@ -1077,6 +1071,7 @@ async function applySelection(body) {
       }
       additions.push({
         product_id: item.product_id,
+        sku_id: item.sku_id,
         before_quantity: beforeQuantity,
         after_quantity: afterQuantity,
         added_quantity: Math.max(0, afterQuantity - beforeQuantity),
@@ -1090,6 +1085,7 @@ async function applySelection(body) {
       operation_id: crypto.randomUUID(),
       items: cleanupItems.map((item) => ({
         product_id: item.product_id,
+        sku_id: item.sku_id,
         before_quantity: item.before_quantity,
         after_quantity: item.after_quantity,
       })),
@@ -1124,10 +1120,12 @@ function validateCleanup(body, scope, store) {
   const items = [];
   for (const item of cleanup.items) {
     const productId = text(item?.product_id, 128);
+    const skuId = text(item?.sku_id, 128);
     const beforeQuantity = Number(item?.before_quantity);
     const afterQuantity = Number(item?.after_quantity);
     if (
       !productIdPattern.test(productId)
+      || !productIdPattern.test(skuId)
       || seen.has(productId)
       || !Number.isInteger(beforeQuantity)
       || beforeQuantity < 0
@@ -1141,6 +1139,7 @@ function validateCleanup(body, scope, store) {
     seen.add(productId);
     items.push({
       product_id: productId,
+      sku_id: skuId,
       before_quantity: beforeQuantity,
       after_quantity: afterQuantity,
     });
@@ -1160,8 +1159,8 @@ async function cleanup(body) {
     // only from the exact post-assembly state, or from the already-restored
     // baseline after a previous (possibly partially acknowledged) request.
     for (const item of cleanupRequest.items) {
-      const existing = quantityInCart(before, item.product_id);
-      const matchingRows = rowsInCart(before, item.product_id);
+      const existing = quantityInCart(before, item.product_id, item.sku_id);
+      const matchingRows = rowsInCart(before, item.product_id, item.sku_id);
       const cartItemId = String(matchingRows[0]?.cart_item_id || "");
       if (existing !== item.before_quantity && existing !== item.after_quantity) {
         throw new OperationError(
@@ -1180,18 +1179,14 @@ async function cleanup(body) {
     }
     for (const item of targets) {
       if (item.existing === item.before_quantity) continue;
-      const mutationWasPossible = mutationState.possible;
-      mutationState.possible = true;
-      const changed = await evaluateCartMutation(
+      const changed = await dispatchCartMutation(
         browser,
         item.before_quantity === 0
           ? removeLegacyItemExpression(context, item.cart_item_id)
           : changeLegacyItemExpression(context, item.cart_item_id, item.before_quantity),
+        mutationState,
       );
       const changedStatus = Number(changed?.status || 0);
-      if (changedStatus >= 400 && changedStatus < 500) {
-        mutationState.possible = mutationWasPossible;
-      }
       const errorCode = text(changed?.error_code, 80);
       const errorMessage = text(changed?.error_message, 240);
       if (changedStatus < 200 || changedStatus >= 300) {
@@ -1208,10 +1203,10 @@ async function cleanup(body) {
       );
     }
     const after = await readCartUntil(browser, context, (cart) => targets.every(
-      (item) => quantityInCart(cart, item.product_id) === item.before_quantity,
+      (item) => quantityInCart(cart, item.product_id, item.sku_id) === item.before_quantity,
     ));
     for (const item of targets) {
-      if (quantityInCart(after, item.product_id) !== item.before_quantity) {
+      if (quantityInCart(after, item.product_id, item.sku_id) !== item.before_quantity) {
         throw new OperationError("verification_failed", "Очистку точного SKU не удалось подтвердить.", { mutationPossible: mutationState.possible });
       }
     }
