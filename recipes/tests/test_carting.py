@@ -22,6 +22,7 @@ from recipes.carting.browser_login import (
     issue_access,
 )
 from recipes.carting.client import (
+    ASSEMBLE_PROMPT,
     STORE_INSTRUCTIONS,
     CartAgentError,
     assemble_store_cart,
@@ -63,21 +64,29 @@ class CartViewTests(TestCase):
         )
         self.client.force_login(self.user)
 
-    def test_default_store_priority_matches_requested_order(self):
+    def test_default_store_selection_is_auchan(self):
         preferences = get_store_preferences(self.user)
         self.assertEqual(
             [item.store for item in preferences],
             ["auchan", "perekrestok", "pyaterochka", "magnit", "lavka"],
         )
+        self.assertEqual(
+            [item.store for item in preferences if item.enabled],
+            [StorePreference.Store.AUCHAN],
+        )
 
     def test_start_cart_snapshots_selected_scaled_ingredients(self):
         response = self.client.post(
             reverse("cart-start", args=[self.recipe.slug]),
-            {"servings": 4, "ingredients": [str(self.potato.pk)]},
+            {
+                "servings": 4,
+                "store": StorePreference.Store.PEREKRESTOK,
+                "ingredients": [str(self.potato.pk)],
+            },
         )
         run = CartRun.objects.get()
         self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
-        self.assertEqual(run.store_priority[0], StorePreference.Store.AUCHAN)
+        self.assertEqual(run.store_priority, [StorePreference.Store.PEREKRESTOK])
         self.assertEqual(run.ingredient_snapshot[0]["name"], "Картофель")
         self.assertEqual(run.ingredient_snapshot[0]["quantity"], "800")
         detail = self.client.get(reverse("cart-detail", args=[run.pk]))
@@ -438,18 +447,11 @@ class CartViewTests(TestCase):
         login_session.refresh_from_db()
         self.assertEqual(login_session.run, first_run)
 
-    def test_store_preferences_can_disable_and_reorder_stores(self):
+    def test_store_preferences_select_exactly_one_store(self):
         get_store_preferences(self.user)
         response = self.client.post(
             reverse("store-preferences"),
-            {
-                "enabled_lavka": "on",
-                "position_lavka": "0",
-                "position_auchan": "4",
-                "position_perekrestok": "3",
-                "position_pyaterochka": "2",
-                "position_magnit": "1",
-            },
+            {"store": StorePreference.Store.LAVKA},
         )
         self.assertRedirects(response, reverse("store-preferences"))
         enabled = list(
@@ -457,21 +459,22 @@ class CartViewTests(TestCase):
         )
         self.assertEqual(enabled, ["lavka"])
 
-    def test_inline_store_preferences_follow_dragged_order_and_return(self):
+    def test_store_selection_returns_to_shopping_list(self):
         get_store_preferences(self.user)
         return_url = reverse("shopping-list", args=[self.recipe.slug])
         response = self.client.post(
             reverse("store-preferences"),
             {
-                "store_order": ["magnit", "auchan", "lavka", "perekrestok", "pyaterochka"],
-                "enabled_magnit": "on",
-                "enabled_auchan": "on",
+                "store": StorePreference.Store.MAGNIT,
                 "next": return_url,
             },
         )
         self.assertRedirects(response, return_url)
         preferences = get_store_preferences(self.user)
-        self.assertEqual([item.store for item in preferences[:2]], ["magnit", "auchan"])
+        self.assertEqual(
+            [item.store for item in preferences if item.enabled],
+            [StorePreference.Store.MAGNIT],
+        )
 
     def test_cart_detail_shows_per_item_status_instead_of_checked_stores(self):
         run = CartRun.objects.create(
@@ -588,6 +591,30 @@ class CartViewTests(TestCase):
             run=run,
             store="auchan",
             status=CartAttempt.Status.BLOCKED,
+        )
+
+        response = self.client.post(reverse("cart-retry", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertEqual(run.next_store_index, 0)
+
+    def test_retry_after_unavailable_delivery_rechecks_selected_store(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.FAILED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+            next_store_index=1,
+        )
+        CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.FAILED,
+            result={"reason": "store_unavailable"},
         )
 
         response = self.client.post(reverse("cart-retry", args=[run.pk]))
@@ -739,6 +766,13 @@ class CartPipelineTests(TestCase):
         )
         self.assertIn("pyaterochka", STORE_INSTRUCTIONS)
         self.assertNotIn("kuper.ru", repr(STORE_INSTRUCTIONS))
+
+    def test_agent_checks_store_delivery_before_searching_products(self):
+        availability_check = ASSEMBLE_PROMPT.index("первым действием")
+        product_search = ASSEMBLE_PROMPT.index("обрабатывай ингредиенты")
+
+        self.assertLess(availability_check, product_search)
+        self.assertIn("reason=store_unavailable", ASSEMBLE_PROMPT)
 
     def test_browser_session_key_is_stable_and_user_specific(self):
         self.assertEqual(cart_browser_session_key(self.user.pk), "recipes-cart-user-1")
@@ -991,6 +1025,25 @@ class CartPipelineTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
         self.assertEqual(run.next_store_index, 0)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_unavailable_selected_store_fails_before_trying_another_store(self, assemble):
+        assemble.return_value = {
+            "status": "failed",
+            "reason": "store_unavailable",
+            "summary": "Ашан недоступен по сохранённому адресу.",
+            "cart_cleared": True,
+            "items": [],
+        }
+        run = self.make_run(["auchan", "perekrestok"])
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.FAILED)
+        self.assertEqual(run.error, assemble.return_value["summary"])
+        self.assertEqual(run.selected_attempt.store, "auchan")
+        self.assertEqual(assemble.call_count, 1)
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_unknown_mutation_requires_manual_check_before_retry(self, assemble):

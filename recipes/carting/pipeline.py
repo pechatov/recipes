@@ -339,6 +339,25 @@ def process_cart_run(run: CartRun) -> None:
         run.next_store_index += 1
         run.save(update_fields=["next_store_index"])
 
+        if data.get("reason") == "store_unavailable":
+            run.status = CartRun.Status.FAILED
+            run.selected_attempt = attempt
+            run.finished_at = timezone.now()
+            run.confirmation_deadline = None
+            run.error = attempt.summary or (
+                "Выбранный магазин недоступен для доставки по сохранённому адресу."
+            )
+            run.save(
+                update_fields=[
+                    "status",
+                    "selected_attempt",
+                    "finished_at",
+                    "confirmation_deadline",
+                    "error",
+                ]
+            )
+            return
+
         if attempt.status in {
             CartAttempt.Status.EXACT,
             CartAttempt.Status.SUBSTITUTIONS,

@@ -6,12 +6,13 @@ from .models import RecipeIngredient, StorePreference, is_water_ingredient_name
 
 
 LAVKA_SEARCH_URL = "https://lavka.yandex.ru/search?text={query}"
-STORE_SEARCH_URLS = {
-    StorePreference.Store.AUCHAN: "https://www.auchan.ru/catalog/?q={query}",
-    StorePreference.Store.PEREKRESTOK: "https://www.perekrestok.ru/cat/search?search={query}",
-    StorePreference.Store.PYATEROCHKA: "https://5ka.ru/search/?q={query}",
-    StorePreference.Store.MAGNIT: "https://magnit.ru/search/?q={query}",
-    StorePreference.Store.LAVKA: LAVKA_SEARCH_URL,
+YANDEX_EDA_SEARCH_URL = "https://eda.yandex.ru/retail/{brand}/search?{parameters}"
+STORE_LINKS = {
+    StorePreference.Store.AUCHAN: ("asan_giper", "ashan_w5r8t"),
+    StorePreference.Store.PEREKRESTOK: ("perekrestok", ""),
+    StorePreference.Store.PYATEROCHKA: ("paterocka", ""),
+    StorePreference.Store.MAGNIT: ("magnit_celevaya", ""),
+    StorePreference.Store.LAVKA: ("lavka", ""),
 }
 
 
@@ -20,7 +21,7 @@ class ShoppingItem:
     ingredient: RecipeIngredient
     quantity: Decimal | None
     search_url: str
-    priority_search_url: str = ""
+    selected_store_search_url: str = ""
 
     @property
     def display_quantity(self) -> str:
@@ -35,12 +36,22 @@ def build_lavka_search_url(query: str) -> str:
 
 
 def build_store_search_url(store: str, query: str) -> str:
-    template = STORE_SEARCH_URLS.get(store, LAVKA_SEARCH_URL)
-    return template.format(query=quote_plus(query.strip()))
+    brand, place = STORE_LINKS.get(
+        store, STORE_LINKS[StorePreference.Store.LAVKA]
+    )
+    parameters = []
+    if place:
+        parameters.append(f"placeSlug={place}")
+        parameters.append(f"relatedBrandSlug={brand}")
+    parameters.append(f"query={quote_plus(query.strip())}")
+    return YANDEX_EDA_SEARCH_URL.format(
+        brand=brand,
+        parameters="&".join(parameters),
+    )
 
 
 def build_shopping_items(
-    recipe, servings: int, preferred_store: str | None = None
+    recipe, servings: int, selected_store: str | None = None
 ) -> list[ShoppingItem]:
     multiplier = Decimal(servings) / Decimal(recipe.servings)
     items = []
@@ -52,13 +63,12 @@ def build_shopping_items(
             ShoppingItem(
                 ingredient=ingredient,
                 quantity=quantity,
-                search_url=build_lavka_search_url(ingredient.effective_search_query),
-                priority_search_url=(
-                    build_store_search_url(
-                        preferred_store, ingredient.effective_search_query
-                    )
-                    if preferred_store and preferred_store != StorePreference.Store.LAVKA
-                    else ""
+                search_url=build_lavka_search_url(
+                    ingredient.effective_search_query
+                ),
+                selected_store_search_url=build_store_search_url(
+                    selected_store or StorePreference.Store.LAVKA,
+                    ingredient.effective_search_query,
                 ),
             )
         )
@@ -69,10 +79,37 @@ def get_store_preferences(user):
     existing = {item.store: item for item in user.store_preferences.all()}
     defaults = [choice[0] for choice in StorePreference.Store.choices]
     missing = [
-        StorePreference(user=user, store=store, position=position)
+        StorePreference(
+            user=user,
+            store=store,
+            position=position,
+            enabled=not existing and position == 0,
+        )
         for position, store in enumerate(defaults)
         if store not in existing
     ]
     if missing:
         StorePreference.objects.bulk_create(missing)
     return list(user.store_preferences.all().order_by("position", "pk"))
+
+
+def get_selected_store(user) -> StorePreference:
+    preferences = get_store_preferences(user)
+    selected = next((item for item in preferences if item.enabled), None)
+    if selected is None:
+        selected = preferences[0]
+        selected.enabled = True
+        selected.save(update_fields=["enabled"])
+    return selected
+
+
+def select_store(user, store: str) -> StorePreference:
+    preferences = get_store_preferences(user)
+    selected = next((item for item in preferences if item.store == store), None)
+    if selected is None:
+        raise ValueError("Unknown store")
+    user.store_preferences.exclude(pk=selected.pk).update(enabled=False)
+    if not selected.enabled:
+        selected.enabled = True
+        selected.save(update_fields=["enabled"])
+    return selected

@@ -453,6 +453,7 @@ class RecipeViewTests(TestCase):
             "/recipes/семейная-паста/shopping/start/",
             {
                 "servings": 2,
+                "store": "auchan",
                 "ingredients": [str(ingredient.pk)],
             },
         )
@@ -563,15 +564,17 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, "Кликните сюда и нажмите Ctrl+V")
         self.assertContains(response, "image/jpeg,image/png,image/webp")
 
-    def test_shopping_page_scales_and_links_to_lavka(self):
+    def test_shopping_page_scales_and_links_to_yandex_eda_stores(self):
         self.client.force_login(self.user)
         response = self.client.get(reverse("shopping-list", args=[self.recipe.slug]), {"servings": 4})
         self.assertContains(response, "400 мл")
-        self.assertContains(response, "https://lavka.yandex.ru/search?text=")
-        self.assertContains(response, "%D1%81%D0%BB%D0%B8%D0%B2%D0%BA%D0%B8+20%25")
-        self.assertContains(response, "Приоритет магазинов")
+        self.assertContains(response, "https://eda.yandex.ru/retail/asan_giper/search?placeSlug=ashan_w5r8t&amp;relatedBrandSlug=asan_giper&amp;query=")
+        self.assertContains(response, 'data-search-query="сливки 20%"')
+        self.assertContains(response, "Магазин для заказа")
         self.assertContains(response, "Найти в Ашан")
-        self.assertContains(response, "data-store-dialog")
+        self.assertNotContains(response, "Найти в Лавке")
+        self.assertContains(response, "data-store-select")
+        self.assertNotContains(response, "Приоритет магазинов")
 
     def test_search_finds_recipe_by_ingredient(self):
         self.client.force_login(self.user)

@@ -89,7 +89,7 @@ class RecipeRefinementAdmin(admin.ModelAdmin):
 
 @admin.register(StorePreference)
 class StorePreferenceAdmin(admin.ModelAdmin):
-    list_display = ("user", "store", "position", "enabled")
+    list_display = ("user", "store", "enabled")
     list_filter = ("store", "enabled")
 
 

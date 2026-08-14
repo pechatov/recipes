@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}Приоритет магазинов · Домашние рецепты{% endblock %}
+{% block title %}Магазин для заказа · Домашние рецепты{% endblock %}
 {% block content %}
   <header class="page-heading">
     <a class="back-link" href="{% url 'recipe-list' %}">← К рецептам</a>
     <p class="eyebrow">Автосборка корзины</p>
-    <h1>Приоритет магазинов</h1>
-    <p class="lead">Меньшее число проверяется раньше. Отключённые магазины агент пропустит.</p>
+    <h1>Магазин для заказа</h1>
+    <p class="lead">Выберите одну сеть. Корзина будет собираться только в ней.</p>
   </header>
 
   <section class="browser-connection-card">
@@ -20,25 +20,19 @@
     </form>
   </section>
 
-  <form method="post" class="store-priority-card">
+  <form method="post" class="store-selection-card">
     {% csrf_token %}
-    <div class="store-priority-list">
-      {% for preference in preferences %}
-        <div class="store-priority-row">
-          <label class="store-enabled">
-            <input type="checkbox" name="enabled_{{ preference.store }}"{% if preference.enabled %} checked{% endif %}>
-            <strong>{{ preference.get_store_display }}</strong>
-          </label>
-          <label class="store-position">
-            <span>Приоритет</span>
-            <input type="number" name="position_{{ preference.store }}" min="0" max="99" value="{{ preference.position }}">
-          </label>
-          <span class="store-platform">через Яндекс Еду</span>
-        </div>
-      {% endfor %}
-    </div>
+    <label class="store-picker store-picker-wide">
+      <span>Магазин</span>
+      <select name="store">
+        {% for value, label in store_options %}
+          <option value="{{ value }}"{% if value == selected_store.store %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <small>Доступность доставки проверяется по адресу в Яндекс Еде перед сборкой.</small>
+    </label>
     <div class="sticky-actions">
-      <button class="button" type="submit">Сохранить порядок</button>
+      <button class="button" type="submit">Сохранить магазин</button>
     </div>
   </form>
 {% endblock %}
