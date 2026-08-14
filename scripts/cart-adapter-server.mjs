@@ -187,17 +187,30 @@ async function camofoxIdentity(scope) {
 
 async function openBrowser(scope, initialUrl = "https://eda.yandex.ru/retail") {
   const identity = await camofoxIdentity(scope);
-  const opened = await camofoxRequest("/tabs", {
-    method: "POST",
-    body: JSON.stringify({
-      userId: identity.user_id,
-      sessionKey: identity.session_key,
-      url: initialUrl,
-    }),
-    timeout: 25_000,
-  });
+  let opened;
+  try {
+    opened = await camofoxRequest("/tabs", {
+      method: "POST",
+      body: JSON.stringify({
+        userId: identity.user_id,
+        sessionKey: identity.session_key,
+        url: initialUrl,
+      }),
+      timeout: 25_000,
+    });
+  } catch (error) {
+    // A lost create response may still have opened the persistent profile,
+    // but without a tab id the adapter cannot confirm or close that session.
+    throw preserveMutationUncertainty(error, true);
+  }
   const tabId = String(opened.tabId || opened.id || "");
-  if (!tabId) throw new OperationError("browser_unavailable", "Браузер не вернул вкладку.");
+  if (!tabId) {
+    throw new OperationError(
+      "browser_unavailable",
+      "Браузер не вернул вкладку.",
+      { mutationPossible: true },
+    );
+  }
   return { identity, tabId };
 }
 

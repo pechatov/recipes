@@ -276,12 +276,12 @@ def _run_adapter_task(
     except ValueError as error:
         raise CartAgentError(
             "Адаптер корзины вернул неверный ответ.",
-            mutation_possible=mutation_possible,
+            mutation_possible=True,
         ) from error
     if not isinstance(data, dict):
         raise CartAgentError(
             "Адаптер корзины вернул неверный ответ.",
-            mutation_possible=mutation_possible,
+            mutation_possible=True,
         )
     if response.is_error:
         reported_mutation = data.get("mutation_possible")
@@ -356,9 +356,14 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
             cart_cleared=True,
         )
     if search_status != "ready":
+        reported_mutation = search.get("mutation_possible")
         raise CartAgentError(
             str(search.get("summary") or "Быстрый поиск товаров не завершился."),
-            mutation_possible=bool(search.get("mutation_possible")),
+            mutation_possible=(
+                reported_mutation
+                if isinstance(reported_mutation, bool)
+                else True
+            ),
         )
 
     raw_results = search.get("results")

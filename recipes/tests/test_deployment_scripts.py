@@ -109,6 +109,7 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn('{ mutationPossible: true }', server)
         self.assertIn("function preserveMutationUncertainty", server)
         self.assertIn("Boolean(error?.mutationPossible)", server)
+        self.assertIn("A lost create response may still have opened", server)
         safety_test = (ROOT / "scripts/cart-adapter-server.test.mjs").read_text()
         self.assertIn('new Error("failed after dispatch")', safety_test)
         self.assertIn("mutation_possible: true", safety_test)
