@@ -1091,12 +1091,19 @@ def yandex_connection(request):
         user=request.user,
         status=BrowserLoginSession.Status.COMPLETED,
     ).first()
+    active_session_conflict = bool(
+        run
+        and active_session
+        and active_session.run_id
+        and active_session.run_id != run.id
+    )
     return render(
         request,
         "recipes/yandex_connection.html",
         {
             "run": run,
             "active_session": active_session,
+            "active_session_conflict": active_session_conflict,
             "latest_connection": latest_connection,
             "browser_login_configured": browser_login_is_configured(),
         },

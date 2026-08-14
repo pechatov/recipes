@@ -204,46 +204,60 @@ def finish_requested_cart_stop(
     mutation_unknown: bool = False,
 ) -> bool:
     """Finish a cooperative stop after any in-flight browser call has returned."""
-    run.refresh_from_db()
-    if not run.cancellation_requested_at:
-        return False
-    if run.status == CartRun.Status.CANCELLED:
-        return True
+    with transaction.atomic():
+        locked_run = CartRun.objects.select_for_update().get(pk=run.pk)
+        if not locked_run.cancellation_requested_at:
+            run.cancellation_requested_at = None
+            return False
+        if locked_run.status == CartRun.Status.CANCELLED:
+            run.refresh_from_db()
+            return True
 
-    attempt = attempt or run.selected_attempt or run.attempts.order_by("-started_at").first()
-    attempt_result = attempt.result if attempt and isinstance(attempt.result, dict) else {}
-    additions_may_remain = bool(
-        mutation_unknown
-        or attempt_result.get("mutation_unknown")
-        or attempt_needs_cleanup(attempt)
-        or (not attempt and run.cleanup_requested_at and not run.cleaned_at)
-    )
-    now = timezone.now()
-    run.status = CartRun.Status.CANCELLED
-    run.selected_attempt = attempt or run.selected_attempt
-    run.finished_at = now
-    run.confirmation_deadline = None
-    run.cleanup_requested_at = None
-    if additions_may_remain:
-        run.cleaned_at = None
-        run.error = (
-            "Сборка остановлена по вашему запросу. В Яндекс Еде могли "
-            "остаться товары этой попытки — проверьте корзину перед новым запуском."
+        attempt = (
+            attempt
+            or locked_run.selected_attempt
+            or locked_run.attempts.order_by("-started_at").first()
         )
-    else:
-        run.cleaned_at = now
-        run.error = ""
-    run.save(
-        update_fields=[
-            "status",
-            "selected_attempt",
-            "finished_at",
-            "confirmation_deadline",
-            "cleanup_requested_at",
-            "cleaned_at",
-            "error",
-        ]
-    )
+        attempt_result = (
+            attempt.result if attempt and isinstance(attempt.result, dict) else {}
+        )
+        additions_may_remain = bool(
+            mutation_unknown
+            or attempt_result.get("mutation_unknown")
+            or attempt_needs_cleanup(attempt)
+            or (
+                not attempt
+                and locked_run.cleanup_requested_at
+                and not locked_run.cleaned_at
+            )
+        )
+        now = timezone.now()
+        locked_run.status = CartRun.Status.CANCELLED
+        locked_run.selected_attempt = attempt or locked_run.selected_attempt
+        locked_run.finished_at = now
+        locked_run.confirmation_deadline = None
+        locked_run.cleanup_requested_at = None
+        if additions_may_remain:
+            locked_run.cleaned_at = None
+            locked_run.error = (
+                "Сборка остановлена по вашему запросу. В Яндекс Еде могли "
+                "остаться товары этой попытки — проверьте корзину перед новым запуском."
+            )
+        else:
+            locked_run.cleaned_at = now
+            locked_run.error = ""
+        locked_run.save(
+            update_fields=[
+                "status",
+                "selected_attempt",
+                "finished_at",
+                "confirmation_deadline",
+                "cleanup_requested_at",
+                "cleaned_at",
+                "error",
+            ]
+        )
+    run.refresh_from_db()
     return True
 
 
@@ -435,9 +449,12 @@ def _best_attempt(run: CartRun):
 
 
 def process_cart_run(run: CartRun) -> None:
-    if finish_requested_cart_stop(run):
-        return
     while run.next_store_index < len(run.store_priority):
+        # This row lock is the dispatch boundary: a stop committed before it
+        # prevents the next browser operation; a stop committed after it waits
+        # for the already-reserved operation to reach its cooperative checkpoint.
+        if finish_requested_cart_stop(run):
+            return
         store = run.store_priority[run.next_store_index]
         attempt, _ = CartAttempt.objects.update_or_create(
             run=run,
@@ -450,6 +467,8 @@ def process_cart_run(run: CartRun) -> None:
                 "finished_at": None,
             },
         )
+        if finish_requested_cart_stop(run, attempt=attempt):
+            return
         try:
             data = assemble_store_cart(run, store)
         except CartAgentError as error:

@@ -10,7 +10,11 @@
 
   <section class="browser-connection-card yandex-connection-card">
     <div>
-      {% if active_session %}
+      {% if active_session_conflict %}
+        <span class="status-badge">Окно занято другой сборкой</span>
+        <h2>Сначала завершите текущий вход</h2>
+        <p>Открытая сессия относится к другой корзине. Завершите её или остановите ту сборку, затем вернитесь сюда.</p>
+      {% elif active_session %}
         <span class="status-badge">Окно входа открыто</span>
         <h2>Завершите привязку</h2>
         <p>Защищённый браузер уже запущен. Вернитесь в него, войдите в Яндекс и сохраните сессию.</p>
@@ -26,7 +30,9 @@
     </div>
     <div class="connection-actions">
       {% if active_session %}
-        {% if run %}
+        {% if active_session_conflict %}
+          <a class="button" href="{% url 'cart-detail' active_session.run.pk %}">Перейти к текущей сборке</a>
+        {% elif run %}
           <form method="post" action="{% url 'cart-browser-login-start' run.pk %}">
             {% csrf_token %}
             <button class="button" type="submit">Вернуться ко входу</button>

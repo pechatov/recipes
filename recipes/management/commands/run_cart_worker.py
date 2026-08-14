@@ -85,7 +85,11 @@ class Command(BaseCommand):
                         run.error = str(error)[:2000]
                     run.finished_at = timezone.now()
                     run.save(update_fields=["status", "error", "finished_at"])
-                    if run.status != CartRun.Status.CANCELLED:
+                    stopped_after_error = finish_requested_cart_stop(
+                        run,
+                        mutation_unknown=error.mutation_possible,
+                    )
+                    if not stopped_after_error:
                         action = "cleanup" if cleaning else "assembly"
                         self.stderr.write(f"Cart {action} {run.pk} failed: {error}")
                 except Exception:
@@ -94,7 +98,11 @@ class Command(BaseCommand):
                         run.error = "Внутренняя ошибка сборки. Подробности сохранены в журнале."
                         run.finished_at = timezone.now()
                         run.save(update_fields=["status", "error", "finished_at"])
-                        logger.exception("Cart run %s failed unexpectedly", run.pk)
+                        if not finish_requested_cart_stop(
+                            run,
+                            mutation_unknown=True,
+                        ):
+                            logger.exception("Cart run %s failed unexpectedly", run.pk)
             if options["once"]:
                 return
             if not run:

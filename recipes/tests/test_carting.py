@@ -5,6 +5,7 @@ import httpx
 from django.conf import settings
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.db import DatabaseError
 from django.db.models.deletion import ProtectedError
 from django.test import SimpleTestCase, TestCase, override_settings
@@ -185,6 +186,46 @@ class CartViewTests(TestCase):
         self.assertNotContains(
             response,
             f'href="{reverse("browser-login", args=[login_session.pk])}"',
+        )
+
+    @override_settings(
+        CART_BROWSER_CONTROL_URL="http://browser.internal:9380",
+        CART_BROWSER_CONTROL_KEY="test-control-key",
+    )
+    def test_yandex_connection_points_a_conflicting_session_to_its_own_run(self):
+        active_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["lavka"],
+            ingredient_snapshot=[],
+        )
+        requested_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        BrowserLoginSession.objects.create(
+            user=self.user,
+            run=active_run,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.get(
+            f'{reverse("yandex-connection")}?run={requested_run.pk}'
+        )
+
+        self.assertContains(response, "Окно занято другой сборкой")
+        self.assertContains(response, reverse("cart-detail", args=[active_run.pk]))
+        self.assertNotContains(
+            response,
+            f'action="{reverse("cart-browser-login-start", args=[requested_run.pk])}"',
         )
 
     @override_settings(
@@ -1194,6 +1235,89 @@ class CartPipelineTests(TestCase):
         self.assertIsNone(claim_cart_run())
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.PENDING)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_stop_before_next_store_prevents_another_browser_call(self, assemble):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            store_priority=["auchan", "lavka"],
+            ingredient_snapshot=self.snapshot,
+        )
+        assemble.return_value = {
+            "status": "failed",
+            "items": [],
+            "cart_cleared": True,
+            "cart_mutated": False,
+        }
+        original_save = run.save
+
+        def request_stop_after_store(*args, **kwargs):
+            result = original_save(*args, **kwargs)
+            if kwargs.get("update_fields") == ["next_store_index"]:
+                CartRun.objects.filter(pk=run.pk).update(
+                    cancellation_requested_at=timezone.now()
+                )
+            return result
+
+        with patch.object(run, "save", side_effect=request_stop_after_store):
+            process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(assemble.call_count, 1)
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+
+    @patch(
+        "recipes.management.commands.run_cart_worker.expire_unconfirmed_cart_runs",
+        return_value=0,
+    )
+    @patch(
+        "recipes.management.commands.run_cart_worker.claim_cleanup_run",
+        return_value=None,
+    )
+    @patch("recipes.management.commands.run_cart_worker.claim_cart_run")
+    @patch("recipes.management.commands.run_cart_worker.process_cart_run")
+    def test_worker_rechecks_stop_after_saving_an_error(
+        self,
+        process_run,
+        claim_run,
+        _claim_cleanup,
+        _expire,
+    ):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        claim_run.return_value = run
+        process_run.side_effect = CartAgentError("safe failure")
+        real_finish = finish_requested_cart_stop
+        finish_calls = 0
+
+        def stop_between_check_and_error_save(*args, **kwargs):
+            nonlocal finish_calls
+            finish_calls += 1
+            result = real_finish(*args, **kwargs)
+            if finish_calls == 1:
+                CartRun.objects.filter(pk=run.pk).update(
+                    cancellation_requested_at=timezone.now()
+                )
+            return result
+
+        with patch(
+            "recipes.management.commands.run_cart_worker.finish_requested_cart_stop",
+            side_effect=stop_between_check_and_error_save,
+        ):
+            call_command("run_cart_worker", "--once")
+
+        run.refresh_from_db()
+        self.assertGreaterEqual(finish_calls, 2)
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
 
     @patch("recipes.carting.coordination.stop_session")
     def test_expired_login_still_blocks_when_remote_close_is_uncertain(self, stop_session):
