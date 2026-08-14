@@ -138,9 +138,26 @@ CART_AI_BASE_URL = os.environ.get("CART_AI_BASE_URL", "").strip()
 CART_AI_API_KEY = os.environ.get("CART_AI_API_KEY", "").strip()
 CART_AI_MODEL = os.environ.get("CART_AI_MODEL", "").strip()
 CART_AI_TIMEOUT_SECONDS = int(os.environ.get("CART_AI_TIMEOUT_SECONDS", "900"))
-CART_CONFIRMATION_MINUTES = max(
-    5,
-    int(os.environ.get("CART_CONFIRMATION_MINUTES", "180")),
+CART_ADAPTER_BASE_URL = os.environ.get("CART_ADAPTER_BASE_URL", "").strip().rstrip("/")
+CART_ADAPTER_API_KEY = os.environ.get("CART_ADAPTER_API_KEY", "").strip()
+CART_ADAPTER_CA_CERT_B64 = os.environ.get("CART_ADAPTER_CA_CERT_B64", "").strip()
+CART_ADAPTER_TIMEOUT_SECONDS = int(
+    os.environ.get("CART_ADAPTER_TIMEOUT_SECONDS", "210")
+)
+# The adapter stops normal browser work after 160 seconds and reserves up to
+# 20 seconds to close its profile. Keep enough client-side delivery margin so
+# Django never abandons an operation that the adapter still considers valid.
+CART_ADAPTER_TIMEOUT_SECONDS = max(210, CART_ADAPTER_TIMEOUT_SECONDS)
+CART_ADAPTER_FALLBACK_TO_HERMES = env_bool(
+    "CART_ADAPTER_FALLBACK_TO_HERMES",
+    True,
+)
+CART_CONFIRMATION_MINUTES = min(
+    7 * 24 * 60,
+    max(
+        5,
+        int(os.environ.get("CART_CONFIRMATION_MINUTES", "180")),
+    ),
 )
 CART_BROWSER_CONTROL_URL = os.environ.get("CART_BROWSER_CONTROL_URL", "").strip().rstrip("/")
 CART_BROWSER_CONTROL_KEY = os.environ.get("CART_BROWSER_CONTROL_KEY", "").strip()

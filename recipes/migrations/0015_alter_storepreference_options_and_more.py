@@ -29,6 +29,10 @@ def restore_legacy_store_selection(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    # PostgreSQL cannot create the partial unique index while the preceding
+    # data migration has pending trigger events in the same transaction.
+    # Let Django commit each operation before advancing to the constraint.
+    atomic = False
 
     dependencies = [
         ('recipes', '0014_merge_reciperefinement'),

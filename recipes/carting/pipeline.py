@@ -128,12 +128,18 @@ def _save_result(attempt: CartAttempt, data: dict) -> None:
                     "product_url": product_url,
                     "product_id": product_id,
                     "package_count": 0,
+                    "added_package_count": 0,
                 },
             )
-            existing["package_count"] = min(
+            added_total = min(
                 100,
-                existing["package_count"] + added_package_count,
+                existing["added_package_count"] + added_package_count,
             )
+            # package_count is retained for old Hermes cleanup prompts. The
+            # explicit field prevents adapter cleanup from confusing the
+            # recipe target with the quantity actually added by this run.
+            existing["added_package_count"] = added_total
+            existing["package_count"] = added_total
     CartItemMatch.objects.bulk_create(matches)
 
     qualities = {match.quality for match in matches}
@@ -240,7 +246,9 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
         product_url = _safe_yandex_food_url(item.get("product_url"))
         product_id = _yandex_food_product_id(product_url)
         try:
-            package_count = int(item.get("package_count") or 0)
+            package_count = int(
+                item.get("added_package_count", item.get("package_count")) or 0
+            )
         except (TypeError, ValueError):
             package_count = 0
         if not product_name or not product_id or not 1 <= package_count <= 100:
@@ -254,9 +262,24 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
                 "product_url": product_url,
                 "product_id": product_id,
                 "package_count": package_count,
+                "added_package_count": package_count,
             }
         )
-    data = cleanup_store_cart(run, attempt.store, safe_items, attempt.cart_url)
+    result = attempt.result if isinstance(attempt.result, dict) else {}
+    cleanup_token = _text(result.get("cleanup_token"), 60_000)
+    if result.get("provider") == "yandex_api_adapter" and not cleanup_token:
+        raise CartAgentError(
+            "Подписанный журнал адаптерной сборки отсутствует; проверьте "
+            "корзину вручную.",
+            mutation_possible=True,
+        )
+    data = cleanup_store_cart(
+        run,
+        attempt.store,
+        safe_items,
+        attempt.cart_url,
+        cleanup_token=cleanup_token,
+    )
     status = _text(data.get("status"), 24)
     if status == "cleared":
         _mark_attempt_cleaned(attempt, data.get("summary", ""))
@@ -378,9 +401,13 @@ def process_cart_run(run: CartRun) -> None:
         try:
             data = assemble_store_cart(run, store)
         except CartAgentError as error:
+            diagnostic = _text(str(error), 500)
             attempt.status = CartAttempt.Status.FAILED
-            attempt.summary = "Браузерный агент не завершил одноэтапную сборку."
-            attempt.result = {"mutation_unknown": error.mutation_possible}
+            attempt.summary = diagnostic or "Сервис не завершил одноэтапную сборку."
+            attempt.result = {
+                "mutation_unknown": error.mutation_possible,
+                "error": diagnostic,
+            }
             attempt.finished_at = timezone.now()
             attempt.save(update_fields=["status", "summary", "result", "finished_at"])
             if error.mutation_possible:
