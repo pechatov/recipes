@@ -237,6 +237,7 @@ def finish_requested_cart_stop(
         locked_run.finished_at = now
         locked_run.confirmation_deadline = None
         locked_run.cleanup_requested_at = None
+        locked_run.browser_operation_started_at = None
         if additions_may_remain:
             locked_run.cleaned_at = None
             locked_run.error = (
@@ -253,6 +254,7 @@ def finish_requested_cart_stop(
                 "finished_at",
                 "confirmation_deadline",
                 "cleanup_requested_at",
+                "browser_operation_started_at",
                 "cleaned_at",
                 "error",
             ]

@@ -944,6 +944,7 @@ class CartViewTests(TestCase):
             requested_by=self.user,
             servings=2,
             status=CartRun.Status.PROCESSING,
+            browser_operation_started_at=timezone.now(),
             store_priority=["auchan"],
             ingredient_snapshot=[],
         )
@@ -956,6 +957,45 @@ class CartViewTests(TestCase):
         self.assertTrue(finish_requested_cart_stop(run))
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
+
+    def test_processing_without_a_browser_reservation_stops_immediately(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNotNone(run.cleaned_at)
+
+    @override_settings(
+        CART_AI_TIMEOUT_SECONDS=900,
+        CART_ADAPTER_TIMEOUT_SECONDS=210,
+    )
+    def test_stale_browser_reservation_is_abandoned_with_a_warning(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            browser_operation_started_at=timezone.now() - timedelta(minutes=17),
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNone(run.browser_operation_started_at)
+        self.assertIsNone(run.cleaned_at)
+        self.assertIn("могли остаться товары", run.error)
 
     @patch("recipes.views.stop_browser_login_session")
     def test_stopping_login_required_closes_its_browser_session(self, stop_session):

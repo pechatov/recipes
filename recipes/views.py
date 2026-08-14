@@ -1384,14 +1384,25 @@ def cart_stop(request, pk):
 
         now = timezone.now()
         run.cancellation_requested_at = now
+        stale_reservation = False
         if run.status in {CartRun.Status.PROCESSING, CartRun.Status.CLEANING}:
-            run.save(update_fields=["cancellation_requested_at"])
-            messages.info(
-                request,
-                "Остановка запрошена. Текущая операция безопасно завершится, "
-                "после чего сборка остановится.",
-            )
-            return redirect("cart-detail", pk=run.pk)
+            maximum_operation_seconds = max(
+                settings.CART_AI_TIMEOUT_SECONDS,
+                settings.CART_ADAPTER_TIMEOUT_SECONDS,
+            ) + 60
+            reservation_cutoff = now - timedelta(seconds=maximum_operation_seconds)
+            if (
+                run.browser_operation_started_at
+                and run.browser_operation_started_at > reservation_cutoff
+            ):
+                run.save(update_fields=["cancellation_requested_at"])
+                messages.info(
+                    request,
+                    "Остановка запрошена. Текущая операция безопасно завершится, "
+                    "после чего сборка остановится.",
+                )
+                return redirect("cart-detail", pk=run.pk)
+            stale_reservation = bool(run.browser_operation_started_at)
 
         attempt = None
         if run.selected_attempt_id:
@@ -1402,7 +1413,8 @@ def cart_stop(request, pk):
             and attempt.result.get("mutation_unknown")
         )
         additions_may_remain = bool(
-            mutation_unknown
+            stale_reservation
+            or mutation_unknown
             or attempt_needs_cleanup(attempt)
             or (not attempt and run.cleanup_requested_at and not run.cleaned_at)
         )
@@ -1413,6 +1425,7 @@ def cart_stop(request, pk):
         # every later cart blocked. The UI preserves a warning when the external
         # cart may still contain products from this attempt.
         run.cleanup_requested_at = None
+        run.browser_operation_started_at = None
         if additions_may_remain:
             run.cleaned_at = None
             run.error = (
@@ -1429,6 +1442,7 @@ def cart_stop(request, pk):
                 "finished_at",
                 "confirmation_deadline",
                 "cleanup_requested_at",
+                "browser_operation_started_at",
                 "cleaned_at",
                 "error",
             ]
