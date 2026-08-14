@@ -97,7 +97,12 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn('"/v1/cleanup"', server)
         self.assertIn("/api/v1/cart", server)
         self.assertNotIn("/api/v1/cart/add_bulk", server)
-        self.assertIn("Promise.all(items.map", server)
+        self.assertIn("for (const item of items)", server)
+        self.assertNotIn("Promise.all(items.map", server)
+        self.assertIn(
+            "if (result.status < 200 || result.status >= 300) return result",
+            server,
+        )
         self.assertIn("item_id:", server)
         self.assertIn("place_business: context.place_business", server)
         self.assertIn('soft_multi: "true"', server)

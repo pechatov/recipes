@@ -837,7 +837,7 @@ function addLegacyItemsExpression(context, items) {
     const context = ${JSON.stringify(context)};
     const items = ${JSON.stringify(payloadItems)};
     const query = new URLSearchParams(${JSON.stringify(legacyCartParams(context))});
-    const results = await Promise.all(items.map(async (item) => {
+    for (const item of items) {
       const response = await fetch('/api/v1/cart?' + query, {
         method: 'POST',
         headers: {'accept': 'application/json', 'content-type': 'application/json'},
@@ -860,15 +860,15 @@ function addLegacyItemsExpression(context, items) {
         data?.error?.description,
         typeof data?.error === 'string' ? data.error : '',
       ].find((value) => typeof value === 'string' && value.trim());
-      return {
+      const result = {
         status: response.status,
         error_code: String(data?.code || data?.error?.code || '').slice(0, 80),
         error_message: String(errorMessage || '').slice(0, 240),
         response_keys: Object.keys(data || {}).filter((key) => /^[a-zA-Z0-9_-]{1,40}$/.test(key)).slice(0, 20),
       };
-    }));
-    return results.find((result) => result.status < 200 || result.status >= 300)
-      || {status: 200, error_code: '', error_message: '', response_keys: []};
+      if (result.status < 200 || result.status >= 300) return result;
+    }
+    return {status: 200, error_code: '', error_message: '', response_keys: []};
   })()`;
 }
 
