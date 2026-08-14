@@ -209,10 +209,6 @@ def finish_requested_cart_stop(
         if not locked_run.cancellation_requested_at:
             run.cancellation_requested_at = None
             return False
-        if locked_run.status == CartRun.Status.CANCELLED:
-            run.refresh_from_db()
-            return True
-
         attempt = (
             attempt
             or locked_run.selected_attempt
@@ -231,6 +227,21 @@ def finish_requested_cart_stop(
                 and not locked_run.cleaned_at
             )
         )
+        if locked_run.status == CartRun.Status.CANCELLED:
+            fields = ["browser_operation_started_at"]
+            locked_run.browser_operation_started_at = None
+            if additions_may_remain:
+                locked_run.selected_attempt = attempt or locked_run.selected_attempt
+                locked_run.cleaned_at = None
+                locked_run.error = (
+                    "Сборка остановлена по вашему запросу. В Яндекс Еде могли "
+                    "остаться товары этой попытки — проверьте корзину перед новым запуском."
+                )
+                fields.extend(["selected_attempt", "cleaned_at", "error"])
+            locked_run.save(update_fields=fields)
+            run.refresh_from_db()
+            return True
+
         now = timezone.now()
         locked_run.status = CartRun.Status.CANCELLED
         locked_run.selected_attempt = attempt or locked_run.selected_attempt
@@ -368,11 +379,25 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
             attempt.cart_url,
             cleanup_token=cleanup_token,
         )
-    finally:
+    except CartAgentError as error:
+        if error.mutation_possible:
+            result = dict(attempt.result or {})
+            result["mutation_unknown"] = True
+            attempt.result = result
+            attempt.save(update_fields=["result"])
         _release_browser_operation(run)
+        raise
     status = _text(data.get("status"), 24)
     if status == "cleared":
         _mark_attempt_cleaned(attempt, data.get("summary", ""))
+    elif data.get("mutation_possible"):
+        result = dict(attempt.result or {})
+        result["mutation_unknown"] = True
+        attempt.result = result
+        attempt.save(update_fields=["result"])
+    # As with assembly, publish an idle run only after the cleanup outcome is
+    # durable so a concurrent stop cannot make a decision from stale journal data.
+    _release_browser_operation(run)
     return status
 
 
@@ -494,10 +519,7 @@ def process_cart_run(run: CartRun) -> None:
             finish_requested_cart_stop(run, attempt=attempt)
             return
         try:
-            try:
-                data = assemble_store_cart(run, store)
-            finally:
-                _release_browser_operation(run)
+            data = assemble_store_cart(run, store)
         except CartAgentError as error:
             diagnostic = _text(str(error), 500)
             attempt.status = CartAttempt.Status.FAILED
@@ -508,6 +530,9 @@ def process_cart_run(run: CartRun) -> None:
             }
             attempt.finished_at = timezone.now()
             attempt.save(update_fields=["status", "summary", "result", "finished_at"])
+            # Keep the reservation until the mutation outcome is durable. A
+            # concurrent stop can now safely derive its warning from attempt.
+            _release_browser_operation(run)
             if finish_requested_cart_stop(
                 run,
                 attempt=attempt,
@@ -533,6 +558,9 @@ def process_cart_run(run: CartRun) -> None:
                 return
             raise
         _save_result(attempt, data)
+        # The result journal must be committed before cart_stop can observe an
+        # idle run; otherwise it can incorrectly claim that no additions remain.
+        _release_browser_operation(run)
         if finish_requested_cart_stop(run, attempt=attempt):
             return
         run.next_store_index += 1

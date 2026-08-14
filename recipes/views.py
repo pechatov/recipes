@@ -35,6 +35,7 @@ from .carting.coordination import (
     BROWSER_BLOCKING_STATUSES,
     reconcile_expired_browser_login_sessions,
     reconcile_missing_browser_login_session,
+    resume_cart_run_after_login,
 )
 from .carting.pipeline import attempt_needs_cleanup
 from .forms import (
@@ -437,34 +438,6 @@ def register_invite(request, token):
         messages.success(request, "Аккаунт создан. Одноразовая регистрация закрыта.")
         return redirect("recipe-list")
     return render(request, "registration/register.html", {"form": form})
-
-
-def _resume_cart_run_after_login(run: CartRun) -> None:
-    if run.status not in {CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED}:
-        return
-    if run.cleanup_requested_at and not run.cleaned_at:
-        run.status = CartRun.Status.CLEANUP_PENDING
-        fields = ["status", "finished_at", "error"]
-    else:
-        if run.status == CartRun.Status.FAILED:
-            retry_stores = {
-                attempt.store
-                for attempt in run.attempts.only("store", "status", "result")
-                if attempt.status == CartAttempt.Status.BLOCKED
-                or (
-                    isinstance(attempt.result, dict)
-                    and attempt.result.get("reason") == "store_unavailable"
-                )
-            }
-            for index, store in enumerate(run.store_priority):
-                if store in retry_stores:
-                    run.next_store_index = index
-                    break
-        run.status = CartRun.Status.PENDING
-        fields = ["status", "next_store_index", "finished_at", "error"]
-    run.finished_at = None
-    run.error = ""
-    run.save(update_fields=fields)
 
 
 def _record_browser_login_start_failure(
@@ -1340,16 +1313,39 @@ def cart_cancel(request, pk):
 @login_required
 @require_POST
 def cart_stop(request, pk):
-    run = get_object_or_404(CartRun, pk=pk, requested_by=request.user)
-    login_session = BrowserLoginSession.objects.filter(
-        user=request.user,
-        run=run,
-        status__in=BROWSER_BLOCKING_STATUSES,
-    ).first()
+    login_session = None
+    previous_login_status = None
+    with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
+        run = get_object_or_404(
+            CartRun.objects.select_for_update(),
+            pk=pk,
+            requested_by=request.user,
+        )
+        if not run.can_stop:
+            messages.info(request, "Эта сборка уже завершена.")
+            return redirect("cart-detail", pk=run.pk)
+        login_session = BrowserLoginSession.objects.select_for_update().filter(
+            user=request.user,
+            run=run,
+            status__in=BROWSER_BLOCKING_STATUSES,
+        ).first()
+        if login_session:
+            previous_login_status = login_session.status
+            login_session.status = BrowserLoginSession.Status.STOPPING
+            login_session.error = "Окно входа закрывается при остановке сборки."
+            login_session.save(update_fields=["status", "error"])
+
     if login_session:
         try:
             stop_browser_login_session(login_session.remote_session_id)
         except BrowserLoginError as error:
+            with transaction.atomic():
+                acquire_application_lock(CART_BROWSER_LOCK)
+                BrowserLoginSession.objects.select_for_update().filter(
+                    pk=login_session.pk,
+                    status=BrowserLoginSession.Status.STOPPING,
+                ).update(status=previous_login_status, error="")
             messages.error(
                 request,
                 f"Не удалось закрыть окно Яндекс Еды: {error}",
@@ -1363,16 +1359,12 @@ def cart_stop(request, pk):
             pk=pk,
             requested_by=request.user,
         )
-        if not run.can_stop:
-            messages.info(request, "Эта сборка уже завершена.")
-            return redirect("cart-detail", pk=run.pk)
-
         if login_session:
             locked_login_session = BrowserLoginSession.objects.select_for_update().filter(
                 pk=login_session.pk,
                 user=request.user,
                 run=run,
-                status__in=BROWSER_BLOCKING_STATUSES,
+                status=BrowserLoginSession.Status.STOPPING,
             ).first()
             if locked_login_session:
                 locked_login_session.status = BrowserLoginSession.Status.FAILED
@@ -1381,6 +1373,12 @@ def cart_stop(request, pk):
                 locked_login_session.save(
                     update_fields=["status", "finished_at", "error"]
                 )
+
+        # The remote close happens outside the database transaction. Another
+        # request may have completed the stop while it was in flight.
+        if not run.can_stop:
+            messages.info(request, "Эта сборка уже завершена.")
+            return redirect("cart-detail", pk=run.pk)
 
         now = timezone.now()
         run.cancellation_requested_at = now
@@ -1515,7 +1513,7 @@ def cart_retry(request, pk):
         status__in=[CartRun.Status.LOGIN_REQUIRED, CartRun.Status.FAILED],
     )
     cleanup_pending = bool(run.cleanup_requested_at and not run.cleaned_at)
-    _resume_cart_run_after_login(run)
+    resume_cart_run_after_login(run)
     if cleanup_pending:
         messages.success(request, "Очистка снова поставлена в очередь.")
         return redirect("cart-detail", pk=run.pk)
@@ -1709,15 +1707,27 @@ def browser_login(request, pk):
 @login_required
 @require_POST
 def browser_login_complete(request, pk):
-    login_session = get_object_or_404(
-        BrowserLoginSession.objects.select_related("run"),
-        pk=pk,
-        user=request.user,
-        status=BrowserLoginSession.Status.ACTIVE,
-    )
+    with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
+        login_session = get_object_or_404(
+            BrowserLoginSession.objects.select_for_update(),
+            pk=pk,
+            user=request.user,
+            status=BrowserLoginSession.Status.ACTIVE,
+        )
+        login_session.status = BrowserLoginSession.Status.COMPLETING
+        login_session.error = "Сессия сохраняется."
+        login_session.save(update_fields=["status", "error"])
     try:
         stop_browser_login_session(login_session.remote_session_id)
     except BrowserLoginError as error:
+        with transaction.atomic():
+            acquire_application_lock(CART_BROWSER_LOCK)
+            BrowserLoginSession.objects.select_for_update().filter(
+                pk=login_session.pk,
+                user=request.user,
+                status=BrowserLoginSession.Status.COMPLETING,
+            ).update(status=BrowserLoginSession.Status.ACTIVE, error="")
         messages.error(request, f"Не удалось сохранить сессию: {error}")
         return redirect("browser-login", pk=login_session.pk)
 
@@ -1727,7 +1737,7 @@ def browser_login_complete(request, pk):
         login_session = BrowserLoginSession.objects.select_for_update().filter(
             pk=login_session.pk,
             user=request.user,
-            status=BrowserLoginSession.Status.ACTIVE,
+            status=BrowserLoginSession.Status.COMPLETING,
         ).first()
         if not login_session:
             messages.info(request, "Окно входа уже было закрыто.")
@@ -1741,7 +1751,7 @@ def browser_login_complete(request, pk):
                 pk=login_session.run_id,
                 requested_by=request.user,
             )
-            _resume_cart_run_after_login(run)
+            resume_cart_run_after_login(run)
     if login_session.run_id:
         messages.success(request, "Сессия Яндекса сохранена; сборка снова поставлена в очередь.")
         return redirect("cart-detail", pk=login_session.run_id)

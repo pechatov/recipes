@@ -13,6 +13,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from recipes.carting.pipeline import (
+    _release_browser_operation,
     claim_cart_run,
     expire_unconfirmed_cart_runs,
     finish_requested_cart_stop,
@@ -477,6 +478,16 @@ class CartViewTests(TestCase):
             status=BrowserLoginSession.Status.ACTIVE,
             expires_at=timezone.now() + timedelta(minutes=15),
         )
+
+        def observe_committed_transition(_remote_session_id):
+            login_session.refresh_from_db()
+            self.assertEqual(
+                login_session.status,
+                BrowserLoginSession.Status.COMPLETING,
+            )
+            self.assertTrue(browser_login_session_blocks_worker())
+
+        stop_session.side_effect = observe_committed_transition
 
         response = self.client.post(
             reverse("browser-login-complete", args=[login_session.pk])
@@ -1015,6 +1026,16 @@ class CartViewTests(TestCase):
             expires_at=timezone.now() + timedelta(minutes=15),
         )
 
+        def observe_committed_transition(_remote_session_id):
+            login_session.refresh_from_db()
+            self.assertEqual(
+                login_session.status,
+                BrowserLoginSession.Status.STOPPING,
+            )
+            self.assertTrue(browser_login_session_blocks_worker())
+
+        stop_session.side_effect = observe_committed_transition
+
         response = self.client.post(reverse("cart-stop", args=[run.pk]))
 
         self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
@@ -1399,6 +1420,49 @@ class CartPipelineTests(TestCase):
         run.refresh_from_db()
         self.assertIsNone(run.browser_operation_started_at)
 
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_result_is_durable_before_browser_reservation_is_released(self, assemble):
+        run = self.make_run()
+        assemble.return_value = {
+            "status": "exact",
+            "cart_url": "https://eda.yandex.ru/cart",
+            "summary": "Всё найдено",
+            "cart_cleared": False,
+            "items": [
+                {
+                    "ingredient_name": "Спагетти",
+                    "requested_quantity": "400 г",
+                    "product_name": "Спагетти 450 г",
+                    "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
+                    "package_count": 1,
+                    "added_package_count": 1,
+                    "quality": "exact",
+                    "warning": "",
+                }
+            ],
+        }
+
+        def request_stop_at_release(released_run):
+            attempt = CartAttempt.objects.get(run=run)
+            self.assertTrue(attempt.result["added_items"])
+            run.refresh_from_db()
+            self.assertIsNotNone(run.browser_operation_started_at)
+            CartRun.objects.filter(pk=run.pk).update(
+                cancellation_requested_at=timezone.now()
+            )
+            _release_browser_operation(released_run)
+
+        with patch(
+            "recipes.carting.pipeline._release_browser_operation",
+            side_effect=request_stop_at_release,
+        ):
+            process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNone(run.cleaned_at)
+        self.assertIn("могли остаться товары", run.error)
+
     @patch(
         "recipes.management.commands.run_cart_worker.expire_unconfirmed_cart_runs",
         return_value=0,
@@ -1496,6 +1560,63 @@ class CartPipelineTests(TestCase):
         login_session.refresh_from_db()
         self.assertEqual(claimed, run)
         self.assertEqual(login_session.status, BrowserLoginSession.Status.EXPIRED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
+
+    @patch("recipes.carting.coordination.stop_session")
+    def test_interrupted_login_stop_is_reconciled_without_waiting_for_expiry(
+        self,
+        stop_session,
+    ):
+        pending_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.STOPPING,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        claimed = claim_cart_run()
+
+        login_session.refresh_from_db()
+        self.assertEqual(claimed, pending_run)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.FAILED)
+        stop_session.assert_called_once_with(login_session.remote_session_id)
+
+    @patch("recipes.carting.coordination.stop_session")
+    def test_interrupted_login_completion_is_reconciled_and_resumes_run(
+        self,
+        stop_session,
+    ):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            run=run,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.COMPLETING,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        claimed = claim_cart_run()
+
+        login_session.refresh_from_db()
+        run.refresh_from_db()
+        self.assertEqual(claimed, run)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.COMPLETED)
+        self.assertEqual(run.status, CartRun.Status.PROCESSING)
         stop_session.assert_called_once_with(login_session.remote_session_id)
 
     @patch("recipes.carting.client.run_store_cart_task")

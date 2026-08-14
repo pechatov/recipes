@@ -603,6 +603,8 @@ class BrowserLoginSession(models.Model):
     class Status(models.TextChoices):
         STARTING = "starting", "Запускается"
         ACTIVE = "active", "Открыта"
+        STOPPING = "stopping", "Закрывается"
+        COMPLETING = "completing", "Сохраняется"
         COMPLETED = "completed", "Сохранена"
         EXPIRED = "expired", "Истекла"
         FAILED = "failed", "Ошибка"
