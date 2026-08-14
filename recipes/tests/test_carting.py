@@ -34,6 +34,7 @@ from recipes.carting.client import (
     cleanup_store_cart,
     _run_adapter_task,
 )
+from recipes.carting.coordination import browser_login_session_blocks_worker
 from recipes.carting.matching import choose_product, enforce_aggregate_stock
 from recipes.models import (
     BrowserLoginSession,
@@ -956,6 +957,67 @@ class CartViewTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
 
+    @patch("recipes.views.stop_browser_login_session")
+    def test_stopping_login_required_closes_its_browser_session(self, stop_session):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            run=run,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        response = self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        login_session.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.FAILED)
+        self.assertFalse(browser_login_session_blocks_worker())
+        stop_session.assert_called_once_with(login_session.remote_session_id)
+
+        stale_completion = self.client.post(
+            reverse("browser-login-complete", args=[login_session.pk])
+        )
+        self.assertEqual(stale_completion.status_code, 404)
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+
+    @patch("recipes.views.stop_browser_login_session")
+    def test_failed_browser_close_does_not_partially_stop_run(self, stop_session):
+        stop_session.side_effect = BrowserLoginError("controller unavailable")
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.LOGIN_REQUIRED,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        login_session = BrowserLoginSession.objects.create(
+            user=self.user,
+            run=run,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.ACTIVE,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        login_session.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
+        self.assertEqual(login_session.status, BrowserLoginSession.Status.ACTIVE)
+
 
 class CartProductMatchingTests(SimpleTestCase):
     def candidate(self, **overrides):
@@ -1268,6 +1330,34 @@ class CartPipelineTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(assemble.call_count, 1)
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_browser_operation_has_a_persisted_dispatch_reservation(self, assemble):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+
+        def observe_reservation(*_args):
+            run.refresh_from_db()
+            self.assertIsNotNone(run.browser_operation_started_at)
+            return {
+                "status": "failed",
+                "items": [],
+                "cart_cleared": True,
+                "cart_mutated": False,
+            }
+
+        assemble.side_effect = observe_reservation
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertIsNone(run.browser_operation_started_at)
 
     @patch(
         "recipes.management.commands.run_cart_worker.expire_unconfirmed_cart_runs",

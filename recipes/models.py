@@ -560,6 +560,7 @@ class CartRun(models.Model):
     cleanup_requested_at = models.DateTimeField(null=True, blank=True)
     cleaned_at = models.DateTimeField(null=True, blank=True)
     cancellation_requested_at = models.DateTimeField(null=True, blank=True)
+    browser_operation_started_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]

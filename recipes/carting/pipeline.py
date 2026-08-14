@@ -261,6 +261,24 @@ def finish_requested_cart_stop(
     return True
 
 
+def _reserve_browser_operation(run: CartRun) -> bool:
+    """Serialize an external browser dispatch against a concurrent stop request."""
+    with transaction.atomic():
+        locked_run = CartRun.objects.select_for_update().get(pk=run.pk)
+        if locked_run.cancellation_requested_at:
+            run.cancellation_requested_at = locked_run.cancellation_requested_at
+            return False
+        locked_run.browser_operation_started_at = timezone.now()
+        locked_run.save(update_fields=["browser_operation_started_at"])
+        run.browser_operation_started_at = locked_run.browser_operation_started_at
+    return True
+
+
+def _release_browser_operation(run: CartRun) -> None:
+    CartRun.objects.filter(pk=run.pk).update(browser_operation_started_at=None)
+    run.browser_operation_started_at = None
+
+
 def _mark_attempt_cleaned(attempt: CartAttempt, summary: str = "") -> None:
     result = dict(attempt.result or {})
     result["cart_cleared"] = True
@@ -337,13 +355,19 @@ def _cleanup_attempt(run: CartRun, attempt: CartAttempt) -> str:
             "корзину вручную.",
             mutation_possible=True,
         )
-    data = cleanup_store_cart(
-        run,
-        attempt.store,
-        safe_items,
-        attempt.cart_url,
-        cleanup_token=cleanup_token,
-    )
+    if not _reserve_browser_operation(run):
+        finish_requested_cart_stop(run, attempt=attempt)
+        return "stopped"
+    try:
+        data = cleanup_store_cart(
+            run,
+            attempt.store,
+            safe_items,
+            attempt.cart_url,
+            cleanup_token=cleanup_token,
+        )
+    finally:
+        _release_browser_operation(run)
     status = _text(data.get("status"), 24)
     if status == "cleared":
         _mark_attempt_cleaned(attempt, data.get("summary", ""))
@@ -450,9 +474,6 @@ def _best_attempt(run: CartRun):
 
 def process_cart_run(run: CartRun) -> None:
     while run.next_store_index < len(run.store_priority):
-        # This row lock is the dispatch boundary: a stop committed before it
-        # prevents the next browser operation; a stop committed after it waits
-        # for the already-reserved operation to reach its cooperative checkpoint.
         if finish_requested_cart_stop(run):
             return
         store = run.store_priority[run.next_store_index]
@@ -467,10 +488,14 @@ def process_cart_run(run: CartRun) -> None:
                 "finished_at": None,
             },
         )
-        if finish_requested_cart_stop(run, attempt=attempt):
+        if not _reserve_browser_operation(run):
+            finish_requested_cart_stop(run, attempt=attempt)
             return
         try:
-            data = assemble_store_cart(run, store)
+            try:
+                data = assemble_store_cart(run, store)
+            finally:
+                _release_browser_operation(run)
         except CartAgentError as error:
             diagnostic = _text(str(error), 500)
             attempt.status = CartAttempt.Status.FAILED
@@ -526,6 +551,8 @@ def process_cart_run(run: CartRun) -> None:
                         "ответа о недоступности магазина.",
                     )
                     raise
+                if cleanup_status == "stopped":
+                    return
                 if cleanup_status != "cleared":
                     _record_outstanding_cleanup(
                         run,
@@ -615,6 +642,8 @@ def process_cart_run(run: CartRun) -> None:
                         "Не удалось очистить товары после неудачной сборки.",
                     )
                     raise
+                if cleanup_status == "stopped":
+                    return
                 if cleanup_status != "cleared":
                     _record_outstanding_cleanup(
                         run,
@@ -642,6 +671,8 @@ def process_cart_run(run: CartRun) -> None:
                     "Не удалось очистить неполную корзину.",
                 )
                 raise
+            if cleanup_status == "stopped":
+                return
             if cleanup_status != "cleared":
                 _record_outstanding_cleanup(
                     run,
@@ -713,8 +744,16 @@ def claim_cleanup_run():
             return None
         run.status = CartRun.Status.CLEANING
         run.started_at = timezone.now()
+        run.browser_operation_started_at = None
         run.error = ""
-        run.save(update_fields=["status", "started_at", "error"])
+        run.save(
+            update_fields=[
+                "status",
+                "started_at",
+                "browser_operation_started_at",
+                "error",
+            ]
+        )
         return run
 
 
@@ -790,7 +829,16 @@ def claim_cart_run():
             return None
         run.status = CartRun.Status.PROCESSING
         run.started_at = timezone.now()
+        run.browser_operation_started_at = None
         run.finished_at = None
         run.error = ""
-        run.save(update_fields=["status", "started_at", "finished_at", "error"])
+        run.save(
+            update_fields=[
+                "status",
+                "started_at",
+                "browser_operation_started_at",
+                "finished_at",
+                "error",
+            ]
+        )
         return run

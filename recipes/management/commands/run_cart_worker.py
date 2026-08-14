@@ -36,6 +36,7 @@ class Command(BaseCommand):
         ).update(
             status=CartRun.Status.PENDING,
             started_at=None,
+            browser_operation_started_at=None,
             error="",
         )
         recovered_cleanups = CartRun.objects.filter(
@@ -44,6 +45,7 @@ class Command(BaseCommand):
         ).update(
             status=CartRun.Status.CLEANUP_PENDING,
             started_at=None,
+            browser_operation_started_at=None,
             error="",
         )
         return recovered_runs + recovered_cleanups
@@ -98,11 +100,11 @@ class Command(BaseCommand):
                         run.error = "Внутренняя ошибка сборки. Подробности сохранены в журнале."
                         run.finished_at = timezone.now()
                         run.save(update_fields=["status", "error", "finished_at"])
-                        if not finish_requested_cart_stop(
+                        finish_requested_cart_stop(
                             run,
                             mutation_unknown=True,
-                        ):
-                            logger.exception("Cart run %s failed unexpectedly", run.pk)
+                        )
+                    logger.exception("Cart run %s failed unexpectedly", run.pk)
             if options["once"]:
                 return
             if not run:

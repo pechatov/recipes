@@ -1340,7 +1340,24 @@ def cart_cancel(request, pk):
 @login_required
 @require_POST
 def cart_stop(request, pk):
+    run = get_object_or_404(CartRun, pk=pk, requested_by=request.user)
+    login_session = BrowserLoginSession.objects.filter(
+        user=request.user,
+        run=run,
+        status__in=BROWSER_BLOCKING_STATUSES,
+    ).first()
+    if login_session:
+        try:
+            stop_browser_login_session(login_session.remote_session_id)
+        except BrowserLoginError as error:
+            messages.error(
+                request,
+                f"Не удалось закрыть окно Яндекс Еды: {error}",
+            )
+            return redirect("cart-detail", pk=run.pk)
+
     with transaction.atomic():
+        acquire_application_lock(CART_BROWSER_LOCK)
         run = get_object_or_404(
             CartRun.objects.select_for_update(),
             pk=pk,
@@ -1349,6 +1366,21 @@ def cart_stop(request, pk):
         if not run.can_stop:
             messages.info(request, "Эта сборка уже завершена.")
             return redirect("cart-detail", pk=run.pk)
+
+        if login_session:
+            locked_login_session = BrowserLoginSession.objects.select_for_update().filter(
+                pk=login_session.pk,
+                user=request.user,
+                run=run,
+                status__in=BROWSER_BLOCKING_STATUSES,
+            ).first()
+            if locked_login_session:
+                locked_login_session.status = BrowserLoginSession.Status.FAILED
+                locked_login_session.finished_at = timezone.now()
+                locked_login_session.error = "Окно входа закрыто при остановке сборки."
+                locked_login_session.save(
+                    update_fields=["status", "finished_at", "error"]
+                )
 
         now = timezone.now()
         run.cancellation_requested_at = now
@@ -1678,6 +1710,14 @@ def browser_login_complete(request, pk):
     now = timezone.now()
     with transaction.atomic():
         acquire_application_lock(CART_BROWSER_LOCK)
+        login_session = BrowserLoginSession.objects.select_for_update().filter(
+            pk=login_session.pk,
+            user=request.user,
+            status=BrowserLoginSession.Status.ACTIVE,
+        ).first()
+        if not login_session:
+            messages.info(request, "Окно входа уже было закрыто.")
+            return redirect("yandex-connection")
         login_session.status = BrowserLoginSession.Status.COMPLETED
         login_session.finished_at = now
         login_session.error = ""
