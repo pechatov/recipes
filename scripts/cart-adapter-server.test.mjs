@@ -73,6 +73,21 @@ assert.equal(
   (await readOperationRecord("scope:operation")).result.status,
   "applied",
 );
+await assert.rejects(
+  storeOperationRecord(
+    "scope:phantom",
+    {
+      status: "started",
+      fingerprint: "fingerprint",
+      started_at: new Date().toISOString(),
+    },
+    async () => {
+      throw new Error("simulated durable write failure");
+    },
+  ),
+  (error) => error.code === "operation_state_unavailable",
+);
+assert.equal(await readOperationRecord("scope:phantom"), null);
 await unlink(process.env.CART_ADAPTER_STATE_FILE);
 
 await quarantineScope("recipes-cart-user-42");

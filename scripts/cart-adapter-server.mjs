@@ -199,9 +199,10 @@ async function durableWriteState(target, serialized) {
   }
 }
 
-async function storeOperationRecord(key, record) {
+async function storeOperationRecord(key, record, writeState = durableWriteState) {
   const write = operationWriteQueue.then(async () => {
-    const records = await loadOperationRecords();
+    const currentRecords = await loadOperationRecords();
+    const records = Object.assign(Object.create(null), currentRecords);
     pruneOperationRecords(records);
     if (
       !Object.hasOwn(records, key)
@@ -214,7 +215,10 @@ async function storeOperationRecord(key, record) {
     if (Buffer.byteLength(serialized) > maximumOperationStateBytes) {
       throw operationStateError();
     }
-    await durableWriteState(operationStateFile, serialized);
+    await writeState(operationStateFile, serialized);
+    // Publish the new in-memory snapshot only after both durability barriers
+    // completed. A failed write must remain indistinguishable from no write.
+    operationRecordsPromise = Promise.resolve(records);
   });
   operationWriteQueue = write.catch(() => {});
   try {
@@ -312,9 +316,10 @@ async function persistQuarantinedScopes(scopes) {
 
 async function quarantineScope(scope) {
   const write = quarantineWriteQueue.then(async () => {
-    const scopes = await loadQuarantinedScopes();
+    const scopes = new Map(await loadQuarantinedScopes());
     scopes.set(scope, Date.now());
     await persistQuarantinedScopes(scopes);
+    quarantinedScopesPromise = Promise.resolve(scopes);
   });
   quarantineWriteQueue = write.catch(() => {});
   await write;
@@ -324,11 +329,12 @@ async function deferScopeRecovery(scope, now = Date.now()) {
   const recoverAfter = now + deferredBrowserCreateSettlementMs;
   let effectiveRecoverAfter = recoverAfter;
   const write = quarantineWriteQueue.then(async () => {
-    const scopes = await loadQuarantinedScopes();
+    const scopes = new Map(await loadQuarantinedScopes());
     if (!scopes.has(scope)) throw quarantineError();
     effectiveRecoverAfter = Math.max(scopes.get(scope) || 0, recoverAfter);
     scopes.set(scope, effectiveRecoverAfter);
     await persistQuarantinedScopes(scopes);
+    quarantinedScopesPromise = Promise.resolve(scopes);
   });
   quarantineWriteQueue = write.catch(() => {});
   await write;
@@ -342,7 +348,7 @@ async function releaseScopeQuarantine(scope) {
     const remaining = new Map(scopes);
     remaining.delete(scope);
     await persistQuarantinedScopes(remaining);
-    scopes.delete(scope);
+    quarantinedScopesPromise = Promise.resolve(remaining);
   });
   quarantineWriteQueue = write.catch(() => {});
   await write;

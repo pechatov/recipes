@@ -180,6 +180,8 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("await file.sync()", server)
         self.assertIn("await rename(temporary, target)", server)
         self.assertIn("await directory.sync()", server)
+        self.assertIn("operationRecordsPromise = Promise.resolve(records)", server)
+        self.assertIn("quarantinedScopesPromise = Promise.resolve(scopes)", server)
         self.assertIn("cart-adapter-quarantine.json", server)
         self.assertIn("function markProfileUncertain", server)
         self.assertIn("await recoverQuarantinedScope(scope)", server)
