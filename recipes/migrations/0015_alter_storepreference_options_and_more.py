@@ -18,6 +18,14 @@ def select_one_store_per_user(apps, schema_editor):
         StorePreference.objects.filter(pk=selected.pk).update(enabled=True)
 
 
+def restore_legacy_store_selection(apps, schema_editor):
+    StorePreference = apps.get_model("recipes", "StorePreference")
+    # The legacy pipeline accepted multiple enabled stores. Enabling every
+    # existing preference gives a rolled-back application a complete fallback
+    # list instead of silently limiting it to the single new-style selection.
+    StorePreference.objects.update(enabled=True)
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -40,7 +48,7 @@ class Migration(migrations.Migration):
             name='store',
             field=models.CharField(choices=[('auchan', 'Ашан'), ('perekrestok', 'Перекрёсток'), ('pyaterochka', 'Пятёрочка'), ('magnit', 'Магнит'), ('lavka', 'Яндекс Лавка')], max_length=24, verbose_name='магазин'),
         ),
-        migrations.RunPython(select_one_store_per_user, migrations.RunPython.noop),
+        migrations.RunPython(select_one_store_per_user, restore_legacy_store_selection),
         migrations.AddConstraint(
             model_name='storepreference',
             constraint=models.UniqueConstraint(condition=models.Q(('enabled', True)), fields=('user',), name='unique_selected_store_per_user'),
