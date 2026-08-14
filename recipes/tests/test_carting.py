@@ -1160,6 +1160,30 @@ class CartPipelineTests(TestCase):
     @override_settings(
         CART_ADAPTER_BASE_URL="http://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_uncertain_search_status_never_releases_profile_to_hermes(
+        self, adapter_task, run_task
+    ):
+        for status in ("login_required", "blocked", "incomplete"):
+            with self.subTest(status=status):
+                adapter_task.return_value = {
+                    "status": status,
+                    "summary": "Профиль мог остаться открытым.",
+                    "mutation_possible": True,
+                }
+
+                with self.assertRaises(CartAgentError) as caught:
+                    assemble_store_cart(self.make_run(), "auchan")
+
+                self.assertTrue(caught.exception.mutation_possible)
+        run_task.assert_not_called()
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client.httpx.Client")
     def test_adapter_transport_timeout_never_allows_concurrent_fallback(self, client):

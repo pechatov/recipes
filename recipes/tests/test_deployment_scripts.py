@@ -111,6 +111,11 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("function finalBrowserError", server)
         self.assertIn("operationError || closeError, true", server)
         self.assertIn("Boolean(error?.mutationPossible)", server)
+        self.assertIn(
+            'status: "incomplete", summary: error.message, '
+            "mutation_possible: mutationPossible",
+            server,
+        )
         self.assertIn("A lost create response may still have opened", server)
         safety_test = (ROOT / "scripts/cart-adapter-server.test.mjs").read_text()
         self.assertIn('new Error("failed after dispatch")', safety_test)

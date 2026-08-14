@@ -344,6 +344,15 @@ def _search_with_adapter(run, store: str) -> dict[str, Any]:
 def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
     search = _search_with_adapter(run, store)
     search_status = str(search.get("status") or "")
+    reported_mutation = search.get("mutation_possible")
+    if reported_mutation is True:
+        # A status such as store_unavailable may have been produced before a
+        # later failure to close the persistent profile. Do not advance to a
+        # different store or executor while the adapter may still own it.
+        raise CartAgentError(
+            str(search.get("summary") or "Профиль корзины не был безопасно освобождён."),
+            mutation_possible=True,
+        )
     if search_status in {"login_required", "blocked"}:
         return _adapter_status_result(
             search_status,
@@ -356,7 +365,6 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
             cart_cleared=True,
         )
     if search_status != "ready":
-        reported_mutation = search.get("mutation_possible")
         raise CartAgentError(
             str(search.get("summary") or "Быстрый поиск товаров не завершился."),
             mutation_possible=(

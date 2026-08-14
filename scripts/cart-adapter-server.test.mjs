@@ -8,6 +8,7 @@ process.env.HERMES_HOME = "/tmp/test-hermes-home";
 const {
   errorBody,
   finalBrowserError,
+  OperationError,
   preserveMutationUncertainty,
   runExclusiveOperation,
   sameLocation,
@@ -31,6 +32,17 @@ assert.equal(
   searchError,
 );
 assert.equal(searchError.mutationPossible, true);
+
+const unavailableAfterCloseFailure = new OperationError(
+  "store_unavailable",
+  "store unavailable",
+  { mutationPossible: true },
+);
+assert.deepEqual(errorBody(unavailableAfterCloseFailure), {
+  status: "incomplete",
+  summary: "store unavailable",
+  mutation_possible: true,
+});
 
 assert.equal(
   sameLocation(

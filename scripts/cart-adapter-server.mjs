@@ -1138,7 +1138,7 @@ function errorBody(error) {
   const mutationPossible = Boolean(error?.mutationPossible);
   if (code === "login_required") return { status: "login_required", summary: error.message, mutation_possible: mutationPossible };
   if (code === "blocked") return { status: "blocked", summary: error.message, mutation_possible: mutationPossible };
-  if (code === "store_unavailable") return { status: "incomplete", summary: error.message, mutation_possible: false };
+  if (code === "store_unavailable") return { status: "incomplete", summary: error.message, mutation_possible: mutationPossible };
   return {
     status: "failed",
     summary: known ? error.message : "Адаптер корзины завершился с ошибкой.",
@@ -1194,6 +1194,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   errorBody,
   finalBrowserError,
+  OperationError,
   preserveMutationUncertainty,
   runExclusiveOperation,
   sameLocation,
