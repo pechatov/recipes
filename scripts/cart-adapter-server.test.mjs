@@ -6,13 +6,21 @@ process.env.HERMES_ROOT = "/tmp/test-hermes";
 process.env.HERMES_HOME = "/tmp/test-hermes-home";
 
 const {
+  boundedOperationTimeout,
   errorBody,
   finalBrowserError,
   OperationError,
   preserveMutationUncertainty,
   runExclusiveOperation,
+  runWithOperationDeadline,
   sameLocation,
 } = await import("./cart-adapter-server.mjs");
+
+const bounded = await runWithOperationDeadline(
+  async () => boundedOperationTimeout(300_000),
+  1_000,
+);
+assert.ok(bounded > 0 && bounded <= 1_000);
 
 const internalError = preserveMutationUncertainty(
   new Error("failed after dispatch"),

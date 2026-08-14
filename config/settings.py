@@ -143,6 +143,9 @@ CART_ADAPTER_API_KEY = os.environ.get("CART_ADAPTER_API_KEY", "").strip()
 CART_ADAPTER_TIMEOUT_SECONDS = int(
     os.environ.get("CART_ADAPTER_TIMEOUT_SECONDS", "210")
 )
+# The adapter stops normal browser work after 160 seconds and reserves up to
+# 20 seconds to close its profile. Keep enough client-side delivery margin so
+# Django never abandons an operation that the adapter still considers valid.
 CART_ADAPTER_TIMEOUT_SECONDS = max(210, CART_ADAPTER_TIMEOUT_SECONDS)
 CART_ADAPTER_FALLBACK_TO_HERMES = env_bool(
     "CART_ADAPTER_FALLBACK_TO_HERMES",

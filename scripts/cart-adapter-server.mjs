@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { execFile } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
@@ -19,6 +20,11 @@ const productIdPattern = /^[A-Za-z0-9_-]{8,128}$/;
 const businessPattern = /^[a-z][a-z0-9_-]{0,63}$/;
 const slugPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const tokenLifetimeMs = 10 * 60 * 1000;
+// All normal browser work must stop before Django's 210-second client timeout.
+// closeBrowser has its own 20-second allowance, leaving roughly 30 seconds for
+// response delivery and scheduling jitter.
+const operationBudgetMs = 160_000;
+const operationDeadline = new AsyncLocalStorage();
 // Django caps confirmation at seven days. The extra day ensures a journal
 // created before the worker persists its deadline still outlives that deadline.
 const cleanupTokenLifetimeMs = 8 * 24 * 60 * 60 * 1000;
@@ -146,6 +152,20 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function boundedOperationTimeout(maximum) {
+  const requested = Math.max(1, Number(maximum) || 1);
+  const deadline = operationDeadline.getStore()?.deadline;
+  if (!Number.isFinite(deadline)) return requested;
+  return Math.max(1, Math.min(requested, deadline - Date.now()));
+}
+
+function runWithOperationDeadline(operation, budget = operationBudgetMs) {
+  return operationDeadline.run(
+    { deadline: Date.now() + Math.max(1, Number(budget) || 1) },
+    operation,
+  );
+}
+
 function camofoxHeaders(json = false) {
   const headers = {};
   if (json) headers["Content-Type"] = "application/json";
@@ -159,7 +179,9 @@ async function camofoxRequest(path, options = {}) {
     response = await fetch(`${camofoxUrl}${path}`, {
       ...options,
       headers: { ...camofoxHeaders(Boolean(options.body)), ...(options.headers || {}) },
-      signal: AbortSignal.timeout(options.timeout || 30_000),
+      signal: AbortSignal.timeout(
+        boundedOperationTimeout(options.timeout || 30_000),
+      ),
     });
   } catch (error) {
     throw new OperationError("browser_unavailable", "Браузерная сессия недоступна.");
@@ -187,7 +209,7 @@ async function camofoxIdentity(scope) {
     ({ stdout } = await execFileAsync(hermesPython, ["-c", program, scope], {
       cwd: hermesRoot,
       env: { ...process.env, HERMES_HOME: hermesHome },
-      timeout: 10_000,
+      timeout: boundedOperationTimeout(10_000),
       maxBuffer: 16_384,
     }));
   } catch {
@@ -1165,7 +1187,10 @@ const server = http.createServer(async (request, response) => {
     return sendJson(
       response,
       200,
-      await runExclusiveOperation(text(body?.scope, 80), operation),
+      await runExclusiveOperation(
+        text(body?.scope, 80),
+        () => runWithOperationDeadline(operation),
+      ),
     );
   } catch (error) {
     const body = errorBody(error);
@@ -1193,9 +1218,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   errorBody,
+  boundedOperationTimeout,
   finalBrowserError,
   OperationError,
   preserveMutationUncertainty,
   runExclusiveOperation,
+  runWithOperationDeadline,
   sameLocation,
 };
