@@ -132,6 +132,17 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("function sameLocation", server)
         self.assertIn("if (!sameLocation(state, context))", server)
         self.assertIn("latitude: currentContext.latitude", server)
+        self.assertIn("cart-adapter-operations.json", server)
+        self.assertIn('status: "started"', server)
+        self.assertIn('status: "completed"', server)
+        self.assertIn("await storeOperationRecord(recordKey", server)
+        self.assertIn(
+            "await writeFile(temporary, JSON.stringify(records), { mode: 0o600 })",
+            server,
+        )
+        self.assertIn("itemsToAdd.push({ ...item, delta: item.quantity })", server)
+        self.assertIn("const expected = existing + item.quantity", server)
+        self.assertNotIn("Math.max(existing, item.quantity)", server)
         self.assertNotIn("/eats/v1/sku-cart", server)
         self.assertNotIn("mutationState.possible = mutationWasPossible", server)
         self.assertIn("sealSelection", server)

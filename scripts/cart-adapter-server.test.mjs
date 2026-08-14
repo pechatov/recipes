@@ -1,19 +1,24 @@
 import assert from "node:assert/strict";
+import { stat, unlink } from "node:fs/promises";
 
 
 process.env.CART_ADAPTER_CONTROL_KEY = "test-control-key";
 process.env.HERMES_ROOT = "/tmp/test-hermes";
 process.env.HERMES_HOME = "/tmp/test-hermes-home";
+process.env.CART_ADAPTER_STATE_FILE = `/tmp/recipes-cart-adapter-${process.pid}.json`;
 
 const {
   boundedOperationTimeout,
   errorBody,
   finalBrowserError,
   OperationError,
+  operationFingerprint,
   preserveMutationUncertainty,
+  readOperationRecord,
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
+  storeOperationRecord,
 } = await import("./cart-adapter-server.mjs");
 
 const bounded = await runWithOperationDeadline(
@@ -21,6 +26,42 @@ const bounded = await runWithOperationDeadline(
   1_000,
 );
 assert.ok(bounded > 0 && bounded <= 1_000);
+
+const fingerprintItems = [
+  { product_id: "product-b", sku_id: "sku-b", quantity: 2 },
+  { product_id: "product-a", sku_id: "sku-a", quantity: 1 },
+];
+assert.equal(
+  operationFingerprint("scope", "store", fingerprintItems),
+  operationFingerprint("scope", "store", [...fingerprintItems].reverse()),
+);
+assert.notEqual(
+  operationFingerprint("scope", "store", fingerprintItems),
+  operationFingerprint("scope", "store", [
+    { product_id: "product-b", sku_id: "sku-b", quantity: 3 },
+    { product_id: "product-a", sku_id: "sku-a", quantity: 1 },
+  ]),
+);
+
+await storeOperationRecord("scope:operation", {
+  status: "started",
+  fingerprint: "fingerprint",
+});
+assert.deepEqual(await readOperationRecord("scope:operation"), {
+  status: "started",
+  fingerprint: "fingerprint",
+});
+assert.equal((await stat(process.env.CART_ADAPTER_STATE_FILE)).mode & 0o777, 0o600);
+await storeOperationRecord("scope:operation", {
+  status: "completed",
+  fingerprint: "fingerprint",
+  result: { status: "applied" },
+});
+assert.equal(
+  (await readOperationRecord("scope:operation")).result.status,
+  "applied",
+);
+await unlink(process.env.CART_ADAPTER_STATE_FILE);
 
 const internalError = preserveMutationUncertainty(
   new Error("failed after dispatch"),

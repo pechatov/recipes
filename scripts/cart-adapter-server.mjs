@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
@@ -13,12 +15,18 @@ const controlKey = process.env.CART_ADAPTER_CONTROL_KEY || "";
 const hermesRoot = process.env.HERMES_ROOT || "";
 const hermesHome = process.env.HERMES_HOME || "";
 const hermesPython = `${hermesRoot}/venv/bin/python`;
+const operationStateFile = process.env.CART_ADAPTER_STATE_FILE
+  || `${hermesHome}/cart-adapter-operations.json`;
 const camofoxUrl = (process.env.CAMOFOX_URL || "http://127.0.0.1:9377").replace(/\/$/, "");
 const camofoxAccessKey = process.env.CAMOFOX_ACCESS_KEY || process.env.CAMOFOX_API_KEY || "";
 const scopePattern = /^recipes-cart-user-[1-9][0-9]*$/;
 const productIdPattern = /^[A-Za-z0-9_-]{8,128}$/;
 const businessPattern = /^[a-z][a-z0-9_-]{0,63}$/;
 const slugPattern = /^[A-Za-z0-9_-]{1,128}$/;
+const operationIdPattern = /^cart-run-[1-9][0-9]{0,18}-[0-9]{20}-[a-z][a-z0-9_-]{0,31}$/;
+const cleanupOperationIdPattern = new RegExp(
+  `^(?:${operationIdPattern.source.slice(1, -1)}|[a-f0-9-]{36})$`,
+);
 const tokenLifetimeMs = 10 * 60 * 1000;
 // All normal browser work must stop before Django's 210-second client timeout.
 // closeBrowser has its own 20-second allowance, leaving roughly 30 seconds for
@@ -67,6 +75,72 @@ function finalBrowserError(operationError, closeError, mutationPossible) {
   return operationError
     ? preserveMutationUncertainty(operationError, mutationPossible)
     : null;
+}
+
+let operationRecordsPromise = null;
+let operationWriteQueue = Promise.resolve();
+
+async function loadOperationRecords() {
+  if (!operationRecordsPromise) {
+    operationRecordsPromise = (async () => {
+      try {
+        const parsed = JSON.parse(await readFile(operationStateFile, "utf8"));
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("invalid operation state");
+        }
+        return Object.assign(Object.create(null), parsed);
+      } catch (error) {
+        if (error?.code === "ENOENT") return Object.create(null);
+        throw new OperationError(
+          "operation_state_unavailable",
+          "Журнал операций корзины недоступен; проверьте корзину вручную.",
+          { mutationPossible: true },
+        );
+      }
+    })();
+  }
+  return operationRecordsPromise;
+}
+
+async function readOperationRecord(key) {
+  await operationWriteQueue;
+  const records = await loadOperationRecords();
+  return Object.hasOwn(records, key) ? records[key] : null;
+}
+
+async function storeOperationRecord(key, record) {
+  const write = operationWriteQueue.then(async () => {
+    const records = await loadOperationRecords();
+    records[key] = record;
+    await mkdir(dirname(operationStateFile), { recursive: true, mode: 0o700 });
+    const temporary = `${operationStateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
+    await rename(temporary, operationStateFile);
+  });
+  operationWriteQueue = write.catch(() => {});
+  try {
+    await write;
+  } catch (error) {
+    if (error instanceof OperationError) throw error;
+    throw new OperationError(
+      "operation_state_unavailable",
+      "Не удалось сохранить журнал операции; проверьте корзину вручную.",
+      { mutationPossible: true },
+    );
+  }
+}
+
+function operationFingerprint(scope, store, requested) {
+  const items = [...requested]
+    .map((item) => ({
+      product_id: item.product_id,
+      sku_id: item.sku_id,
+      quantity: item.quantity,
+    }))
+    .sort((left, right) => left.product_id.localeCompare(right.product_id));
+  return crypto.createHash("sha256")
+    .update(JSON.stringify({ scope, store, items }))
+    .digest("hex");
 }
 
 const activeScopes = new Set();
@@ -890,6 +964,10 @@ function validateIngredients(body) {
 
 async function search(body) {
   const { scope, store } = validateBaseRequest(body);
+  const operationId = text(body?.operation_id, 128);
+  if (!operationIdPattern.test(operationId)) {
+    throw new OperationError("invalid_request", "Неверный идентификатор операции.");
+  }
   const ingredients = validateIngredients(body);
   const started = Date.now();
   return withBrowser(scope, async (browser) => {
@@ -924,6 +1002,7 @@ async function search(body) {
     const selectionToken = sealSelection({
       scope,
       store,
+      operation_id: operationId,
       context,
       allowed,
       expires_at: Date.now() + tokenLifetimeMs,
@@ -986,15 +1065,52 @@ function validateApplyItems(body, selection) {
 
 async function applySelection(body) {
   const { scope, store } = validateBaseRequest(body);
+  const operationId = text(body?.operation_id, 128);
   const selection = openSelection(body.selection_token);
-  if (selection.scope !== scope || selection.store !== store) {
+  if (
+    !operationIdPattern.test(operationId)
+    || selection.operation_id !== operationId
+    || selection.scope !== scope
+    || selection.store !== store
+  ) {
     throw new OperationError("invalid_selection", "Поиск относится к другому пользователю или магазину.");
   }
   const signedContext = validatedContext(selection.context);
   const requested = validateApplyItems(body, selection);
+  const recordKey = `${scope}:${operationId}`;
+  const fingerprint = operationFingerprint(scope, store, requested);
+  const previous = await readOperationRecord(recordKey);
+  if (previous) {
+    if (
+      typeof previous !== "object"
+      || previous.fingerprint !== fingerprint
+      || !["started", "completed"].includes(previous.status)
+    ) {
+      throw new OperationError(
+        "operation_conflict",
+        "Повтор операции не совпадает с сохранённым журналом; проверьте корзину вручную.",
+        { mutationPossible: true },
+      );
+    }
+    if (previous.status === "completed") {
+      if (!previous.result || previous.result.status !== "applied") {
+        throw new OperationError(
+          "operation_state_unavailable",
+          "Сохранённый результат операции повреждён; проверьте корзину вручную.",
+          { mutationPossible: true },
+        );
+      }
+      return previous.result;
+    }
+    throw new OperationError(
+      "operation_in_progress",
+      "Предыдущий запуск мог изменить корзину; проверьте её вручную.",
+      { mutationPossible: true },
+    );
+  }
   const started = Date.now();
   const mutationState = { possible: false };
-  return withBrowser(scope, async (browser) => {
+  const result = await withBrowser(scope, async (browser) => {
     const context = await validateSignedStore(browser, signedContext);
     const before = await readCart(browser, context);
     const quantitiesBefore = new Map();
@@ -1002,13 +1118,23 @@ async function applySelection(body) {
     const itemsToAdd = [];
     for (const item of requested) {
       const existing = quantityInCart(before, item.product_id, item.sku_id);
+      const expected = existing + item.quantity;
+      if (
+        !Number.isInteger(existing)
+        || existing < 0
+        || !Number.isInteger(expected)
+        || expected > 100
+      ) {
+        throw new OperationError(
+          "quantity_limit",
+          "Количество товара в корзине не позволяет безопасно добавить рецепт.",
+        );
+      }
       quantitiesBefore.set(item.product_id, existing);
-      const target = Math.max(existing, item.quantity);
-      quantitiesExpected.set(item.product_id, target);
-      if (target === existing) continue;
+      quantitiesExpected.set(item.product_id, expected);
       // POST applies a positive delta. Never write an absolute
       // quantity here: a user may increase this SKU after the preceding read.
-      itemsToAdd.push({ ...item, delta: target - existing });
+      itemsToAdd.push({ ...item, delta: item.quantity });
     }
 
     const runMutation = async (mutationExpression) => {
@@ -1034,9 +1160,15 @@ async function applySelection(body) {
       );
     };
 
-    if (itemsToAdd.length > 0) {
-      await runMutation(addLegacyItemsExpression(context, itemsToAdd));
-    }
+    // Persist intent before crossing the mutation boundary. If the process or
+    // response is lost afterwards, a retry fails closed instead of adding the
+    // same recipe twice.
+    await storeOperationRecord(recordKey, {
+      status: "started",
+      fingerprint,
+      started_at: new Date().toISOString(),
+    });
+    await runMutation(addLegacyItemsExpression(context, itemsToAdd));
     const after = await readCartUntil(browser, context, (cart) => requested.every((item) => {
       const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
       return quantityInCart(cart, item.product_id, item.sku_id) === expectedQuantity;
@@ -1062,7 +1194,7 @@ async function applySelection(body) {
       scope,
       store,
       context,
-      operation_id: crypto.randomUUID(),
+      operation_id: operationId,
       items: cleanupItems.map((item) => ({
         product_id: item.product_id,
         sku_id: item.sku_id,
@@ -1079,6 +1211,16 @@ async function applySelection(body) {
       elapsed_ms: Date.now() - started,
     };
   }, mutationState, signedContext.store_url);
+  // A completed record is written only after withBrowser confirms that the
+  // persistent profile was closed. A replay can then return this exact result
+  // without touching Yandex or opening the profile again.
+  await storeOperationRecord(recordKey, {
+    status: "completed",
+    fingerprint,
+    completed_at: new Date().toISOString(),
+    result,
+  });
+  return result;
 }
 
 function validateCleanup(body, scope, store) {
@@ -1090,7 +1232,7 @@ function validateCleanup(body, scope, store) {
     );
   }
   const context = validatedContext(cleanup.context);
-  if (!/^[a-f0-9-]{36}$/.test(String(cleanup.operation_id || ""))) {
+  if (!cleanupOperationIdPattern.test(String(cleanup.operation_id || ""))) {
     throw new OperationError("invalid_cleanup", "Журнал очистки не содержит операцию.");
   }
   if (!Array.isArray(cleanup.items) || cleanup.items.length < 1 || cleanup.items.length > 24) {
@@ -1221,8 +1363,11 @@ export {
   boundedOperationTimeout,
   finalBrowserError,
   OperationError,
+  operationFingerprint,
   preserveMutationUncertainty,
+  readOperationRecord,
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
+  storeOperationRecord,
 };

@@ -318,6 +318,11 @@ def _adapter_status_result(
     }
 
 
+def _adapter_operation_id(run, store: str) -> str:
+    created = run.created_at.strftime("%Y%m%d%H%M%S%f")
+    return f"cart-run-{run.pk}-{created}-{store}"
+
+
 def _search_with_adapter(run, store: str) -> dict[str, Any]:
     scope = cart_browser_session_key(run.requested_by_id)
     ingredients = run.ingredient_snapshot
@@ -326,6 +331,7 @@ def _search_with_adapter(run, store: str) -> dict[str, Any]:
         {
             "scope": scope,
             "store": store,
+            "operation_id": _adapter_operation_id(run, store),
             "ingredients": [
                 {
                     "name": ingredient.get("name", ""),
@@ -419,6 +425,7 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
         {
             "scope": cart_browser_session_key(run.requested_by_id),
             "store": store,
+            "operation_id": _adapter_operation_id(run, store),
             "selection_token": selection_token,
             "items": [
                 {

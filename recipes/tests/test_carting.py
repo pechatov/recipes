@@ -1134,6 +1134,13 @@ class CartPipelineTests(TestCase):
         self.assertEqual(adapter_task.call_count, 2)
         self.assertEqual(adapter_task.call_args_list[0].args[0], "/v1/search")
         self.assertEqual(adapter_task.call_args_list[1].args[0], "/v1/apply")
+        search_operation = adapter_task.call_args_list[0].args[1]["operation_id"]
+        apply_operation = adapter_task.call_args_list[1].args[1]["operation_id"]
+        self.assertEqual(search_operation, apply_operation)
+        self.assertRegex(
+            search_operation,
+            rf"^cart-run-{run.pk}-[0-9]{{20}}-auchan$",
+        )
         self.assertFalse(adapter_task.call_args_list[0].kwargs["mutation_possible"])
         self.assertTrue(adapter_task.call_args_list[1].kwargs["mutation_possible"])
         run_task.assert_not_called()
