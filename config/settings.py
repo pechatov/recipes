@@ -140,6 +140,7 @@ CART_AI_MODEL = os.environ.get("CART_AI_MODEL", "").strip()
 CART_AI_TIMEOUT_SECONDS = int(os.environ.get("CART_AI_TIMEOUT_SECONDS", "900"))
 CART_ADAPTER_BASE_URL = os.environ.get("CART_ADAPTER_BASE_URL", "").strip().rstrip("/")
 CART_ADAPTER_API_KEY = os.environ.get("CART_ADAPTER_API_KEY", "").strip()
+CART_ADAPTER_CA_CERT_B64 = os.environ.get("CART_ADAPTER_CA_CERT_B64", "").strip()
 CART_ADAPTER_TIMEOUT_SECONDS = int(
     os.environ.get("CART_ADAPTER_TIMEOUT_SECONDS", "210")
 )

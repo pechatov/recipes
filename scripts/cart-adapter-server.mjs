@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import http from "node:http";
+import https from "node:https";
 import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { readFileSync } from "node:fs";
 import {
   mkdir,
   open as openFile,
@@ -22,6 +24,8 @@ const controlKey = process.env.CART_ADAPTER_CONTROL_KEY || "";
 const hermesRoot = process.env.HERMES_ROOT || "";
 const hermesHome = process.env.HERMES_HOME || "";
 const hermesPython = `${hermesRoot}/venv/bin/python`;
+const tlsCertPath = process.env.CART_ADAPTER_TLS_CERT || "";
+const tlsKeyPath = process.env.CART_ADAPTER_TLS_KEY || "";
 const operationStateFile = process.env.CART_ADAPTER_STATE_FILE
   || `${hermesHome}/cart-adapter-operations.json`;
 const quarantineStateFile = process.env.CART_ADAPTER_QUARANTINE_FILE
@@ -58,7 +62,16 @@ const stores = {
   lavka: ["яндекс лавка", "лавка", "yandex lavka"],
 };
 
-if (!controlKey || !hermesRoot || !hermesHome || !Number.isInteger(port)) {
+const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+const tlsEnabled = Boolean(tlsCertPath && tlsKeyPath);
+if (
+  !controlKey
+  || !hermesRoot
+  || !hermesHome
+  || !Number.isInteger(port)
+  || Boolean(tlsCertPath) !== Boolean(tlsKeyPath)
+  || (!tlsEnabled && !loopbackHosts.has(bindHost))
+) {
   throw new Error("Cart adapter service environment is incomplete");
 }
 
@@ -1504,7 +1517,7 @@ function errorBody(error) {
   };
 }
 
-const server = http.createServer(async (request, response) => {
+const handleRequest = async (request, response) => {
   const url = new URL(request.url, "http://cart-adapter.local");
   if (request.method === "GET" && url.pathname === "/healthz") {
     return sendJson(response, 200, { status: "ok" });
@@ -1541,7 +1554,18 @@ const server = http.createServer(async (request, response) => {
     }
     return sendJson(response, status, body);
   }
-});
+};
+
+const server = tlsEnabled
+  ? https.createServer(
+    {
+      cert: readFileSync(tlsCertPath),
+      key: readFileSync(tlsKeyPath),
+      minVersion: "TLSv1.2",
+    },
+    handleRequest,
+  )
+  : http.createServer(handleRequest);
 
 server.requestTimeout = 180_000;
 server.headersTimeout = 10_000;

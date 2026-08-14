@@ -52,7 +52,7 @@ if [[ -f "$HOME/.hermes/auth.json" ]]; then
 fi
 
 missing_packages=()
-for package in x11vnc novnc python3-websockify net-tools procps; do
+for package in x11vnc novnc python3-websockify net-tools procps openssl; do
   dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed' || missing_packages+=("$package")
 done
 if ((${#missing_packages[@]})); then
@@ -65,6 +65,31 @@ if [[ ! -x "$CAMOFOX_BIN" ]]; then
 fi
 npm install --prefix "$LOGIN_ROOT" --omit=dev --no-audit --no-fund http-proxy@1.18.1
 install -d -m 0700 "$PROFILE_HOME/camofox-profiles"
+
+ADAPTER_TLS_ROOT="$HOME/.local/share/recipes-cart-adapter/tls"
+install -d -m 0700 "$ADAPTER_TLS_ROOT"
+certificate_is_current=false
+if [[ -s "$ADAPTER_TLS_ROOT/server.key" && -s "$ADAPTER_TLS_ROOT/server.crt" ]] \
+  && openssl x509 -checkend 2592000 -noout \
+    -in "$ADAPTER_TLS_ROOT/server.crt" >/dev/null 2>&1; then
+  if openssl x509 -noout -ext subjectAltName \
+    -in "$ADAPTER_TLS_ROOT/server.crt" 2>/dev/null \
+    | grep -F "IP Address:$PI_ADDRESS" >/dev/null; then
+    certificate_is_current=true
+  fi
+fi
+if [[ "$certificate_is_current" != true ]]; then
+  tls_staging="$(mktemp -d)"
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 825 \
+    -subj "/CN=recipes-cart-adapter" \
+    -addext "subjectAltName=IP:$PI_ADDRESS" \
+    -keyout "$tls_staging/server.key" \
+    -out "$tls_staging/server.crt" >/dev/null 2>&1
+  install -m 0600 "$tls_staging/server.key" "$ADAPTER_TLS_ROOT/server.key"
+  install -m 0644 "$tls_staging/server.crt" "$ADAPTER_TLS_ROOT/server.crt"
+  rm -f "$tls_staging/server.key" "$tls_staging/server.crt"
+  rmdir "$tls_staging"
+fi
 
 # The upstream no-proxy defaults identify every context as en-US in Los
 # Angeles. That contradicts the Russian residential IP used here and is a
@@ -351,6 +376,8 @@ After=recipes-camofox.service recipes-browser-login.service network-online.targe
 Environment=PATH={home}/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CART_ADAPTER_BIND_HOST={os.environ['PI_ADDRESS']}
 Environment=CART_ADAPTER_PORT={os.environ['PI_ADAPTER_PORT']}
+Environment=CART_ADAPTER_TLS_CERT={home}/.local/share/recipes-cart-adapter/tls/server.crt
+Environment=CART_ADAPTER_TLS_KEY={home}/.local/share/recipes-cart-adapter/tls/server.key
 Environment=HERMES_ROOT={home}/.hermes/hermes-agent
 Environment=HERMES_HOME={home}/.hermes/profiles/{profile}
 EnvironmentFile={home}/.hermes/profiles/{profile}/.env
@@ -400,7 +427,8 @@ for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:9377/health" >/dev/null 2>&1 \
     && curl -fsS "http://$PI_ADDRESS:$PI_API_PORT/health" >/dev/null 2>&1 \
     && curl -fsS "http://$PI_ADDRESS:9380/healthz" >/dev/null 2>&1 \
-    && curl -fsS "http://$PI_ADDRESS:$PI_ADAPTER_PORT/healthz" >/dev/null 2>&1; then
+    && curl --cacert "$ADAPTER_TLS_ROOT/server.crt" -fsS \
+      "https://$PI_ADDRESS:$PI_ADAPTER_PORT/healthz" >/dev/null 2>&1; then
     exit 0
   fi
   sleep 1
@@ -410,8 +438,8 @@ exit 1
 REMOTE
 
 # Pass the bearer keys directly from Pi to the root-owned TrueNAS env file.
-ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY'], 'adapter': values['CART_ADAPTER_CONTROL_KEY']}))\"" \
-  | ssh "$TRUENAS_SSH_HOST" "sudo env TRUENAS_ENV='$TRUENAS_ENV' CART_BASE_URL='http://$PI_ADDRESS:$PI_API_PORT/v1' CART_ADAPTER_URL='http://$PI_ADDRESS:$PI_ADAPTER_PORT' python3 -c '
+ssh "$PI_SSH_HOST" "HERMES_PROFILE='$HERMES_PROFILE' python3 -c \"import base64, json, os; from pathlib import Path; values=dict(line.split('=',1) for line in (Path.home()/'.hermes/profiles'/os.environ['HERMES_PROFILE']/'.env').read_text().splitlines() if '=' in line and not line.startswith('#')); certificate=(Path.home()/'.local/share/recipes-cart-adapter/tls/server.crt').read_bytes(); print(json.dumps({'cart': values['API_SERVER_KEY'], 'browser': values['BROWSER_LOGIN_CONTROL_KEY'], 'adapter': values['CART_ADAPTER_CONTROL_KEY'], 'adapter_ca': base64.b64encode(certificate).decode()}))\"" \
+  | ssh "$TRUENAS_SSH_HOST" "sudo env TRUENAS_ENV='$TRUENAS_ENV' CART_BASE_URL='http://$PI_ADDRESS:$PI_API_PORT/v1' CART_ADAPTER_URL='https://$PI_ADDRESS:$PI_ADAPTER_PORT' python3 -c '
 import json
 import os
 import sys
@@ -419,11 +447,14 @@ from pathlib import Path
 
 path = Path(os.environ[\"TRUENAS_ENV\"])
 keys = json.loads(sys.stdin.read())
-if not all(keys.get(name) for name in (\"cart\", \"browser\", \"adapter\")) or not path.is_file():
+if not all(
+    keys.get(name) for name in (\"cart\", \"browser\", \"adapter\", \"adapter_ca\")
+) or not path.is_file():
     raise SystemExit(\"Missing cart automation key or TrueNAS application .env\")
 values = {
     \"CART_ADAPTER_BASE_URL\": os.environ[\"CART_ADAPTER_URL\"],
     \"CART_ADAPTER_API_KEY\": keys[\"adapter\"],
+    \"CART_ADAPTER_CA_CERT_B64\": keys[\"adapter_ca\"],
     \"CART_ADAPTER_TIMEOUT_SECONDS\": \"210\",
     \"CART_ADAPTER_FALLBACK_TO_HERMES\": \"true\",
     \"CART_AI_BASE_URL\": os.environ[\"CART_BASE_URL\"],

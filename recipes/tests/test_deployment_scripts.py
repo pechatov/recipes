@@ -86,7 +86,27 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         )
         self.assertIn("CART_ADAPTER_CONTROL_KEY", script)
         self.assertIn("CART_ADAPTER_BASE_URL", script)
+        self.assertIn("CART_ADAPTER_TLS_CERT", script)
+        self.assertIn("CART_ADAPTER_TLS_KEY", script)
+        self.assertIn("CART_ADAPTER_CA_CERT_B64", script)
+        self.assertIn("CART_ADAPTER_URL='https://$PI_ADDRESS:$PI_ADAPTER_PORT'", script)
+        self.assertIn('--cacert "$ADAPTER_TLS_ROOT/server.crt"', script)
+        self.assertNotIn(
+            "CART_ADAPTER_URL='http://$PI_ADDRESS:$PI_ADAPTER_PORT'",
+            script,
+        )
         self.assertIn("CART_ADAPTER_FALLBACK_TO_HERMES", script)
+
+        client = (ROOT / "recipes/carting/client.py").read_text()
+        self.assertIn("def _adapter_tls_context()", client)
+        self.assertIn("ssl.create_default_context(cadata=certificate)", client)
+        self.assertIn("verify=_adapter_tls_context()", client)
+
+        server = (ROOT / "scripts/cart-adapter-server.mjs").read_text()
+        self.assertIn("https.createServer(", server)
+        self.assertIn("cert: readFileSync(tlsCertPath)", server)
+        self.assertIn("key: readFileSync(tlsKeyPath)", server)
+        self.assertIn("(!tlsEnabled && !loopbackHosts.has(bindHost))", server)
 
     def test_adapter_exposes_only_bounded_cart_operations(self):
         server = (ROOT / "scripts/cart-adapter-server.mjs").read_text()

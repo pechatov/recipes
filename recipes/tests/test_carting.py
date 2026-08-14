@@ -2,6 +2,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import httpx
+from django.conf import settings
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError
@@ -1096,7 +1097,7 @@ class CartPipelineTests(TestCase):
         )
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
@@ -1166,7 +1167,7 @@ class CartPipelineTests(TestCase):
         run_task.assert_not_called()
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
@@ -1185,7 +1186,7 @@ class CartPipelineTests(TestCase):
         run_task.assert_called_once_with(run, "auchan", "assemble")
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
@@ -1209,7 +1210,7 @@ class CartPipelineTests(TestCase):
         run_task.assert_not_called()
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client.httpx.Client")
@@ -1226,9 +1227,32 @@ class CartPipelineTests(TestCase):
             )
 
         self.assertTrue(caught.exception.mutation_possible)
+        client.assert_called_once_with(
+            timeout=settings.CART_ADAPTER_TIMEOUT_SECONDS,
+            trust_env=False,
+            verify=True,
+        )
 
     @override_settings(
         CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+    )
+    @patch("recipes.carting.client.httpx.Client")
+    def test_adapter_rejects_plain_http_outside_loopback(self, client):
+        with self.assertRaisesMessage(
+            CartAgentError,
+            "Небезопасное подключение к адаптеру корзины запрещено.",
+        ):
+            _run_adapter_task(
+                "/v1/search",
+                {"scope": "recipes-cart-user-1", "store": "auchan"},
+                mutation_possible=False,
+            )
+
+        client.assert_not_called()
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client.httpx.Client")
@@ -1251,7 +1275,7 @@ class CartPipelineTests(TestCase):
         self.assertFalse(caught.exception.mutation_possible)
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
@@ -1300,7 +1324,7 @@ class CartPipelineTests(TestCase):
         run_task.assert_not_called()
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=False,
     )
@@ -1348,7 +1372,7 @@ class CartPipelineTests(TestCase):
         self.assertFalse(raised.exception.mutation_possible)
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
         CART_ADAPTER_FALLBACK_TO_HERMES=True,
     )
@@ -1394,7 +1418,7 @@ class CartPipelineTests(TestCase):
         run_task.assert_not_called()
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client._run_adapter_task")
@@ -1415,7 +1439,7 @@ class CartPipelineTests(TestCase):
         adapter_task.assert_called_once()
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client._run_adapter_task")
@@ -1443,7 +1467,7 @@ class CartPipelineTests(TestCase):
         )
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client._run_adapter_task")
@@ -1467,7 +1491,7 @@ class CartPipelineTests(TestCase):
         self.assertTrue(caught.exception.mutation_possible)
 
     @override_settings(
-        CART_ADAPTER_BASE_URL="http://adapter.example",
+        CART_ADAPTER_BASE_URL="https://adapter.example",
         CART_ADAPTER_API_KEY="adapter-key",
     )
     @patch("recipes.carting.client._run_adapter_task")

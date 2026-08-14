@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
+import ssl
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from django.conf import settings
@@ -123,6 +127,31 @@ def _adapter_url(path: str) -> str:
     if base.endswith("/v1") and path.startswith("/v1/"):
         return f"{base}{path[3:]}"
     return f"{base}{path}"
+
+
+def _adapter_tls_context() -> ssl.SSLContext | bool:
+    parsed = urlparse(settings.CART_ADAPTER_BASE_URL)
+    if parsed.scheme == "http":
+        if parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
+            raise CartAgentError(
+                "Небезопасное подключение к адаптеру корзины запрещено."
+            )
+        return True
+    if parsed.scheme != "https":
+        raise CartAgentError("Адрес адаптера корзины должен использовать HTTPS.")
+    encoded = settings.CART_ADAPTER_CA_CERT_B64
+    if not encoded:
+        return True
+    try:
+        certificate = base64.b64decode(encoded, validate=True).decode("ascii")
+    except (binascii.Error, UnicodeDecodeError) as error:
+        raise CartAgentError("Сертификат адаптера корзины повреждён.") from error
+    if len(certificate) > 32_768 or "-----BEGIN CERTIFICATE-----" not in certificate:
+        raise CartAgentError("Сертификат адаптера корзины повреждён.")
+    try:
+        return ssl.create_default_context(cadata=certificate)
+    except ssl.SSLError as error:
+        raise CartAgentError("Сертификат адаптера корзины повреждён.") from error
 
 
 def cart_browser_session_key(user_id: int, shard: int | None = None) -> str:
@@ -257,6 +286,7 @@ def _run_adapter_task(
         with httpx.Client(
             timeout=settings.CART_ADAPTER_TIMEOUT_SECONDS,
             trust_env=False,
+            verify=_adapter_tls_context(),
         ) as client:
             response = client.post(
                 _adapter_url(path),
