@@ -870,7 +870,7 @@ class CartProductMatchingTests(SimpleTestCase):
             [self.candidate(name="Яйца куриные 10 штук", weight="")],
         )
 
-        self.assertEqual(match["quality"], "exact")
+        self.assertEqual(match["quality"], "substitute")
         self.assertEqual(match["package_count"], 2)
 
     def test_unknown_count_pack_size_never_multiplies_packages(self):
@@ -903,6 +903,24 @@ class CartProductMatchingTests(SimpleTestCase):
 
                 self.assertEqual(match["quality"], "substitute")
                 self.assertEqual(match["package_count"], 1)
+
+    def test_single_word_query_with_extra_descriptor_requires_review(self):
+        for query, product_name in (
+            ("лук", "Лук-порей 1 шт"),
+            ("перец", "Перец острый"),
+        ):
+            with self.subTest(query=query):
+                match = choose_product(
+                    {
+                        "name": query.title(),
+                        "search_query": query,
+                        "quantity": "1",
+                        "unit": "шт",
+                    },
+                    [self.candidate(name=product_name, weight="")],
+                )
+
+                self.assertEqual(match["quality"], "substitute")
 
 
 class CartPipelineTests(TestCase):

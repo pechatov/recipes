@@ -51,17 +51,25 @@ function preserveMutationUncertainty(error, mutationPossible) {
   return preserved;
 }
 
-const operationQueues = new Map();
+const activeScopes = new Set();
 
-function serializeOperation(scope, operation) {
-  const previous = operationQueues.get(scope) || Promise.resolve();
-  const result = previous.then(operation, operation);
-  const settled = result.catch(() => {});
-  operationQueues.set(scope, settled);
-  settled.then(() => {
-    if (operationQueues.get(scope) === settled) operationQueues.delete(scope);
-  });
-  return result;
+async function runExclusiveOperation(scope, operation) {
+  if (activeScopes.has(scope)) {
+    // Never enqueue work that could begin after the caller's timeout. The
+    // active operation may still own the profile, so busy is uncertain and
+    // must not permit a Hermes fallback.
+    throw new OperationError(
+      "scope_busy",
+      "Другая операция с этой корзиной ещё выполняется.",
+      { mutationPossible: true },
+    );
+  }
+  activeScopes.add(scope);
+  try {
+    return await operation();
+  } finally {
+    activeScopes.delete(scope);
+  }
 }
 
 function safeEqual(left, right) {
@@ -1116,7 +1124,7 @@ const server = http.createServer(async (request, response) => {
     return sendJson(
       response,
       200,
-      await serializeOperation(text(body?.scope, 80), operation),
+      await runExclusiveOperation(text(body?.scope, 80), operation),
     );
   } catch (error) {
     const body = errorBody(error);
@@ -1142,4 +1150,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
 }
 
-export { errorBody, preserveMutationUncertainty };
+export { errorBody, preserveMutationUncertainty, runExclusiveOperation };

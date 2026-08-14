@@ -195,6 +195,24 @@ def _candidate_score(query_tokens: list[str], candidate: dict[str, Any], rank: i
         if any(token.startswith(modifier) for token in name_tokens)
         and not any(token.startswith(modifier) for token in query_tokens)
     ]
+    query_words = [
+        token
+        for token in query_tokens
+        if not token.replace(".", "", 1).isdigit() and _unit(token) is None
+    ]
+    if len(query_words) == 1:
+        extra_words = [
+            token
+            for token in name_tokens
+            if not token.replace(".", "", 1).isdigit()
+            and _unit(token) is None
+            and not any(_word_matches(token, query) for query in query_words)
+        ]
+        if extra_words:
+            # A generic one-word query cannot prove that an extra descriptor
+            # is merely a brand rather than a different ingredient (for
+            # example, "лук" vs "лук-порей"). Require user review.
+            unexpected_modifiers.append("additional_descriptor")
     score = coverage * 100 - rank * 1.5 - len(unexpected_modifiers) * 35
     if _contains_token(name_tokens, query_tokens[0]):
         score += 15
