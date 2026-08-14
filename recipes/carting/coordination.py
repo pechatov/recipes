@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.db.models import Q
 from django.utils import timezone
 
@@ -12,6 +14,7 @@ BROWSER_BLOCKING_STATUSES = [
     BrowserLoginSession.Status.STOPPING,
     BrowserLoginSession.Status.COMPLETING,
 ]
+BROWSER_LOGIN_TRANSITION_GRACE_SECONDS = 30
 
 
 def resume_cart_run_after_login(run: CartRun) -> None:
@@ -43,19 +46,23 @@ def resume_cart_run_after_login(run: CartRun) -> None:
 
 
 def reconcile_expired_browser_login_sessions() -> bool:
-    """Close expired controller sessions before releasing their database lock.
+    """Close expired or abandoned controller sessions before releasing their lock.
 
     The caller must hold CART_BROWSER_LOCK in a transaction. Returning False
     means at least one remote close was not confirmed and workers must wait.
     """
     now = timezone.now()
+    transition_cutoff = now - timedelta(
+        seconds=BROWSER_LOGIN_TRANSITION_GRACE_SECONDS
+    )
     sessions = list(
         BrowserLoginSession.objects.select_for_update().filter(
             Q(
                 status__in=[
                     BrowserLoginSession.Status.STOPPING,
                     BrowserLoginSession.Status.COMPLETING,
-                ]
+                ],
+                transition_started_at__lte=transition_cutoff,
             )
             | Q(
                 status__in=[
@@ -80,8 +87,11 @@ def reconcile_expired_browser_login_sessions() -> bool:
             login_session.error = "Окно входа закрыто при остановке сборки."
         else:
             login_session.status = BrowserLoginSession.Status.EXPIRED
+        login_session.transition_started_at = None
         login_session.finished_at = now
-        login_session.save(update_fields=["status", "finished_at", "error"])
+        login_session.save(
+            update_fields=["status", "transition_started_at", "finished_at", "error"]
+        )
         if (
             previous_status == BrowserLoginSession.Status.COMPLETING
             and login_session.run_id

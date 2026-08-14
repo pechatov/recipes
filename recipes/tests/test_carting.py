@@ -485,6 +485,7 @@ class CartViewTests(TestCase):
                 login_session.status,
                 BrowserLoginSession.Status.COMPLETING,
             )
+            self.assertIsNotNone(login_session.transition_started_at)
             self.assertTrue(browser_login_session_blocks_worker())
 
         stop_session.side_effect = observe_committed_transition
@@ -985,6 +986,38 @@ class CartViewTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.CANCELLED)
         self.assertIsNotNone(run.cleaned_at)
 
+    def test_stop_uses_latest_attempt_when_selected_attempt_is_not_set(self):
+        run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PROCESSING,
+            store_priority=["auchan"],
+            ingredient_snapshot=[],
+        )
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            result={
+                "added_items": [
+                    {
+                        "product_name": "Картофель",
+                        "product_url": "https://eda.yandex.ru/product/potato-12345678",
+                        "package_count": 1,
+                    }
+                ]
+            },
+        )
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertEqual(run.selected_attempt, attempt)
+        self.assertIsNone(run.cleaned_at)
+        self.assertIn("могли остаться товары", run.error)
+
     @override_settings(
         CART_AI_TIMEOUT_SECONDS=900,
         CART_ADAPTER_TIMEOUT_SECONDS=210,
@@ -1032,6 +1065,7 @@ class CartViewTests(TestCase):
                 login_session.status,
                 BrowserLoginSession.Status.STOPPING,
             )
+            self.assertIsNotNone(login_session.transition_started_at)
             self.assertTrue(browser_login_session_blocks_worker())
 
         stop_session.side_effect = observe_committed_transition
@@ -1078,6 +1112,7 @@ class CartViewTests(TestCase):
         login_session.refresh_from_db()
         self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
         self.assertEqual(login_session.status, BrowserLoginSession.Status.ACTIVE)
+        self.assertIsNone(login_session.transition_started_at)
 
 
 class CartProductMatchingTests(SimpleTestCase):
@@ -1563,7 +1598,7 @@ class CartPipelineTests(TestCase):
         stop_session.assert_called_once_with(login_session.remote_session_id)
 
     @patch("recipes.carting.coordination.stop_session")
-    def test_interrupted_login_stop_is_reconciled_without_waiting_for_expiry(
+    def test_interrupted_login_stop_is_reconciled_after_transition_grace(
         self,
         stop_session,
     ):
@@ -1579,6 +1614,7 @@ class CartPipelineTests(TestCase):
             user=self.user,
             remote_session_id="remote-session-id-1234567890",
             status=BrowserLoginSession.Status.STOPPING,
+            transition_started_at=timezone.now() - timedelta(seconds=31),
             expires_at=timezone.now() + timedelta(minutes=15),
         )
 
@@ -1607,6 +1643,7 @@ class CartPipelineTests(TestCase):
             run=run,
             remote_session_id="remote-session-id-1234567890",
             status=BrowserLoginSession.Status.COMPLETING,
+            transition_started_at=timezone.now() - timedelta(seconds=31),
             expires_at=timezone.now() + timedelta(minutes=15),
         )
 
@@ -1618,6 +1655,33 @@ class CartPipelineTests(TestCase):
         self.assertEqual(login_session.status, BrowserLoginSession.Status.COMPLETED)
         self.assertEqual(run.status, CartRun.Status.PROCESSING)
         stop_session.assert_called_once_with(login_session.remote_session_id)
+
+    @patch("recipes.carting.coordination.stop_session")
+    def test_fresh_login_transition_keeps_worker_blocked_without_duplicate_close(
+        self,
+        stop_session,
+    ):
+        pending_run = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.PENDING,
+            store_priority=["auchan"],
+            ingredient_snapshot=self.snapshot,
+        )
+        BrowserLoginSession.objects.create(
+            user=self.user,
+            remote_session_id="remote-session-id-1234567890",
+            status=BrowserLoginSession.Status.STOPPING,
+            transition_started_at=timezone.now(),
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        self.assertIsNone(claim_cart_run())
+
+        pending_run.refresh_from_db()
+        self.assertEqual(pending_run.status, CartRun.Status.PENDING)
+        stop_session.assert_not_called()
 
     @patch("recipes.carting.client.run_store_cart_task")
     def test_single_ingredient_keeps_legacy_agent_call(self, run_task):
