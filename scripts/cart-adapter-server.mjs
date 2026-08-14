@@ -24,6 +24,8 @@ const hermesHome = process.env.HERMES_HOME || "";
 const hermesPython = `${hermesRoot}/venv/bin/python`;
 const operationStateFile = process.env.CART_ADAPTER_STATE_FILE
   || `${hermesHome}/cart-adapter-operations.json`;
+const quarantineStateFile = process.env.CART_ADAPTER_QUARANTINE_FILE
+  || `${hermesHome}/cart-adapter-quarantine.json`;
 const camofoxUrl = (process.env.CAMOFOX_URL || "http://127.0.0.1:9377").replace(/\/$/, "");
 const camofoxAccessKey = process.env.CAMOFOX_ACCESS_KEY || process.env.CAMOFOX_API_KEY || "";
 const scopePattern = /^recipes-cart-user-[1-9][0-9]*$/;
@@ -76,12 +78,18 @@ function preserveMutationUncertainty(error, mutationPossible) {
   return preserved;
 }
 
+function markProfileUncertain(error) {
+  const uncertain = preserveMutationUncertainty(error, true);
+  uncertain.profileUncertain = true;
+  return uncertain;
+}
+
 function finalBrowserError(operationError, closeError, mutationPossible) {
   if (closeError) {
     // Even a read-only operation is no longer safe to hand to Hermes when the
     // adapter could not release its persistent profile. Preserve the useful
     // original error code while making the ownership uncertainty explicit.
-    return preserveMutationUncertainty(operationError || closeError, true);
+    return markProfileUncertain(operationError || closeError);
   }
   return operationError
     ? preserveMutationUncertainty(operationError, mutationPossible)
@@ -147,10 +155,10 @@ async function readOperationRecord(key) {
   return Object.hasOwn(records, key) ? records[key] : null;
 }
 
-async function durableWriteOperationState(serialized) {
-  const parent = dirname(operationStateFile);
+async function durableWriteState(target, serialized) {
+  const parent = dirname(target);
   await mkdir(parent, { recursive: true, mode: 0o700 });
-  const temporary = `${operationStateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
   let renamed = false;
   try {
     const file = await openFile(temporary, "w", 0o600);
@@ -160,7 +168,7 @@ async function durableWriteOperationState(serialized) {
     } finally {
       await file.close();
     }
-    await rename(temporary, operationStateFile);
+    await rename(temporary, target);
     renamed = true;
     const directory = await openFile(parent, "r");
     try {
@@ -188,7 +196,7 @@ async function storeOperationRecord(key, record) {
     if (Buffer.byteLength(serialized) > maximumOperationStateBytes) {
       throw operationStateError();
     }
-    await durableWriteOperationState(serialized);
+    await durableWriteState(operationStateFile, serialized);
   });
   operationWriteQueue = write.catch(() => {});
   try {
@@ -216,6 +224,88 @@ function operationFingerprint(scope, store, requested) {
     .digest("hex");
 }
 
+let quarantinedScopesPromise = null;
+let quarantineWriteQueue = Promise.resolve();
+
+function quarantineError(message = "Профиль корзины требует безопасного восстановления.") {
+  return markProfileUncertain(new OperationError(
+    "profile_quarantined",
+    message,
+    { mutationPossible: true },
+  ));
+}
+
+async function loadQuarantinedScopes() {
+  if (!quarantinedScopesPromise) {
+    quarantinedScopesPromise = (async () => {
+      try {
+        const information = await stat(quarantineStateFile);
+        if (information.size > 1_048_576) throw new Error("quarantine is too large");
+        const parsed = JSON.parse(await readFile(quarantineStateFile, "utf8"));
+        if (
+          !Array.isArray(parsed)
+          || parsed.length > 10_000
+          || parsed.some((scope) => !scopePattern.test(String(scope)))
+        ) {
+          throw new Error("invalid quarantine state");
+        }
+        return new Set(parsed.map(String));
+      } catch (error) {
+        if (error?.code === "ENOENT") return new Set();
+        throw quarantineError("Журнал карантина профилей недоступен.");
+      }
+    })();
+  }
+  return quarantinedScopesPromise;
+}
+
+async function persistQuarantinedScopes(scopes) {
+  const serialized = JSON.stringify([...scopes].sort());
+  if (Buffer.byteLength(serialized) > 1_048_576) throw quarantineError();
+  await durableWriteState(quarantineStateFile, serialized);
+}
+
+async function quarantineScope(scope) {
+  const write = quarantineWriteQueue.then(async () => {
+    const scopes = await loadQuarantinedScopes();
+    scopes.add(scope);
+    await persistQuarantinedScopes(scopes);
+  });
+  quarantineWriteQueue = write.catch(() => {});
+  await write;
+}
+
+async function releaseScopeQuarantine(scope) {
+  const write = quarantineWriteQueue.then(async () => {
+    const scopes = await loadQuarantinedScopes();
+    if (!scopes.has(scope)) return;
+    const remaining = new Set(scopes);
+    remaining.delete(scope);
+    await persistQuarantinedScopes(remaining);
+    scopes.delete(scope);
+  });
+  quarantineWriteQueue = write.catch(() => {});
+  await write;
+}
+
+async function isScopeQuarantined(scope) {
+  await quarantineWriteQueue;
+  return (await loadQuarantinedScopes()).has(scope);
+}
+
+async function recoverQuarantinedScope(scope) {
+  if (!await isScopeQuarantined(scope)) return;
+  try {
+    const identity = await camofoxIdentity(scope);
+    await closeBrowser(identity.user_id);
+    await releaseScopeQuarantine(scope);
+  } catch (error) {
+    throw quarantineError(
+      error?.message || "Профиль корзины пока не удалось безопасно восстановить.",
+    );
+  }
+}
+
 const activeScopes = new Set();
 
 async function runExclusiveOperation(scope, operation) {
@@ -231,7 +321,17 @@ async function runExclusiveOperation(scope, operation) {
   }
   activeScopes.add(scope);
   try {
+    await recoverQuarantinedScope(scope);
     return await operation();
+  } catch (error) {
+    if (error?.profileUncertain) {
+      try {
+        await quarantineScope(scope);
+      } catch (quarantineFailure) {
+        throw quarantineError(quarantineFailure?.message);
+      }
+    }
+    throw error;
   } finally {
     activeScopes.delete(scope);
   }
@@ -389,16 +489,26 @@ async function openBrowser(scope, initialUrl = "https://eda.yandex.ru/retail") {
     });
   } catch (error) {
     // A lost create response may still have opened the persistent profile,
-    // but without a tab id the adapter cannot confirm or close that session.
-    throw preserveMutationUncertainty(error, true);
+    // so attempt an immediate close and quarantine the scope until a later
+    // request confirms another close. This also covers a delayed create that
+    // races the first cleanup request.
+    try {
+      await closeBrowser(identity.user_id);
+    } catch {}
+    throw markProfileUncertain(error);
   }
   const tabId = String(opened.tabId || opened.id || "");
   if (!tabId) {
-    throw new OperationError(
+    const missingTab = new OperationError(
       "browser_unavailable",
       "Браузер не вернул вкладку.",
-      { mutationPossible: true },
     );
+    try {
+      await closeBrowser(identity.user_id);
+    } catch {
+      throw markProfileUncertain(missingTab);
+    }
+    throw missingTab;
   }
   return { identity, tabId };
 }
@@ -1434,13 +1544,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   errorBody,
   boundedOperationTimeout,
-  durableWriteOperationState,
+  durableWriteState,
   finalBrowserError,
+  isScopeQuarantined,
+  markProfileUncertain,
   OperationError,
   operationFingerprint,
   pruneOperationRecords,
   preserveMutationUncertainty,
+  quarantineScope,
   readOperationRecord,
+  releaseScopeQuarantine,
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,

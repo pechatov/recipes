@@ -6,16 +6,20 @@ process.env.CART_ADAPTER_CONTROL_KEY = "test-control-key";
 process.env.HERMES_ROOT = "/tmp/test-hermes";
 process.env.HERMES_HOME = "/tmp/test-hermes-home";
 process.env.CART_ADAPTER_STATE_FILE = `/tmp/recipes-cart-adapter-${process.pid}.json`;
+process.env.CART_ADAPTER_QUARANTINE_FILE = `/tmp/recipes-cart-quarantine-${process.pid}.json`;
 
 const {
   boundedOperationTimeout,
   errorBody,
   finalBrowserError,
+  isScopeQuarantined,
   OperationError,
   operationFingerprint,
   pruneOperationRecords,
   preserveMutationUncertainty,
+  quarantineScope,
   readOperationRecord,
+  releaseScopeQuarantine,
   runExclusiveOperation,
   runWithOperationDeadline,
   sameLocation,
@@ -68,6 +72,13 @@ assert.equal(
 );
 await unlink(process.env.CART_ADAPTER_STATE_FILE);
 
+await quarantineScope("recipes-cart-user-42");
+assert.equal(await isScopeQuarantined("recipes-cart-user-42"), true);
+assert.equal((await stat(process.env.CART_ADAPTER_QUARANTINE_FILE)).mode & 0o777, 0o600);
+await releaseScopeQuarantine("recipes-cart-user-42");
+assert.equal(await isScopeQuarantined("recipes-cart-user-42"), false);
+await unlink(process.env.CART_ADAPTER_QUARANTINE_FILE);
+
 const retentionNow = Date.parse("2026-08-14T00:00:00Z");
 const retentionRecords = {
   recent: {
@@ -104,6 +115,7 @@ assert.equal(
   searchError,
 );
 assert.equal(searchError.mutationPossible, true);
+assert.equal(searchError.profileUncertain, true);
 
 const unavailableAfterCloseFailure = new OperationError(
   "store_unavailable",
@@ -132,15 +144,21 @@ assert.equal(
 );
 
 let releaseFirst;
+let announceFirstStart;
 const firstMayFinish = new Promise((resolve) => {
   releaseFirst = resolve;
+});
+const firstHasStarted = new Promise((resolve) => {
+  announceFirstStart = resolve;
 });
 let starts = 0;
 const first = runExclusiveOperation("same-cart", async () => {
   starts += 1;
+  announceFirstStart();
   await firstMayFinish;
   return "first";
 });
+await firstHasStarted;
 await assert.rejects(
   runExclusiveOperation("same-cart", async () => {
     starts += 1;

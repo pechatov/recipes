@@ -114,7 +114,7 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn('{ mutationPossible: true }', server)
         self.assertIn("function preserveMutationUncertainty", server)
         self.assertIn("function finalBrowserError", server)
-        self.assertIn("operationError || closeError, true", server)
+        self.assertIn("markProfileUncertain(operationError || closeError)", server)
         self.assertIn("Boolean(error?.mutationPossible)", server)
         self.assertIn(
             'status: "incomplete", summary: error.message, '
@@ -148,8 +148,13 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("await storeOperationRecord(recordKey", server)
         self.assertIn("await file.writeFile(serialized)", server)
         self.assertIn("await file.sync()", server)
-        self.assertIn("await rename(temporary, operationStateFile)", server)
+        self.assertIn("await rename(temporary, target)", server)
         self.assertIn("await directory.sync()", server)
+        self.assertIn("cart-adapter-quarantine.json", server)
+        self.assertIn("function markProfileUncertain", server)
+        self.assertIn("await recoverQuarantinedScope(scope)", server)
+        self.assertIn("await quarantineScope(scope)", server)
+        self.assertIn("await closeBrowser(identity.user_id)", server)
         self.assertIn("itemsToAdd.push({ ...item, delta: item.quantity })", server)
         self.assertIn("const expected = existing + item.quantity", server)
         self.assertNotIn("Math.max(existing, item.quantity)", server)
