@@ -13,6 +13,7 @@ const {
   finalBrowserError,
   OperationError,
   operationFingerprint,
+  pruneOperationRecords,
   preserveMutationUncertainty,
   readOperationRecord,
   runExclusiveOperation,
@@ -43,18 +44,22 @@ assert.notEqual(
   ]),
 );
 
+const testStartedAt = new Date().toISOString();
 await storeOperationRecord("scope:operation", {
   status: "started",
   fingerprint: "fingerprint",
+  started_at: testStartedAt,
 });
 assert.deepEqual(await readOperationRecord("scope:operation"), {
   status: "started",
   fingerprint: "fingerprint",
+  started_at: testStartedAt,
 });
 assert.equal((await stat(process.env.CART_ADAPTER_STATE_FILE)).mode & 0o777, 0o600);
 await storeOperationRecord("scope:operation", {
   status: "completed",
   fingerprint: "fingerprint",
+  completed_at: new Date().toISOString(),
   result: { status: "applied" },
 });
 assert.equal(
@@ -62,6 +67,24 @@ assert.equal(
   "applied",
 );
 await unlink(process.env.CART_ADAPTER_STATE_FILE);
+
+const retentionNow = Date.parse("2026-08-14T00:00:00Z");
+const retentionRecords = {
+  recent: {
+    status: "completed",
+    completed_at: "2026-08-13T00:00:00Z",
+  },
+  expiredCompleted: {
+    status: "completed",
+    completed_at: "2026-06-01T00:00:00Z",
+  },
+  expiredStarted: {
+    status: "started",
+    started_at: "2026-01-01T00:00:00Z",
+  },
+};
+pruneOperationRecords(retentionRecords, retentionNow);
+assert.deepEqual(Object.keys(retentionRecords), ["recent"]);
 
 const internalError = preserveMutationUncertainty(
   new Error("failed after dispatch"),

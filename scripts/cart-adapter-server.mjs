@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -36,6 +36,10 @@ const operationDeadline = new AsyncLocalStorage();
 // Django caps confirmation at seven days. The extra day ensures a journal
 // created before the worker persists its deadline still outlives that deadline.
 const cleanupTokenLifetimeMs = 8 * 24 * 60 * 60 * 1000;
+const completedOperationRetentionMs = 30 * 24 * 60 * 60 * 1000;
+const startedOperationRetentionMs = 90 * 24 * 60 * 60 * 1000;
+const maximumOperationRecords = 2_000;
+const maximumOperationStateBytes = 16 * 1024 * 1024;
 const selectionKey = crypto.createHash("sha256").update(controlKey).digest();
 const stores = {
   auchan: ["ашан", "auchan"],
@@ -80,22 +84,50 @@ function finalBrowserError(operationError, closeError, mutationPossible) {
 let operationRecordsPromise = null;
 let operationWriteQueue = Promise.resolve();
 
+function operationStateError() {
+  return new OperationError(
+    "operation_state_unavailable",
+    "Журнал операций корзины недоступен; проверьте корзину вручную.",
+    { mutationPossible: true },
+  );
+}
+
+function pruneOperationRecords(records, now = Date.now()) {
+  for (const [key, record] of Object.entries(records)) {
+    if (!record || typeof record !== "object") throw operationStateError();
+    const timestamp = Date.parse(
+      record.status === "completed" ? record.completed_at : record.started_at,
+    );
+    const retention = record.status === "completed"
+      ? completedOperationRetentionMs
+      : record.status === "started"
+        ? startedOperationRetentionMs
+        : 0;
+    if (!retention || !Number.isFinite(timestamp)) throw operationStateError();
+    if (now - timestamp > retention) delete records[key];
+  }
+  return records;
+}
+
 async function loadOperationRecords() {
   if (!operationRecordsPromise) {
     operationRecordsPromise = (async () => {
       try {
+        const information = await stat(operationStateFile);
+        if (information.size > maximumOperationStateBytes) {
+          throw new Error("operation state is too large");
+        }
         const parsed = JSON.parse(await readFile(operationStateFile, "utf8"));
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
           throw new Error("invalid operation state");
         }
-        return Object.assign(Object.create(null), parsed);
+        return pruneOperationRecords(
+          Object.assign(Object.create(null), parsed),
+        );
       } catch (error) {
         if (error?.code === "ENOENT") return Object.create(null);
-        throw new OperationError(
-          "operation_state_unavailable",
-          "Журнал операций корзины недоступен; проверьте корзину вручную.",
-          { mutationPossible: true },
-        );
+        if (error instanceof OperationError) throw error;
+        throw operationStateError();
       }
     })();
   }
@@ -111,10 +143,21 @@ async function readOperationRecord(key) {
 async function storeOperationRecord(key, record) {
   const write = operationWriteQueue.then(async () => {
     const records = await loadOperationRecords();
+    pruneOperationRecords(records);
+    if (
+      !Object.hasOwn(records, key)
+      && Object.keys(records).length >= maximumOperationRecords
+    ) {
+      throw operationStateError();
+    }
     records[key] = record;
     await mkdir(dirname(operationStateFile), { recursive: true, mode: 0o700 });
     const temporary = `${operationStateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
+    const serialized = JSON.stringify(records);
+    if (Buffer.byteLength(serialized) > maximumOperationStateBytes) {
+      throw operationStateError();
+    }
+    await writeFile(temporary, serialized, { mode: 0o600 });
     await rename(temporary, operationStateFile);
   });
   operationWriteQueue = write.catch(() => {});
@@ -1364,6 +1407,7 @@ export {
   finalBrowserError,
   OperationError,
   operationFingerprint,
+  pruneOperationRecords,
   preserveMutationUncertainty,
   readOperationRecord,
   runExclusiveOperation,

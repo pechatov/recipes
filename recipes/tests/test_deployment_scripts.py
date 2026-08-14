@@ -133,11 +133,16 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("if (!sameLocation(state, context))", server)
         self.assertIn("latitude: currentContext.latitude", server)
         self.assertIn("cart-adapter-operations.json", server)
+        self.assertIn("completedOperationRetentionMs = 30 * 24", server)
+        self.assertIn("startedOperationRetentionMs = 90 * 24", server)
+        self.assertIn("maximumOperationRecords = 2_000", server)
+        self.assertIn("maximumOperationStateBytes = 16 * 1024 * 1024", server)
+        self.assertIn("pruneOperationRecords(records)", server)
         self.assertIn('status: "started"', server)
         self.assertIn('status: "completed"', server)
         self.assertIn("await storeOperationRecord(recordKey", server)
         self.assertIn(
-            "await writeFile(temporary, JSON.stringify(records), { mode: 0o600 })",
+            "await writeFile(temporary, serialized, { mode: 0o600 })",
             server,
         )
         self.assertIn("itemsToAdd.push({ ...item, delta: item.quantity })", server)
