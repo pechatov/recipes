@@ -38,7 +38,7 @@ from recipes.models import (
     RecipeIngredient,
     StorePreference,
 )
-from recipes.services import get_store_preferences
+from recipes.services import get_store_preferences, select_store
 
 
 class CartViewTests(TestCase):
@@ -458,6 +458,21 @@ class CartViewTests(TestCase):
             self.user.store_preferences.filter(enabled=True).values_list("store", flat=True)
         )
         self.assertEqual(enabled, ["lavka"])
+
+    def test_reselecting_current_store_keeps_exactly_one_store_enabled(self):
+        get_store_preferences(self.user)
+
+        selected = select_store(self.user, StorePreference.Store.AUCHAN)
+
+        self.assertTrue(selected.enabled)
+        self.assertEqual(
+            list(
+                self.user.store_preferences.filter(enabled=True).values_list(
+                    "store", flat=True
+                )
+            ),
+            [StorePreference.Store.AUCHAN],
+        )
 
     def test_store_selection_returns_to_shopping_list(self):
         get_store_preferences(self.user)
@@ -1043,6 +1058,71 @@ class CartPipelineTests(TestCase):
         self.assertEqual(run.status, CartRun.Status.FAILED)
         self.assertEqual(run.error, assemble.return_value["summary"])
         self.assertEqual(run.selected_attempt.store, "auchan")
+        self.assertEqual(assemble.call_count, 1)
+
+    @patch("recipes.carting.pipeline.cleanup_store_cart")
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_unavailable_store_with_additions_is_cleaned_before_failure(
+        self,
+        assemble,
+        cleanup,
+    ):
+        assemble.return_value = {
+            "status": "failed",
+            "reason": "store_unavailable",
+            "summary": "Противоречивый ответ",
+            "cart_url": "https://eda.yandex.ru/cart",
+            "cart_cleared": False,
+            "items": [
+                {
+                    "ingredient_name": "Спагетти",
+                    "product_name": "Спагетти 450 г",
+                    "product_url": "https://eda.yandex.ru/product/sku-pasta-1",
+                    "package_count": 1,
+                    "added_package_count": 1,
+                    "quality": "exact",
+                }
+            ],
+        }
+        cleanup.return_value = {"status": "cleared", "summary": "Очищено"}
+        run = self.make_run(["auchan", "perekrestok"])
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        attempt = run.attempts.get(store="auchan")
+        attempt.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.FAILED)
+        self.assertEqual(attempt.status, CartAttempt.Status.FAILED)
+        self.assertTrue(attempt.result["cart_cleared"])
+        self.assertFalse(attempt.result["mutation_unknown"])
+        self.assertEqual(assemble.call_count, 1)
+        cleanup.assert_called_once()
+
+    @patch("recipes.carting.pipeline.assemble_store_cart")
+    def test_unavailable_store_without_cleanup_proof_requires_manual_check(
+        self,
+        assemble,
+    ):
+        assemble.return_value = {
+            "status": "failed",
+            "reason": "store_unavailable",
+            "summary": "Не удалось проверить доступность",
+            "cart_cleared": False,
+            "items": [],
+        }
+        run = self.make_run(["auchan", "perekrestok"])
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        attempt = run.attempts.get(store="auchan")
+        self.assertEqual(run.status, CartRun.Status.MANUAL_CHECK)
+        self.assertTrue(attempt.result["mutation_unknown"])
+        self.assertEqual(
+            attempt.result["validation_error"],
+            "inconsistent_store_unavailable_result",
+        )
         self.assertEqual(assemble.call_count, 1)
 
     @patch("recipes.carting.pipeline.assemble_store_cart")

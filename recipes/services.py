@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import quote_plus
 
+from django.db import transaction
+
 from .models import RecipeIngredient, StorePreference, is_water_ingredient_name
 
 
@@ -104,12 +106,17 @@ def get_selected_store(user) -> StorePreference:
 
 
 def select_store(user, store: str) -> StorePreference:
-    preferences = get_store_preferences(user)
-    selected = next((item for item in preferences if item.store == store), None)
-    if selected is None:
-        raise ValueError("Unknown store")
-    user.store_preferences.exclude(pk=selected.pk).update(enabled=False)
-    if not selected.enabled:
+    with transaction.atomic():
+        # Lock the parent row rather than only the existing preferences: this
+        # also serializes first-time selection while defaults are being made.
+        locked_user = (
+            user.__class__._default_manager.select_for_update().get(pk=user.pk)
+        )
+        preferences = get_store_preferences(locked_user)
+        selected = next((item for item in preferences if item.store == store), None)
+        if selected is None:
+            raise ValueError("Unknown store")
+        locked_user.store_preferences.exclude(pk=selected.pk).update(enabled=False)
+        locked_user.store_preferences.filter(pk=selected.pk).update(enabled=True)
         selected.enabled = True
-        selected.save(update_fields=["enabled"])
-    return selected
+        return selected
