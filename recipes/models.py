@@ -487,6 +487,11 @@ class StorePreference(models.Model):
     store = models.CharField("магазин", max_length=24, choices=Store.choices)
     position = models.PositiveSmallIntegerField("приоритет", default=0)
     enabled = models.BooleanField("использовать", default=True)
+    legacy_enabled_before_single_selection = models.BooleanField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
 
     class Meta:
         ordering = ["position", "pk"]

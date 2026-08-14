@@ -40,7 +40,7 @@ class StoreSelectionMigrationTests(TransactionTestCase):
         self.executor.migrate(self.executor.loader.graph.leaf_nodes())
         super().tearDown()
 
-    def test_forward_selection_and_rollback_restore_legacy_fallbacks(self):
+    def test_forward_selection_and_rollback_restore_exact_legacy_flags(self):
         self.executor = MigrationExecutor(connection)
         self.executor.migrate([self.migrate_to])
         new_apps = self.executor.loader.project_state([self.migrate_to]).apps
@@ -60,11 +60,14 @@ class StoreSelectionMigrationTests(TransactionTestCase):
         old_apps = self.executor.loader.project_state([self.migrate_from]).apps
         StorePreference = old_apps.get_model("recipes", "StorePreference")
         self.assertEqual(
-            set(
-                StorePreference.objects.filter(
-                    user_id=self.user_id,
-                    enabled=True,
-                ).values_list("store", flat=True)
+            dict(
+                StorePreference.objects.filter(user_id=self.user_id).values_list(
+                    "store", "enabled"
+                )
             ),
-            {"auchan", "perekrestok", "lavka"},
+            {
+                "auchan": False,
+                "perekrestok": True,
+                "lavka": True,
+            },
         )

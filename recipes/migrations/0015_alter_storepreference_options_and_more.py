@@ -6,6 +6,9 @@ from django.db import migrations, models
 
 def select_one_store_per_user(apps, schema_editor):
     StorePreference = apps.get_model("recipes", "StorePreference")
+    StorePreference.objects.update(
+        legacy_enabled_before_single_selection=models.F("enabled")
+    )
     user_ids = StorePreference.objects.values_list("user_id", flat=True).distinct()
     for user_id in user_ids.iterator():
         preferences = list(
@@ -20,10 +23,9 @@ def select_one_store_per_user(apps, schema_editor):
 
 def restore_legacy_store_selection(apps, schema_editor):
     StorePreference = apps.get_model("recipes", "StorePreference")
-    # The legacy pipeline accepted multiple enabled stores. Enabling every
-    # existing preference gives a rolled-back application a complete fallback
-    # list instead of silently limiting it to the single new-style selection.
-    StorePreference.objects.update(enabled=True)
+    StorePreference.objects.filter(
+        legacy_enabled_before_single_selection__isnull=False
+    ).update(enabled=models.F("legacy_enabled_before_single_selection"))
 
 
 class Migration(migrations.Migration):
@@ -34,6 +36,11 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        migrations.AddField(
+            model_name='storepreference',
+            name='legacy_enabled_before_single_selection',
+            field=models.BooleanField(blank=True, editable=False, null=True),
+        ),
         migrations.AlterModelOptions(
             name='storepreference',
             options={'ordering': ['position', 'pk'], 'verbose_name': 'магазин пользователя', 'verbose_name_plural': 'магазины пользователей'},
