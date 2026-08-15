@@ -8,7 +8,11 @@
   </header>
 
   <section class="cart-run-status status-{{ run.status }}">
-    {% if run.status == 'pending' or run.status == 'processing' %}
+    {% if run.stop_is_pending %}
+      <div class="status-orb is-working">…</div>
+      <h2>Останавливаем сборку</h2>
+      <p>Текущая операция с браузером должна безопасно завершиться. После этого задача остановится автоматически.</p>
+    {% elif run.status == 'pending' or run.status == 'processing' %}
       <div class="status-orb is-working">…</div>
       <h2>{% if run.status == 'pending' %}Ожидает своей очереди{% else %}Сервис собирает корзину{% endif %}</h2>
       <p>Товары ищутся параллельно; обычно сборка занимает несколько десятков секунд. Эту страницу можно закрыть.</p>
@@ -39,7 +43,11 @@
     {% elif run.status == 'cancelled' %}
       <div class="status-orb is-done">✓</div>
       <h2>Сборка отменена</h2>
-      <p>Добавленные этой попыткой товары удалены из корзины.</p>
+      {% if run.cleaned_at %}
+        <p>Эта задача больше не активна; известных добавлений в корзине не осталось.</p>
+      {% else %}
+        <p>{{ run.error|default:"Задача остановлена. Перед новой сборкой проверьте корзину Яндекс Еды." }}</p>
+      {% endif %}
     {% elif run.status == 'login_required' %}
       <div class="status-orb is-error">↗</div>
       <h2>Нужно подтвердить браузер</h2>
@@ -71,10 +79,7 @@
         {% endif %}
       {% endif %}
       {% if run.status == 'login_required' %}
-        <form method="post" action="{% url 'cart-browser-login-start' run.pk %}">
-          {% csrf_token %}
-          <button class="button" type="submit">Войти в Яндекс Еду</button>
-        </form>
+        <a class="button" href="{% url 'yandex-connection' %}?run={{ run.pk }}">Привязать Яндекс Еду</a>
         <form method="post" action="{% url 'cart-retry' run.pk %}">
           {% csrf_token %}
           <button class="button button-secondary" type="submit">Уже вошли — продолжить</button>
@@ -99,6 +104,12 @@
           <button class="button button-secondary" type="submit">Найти в другом магазине</button>
         </form>
         {% endif %}
+      {% endif %}
+      {% if run.can_stop %}
+        <form method="post" action="{% url 'cart-stop' run.pk %}">
+          {% csrf_token %}
+          <button class="button button-danger" type="submit">{% if run.stop_is_pending %}Проверить остановку ещё раз{% else %}Остановить сборку{% endif %}</button>
+        </form>
       {% endif %}
     </div>
   </section>

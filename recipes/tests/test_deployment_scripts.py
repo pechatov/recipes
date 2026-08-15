@@ -68,6 +68,25 @@ class BrowserLoginDeploymentContractTests(SimpleTestCase):
             server,
         )
 
+    def test_uncertain_cart_operation_is_fenced_before_profile_release(self):
+        server = (ROOT / "scripts/browser-login-server.mjs").read_text()
+        script = (ROOT / "scripts/connect-hermes-cart-pi.sh").read_text()
+
+        begin = server.index("async function recoverAutomationScope")
+        end = server.index("async function recoverInterruptedSession", begin)
+        recovery = server[begin:end]
+        stop = recovery.index('systemctlRecoveryUnits("stop")')
+        close = recovery.index("closeCamofoxUser(identity.user_id)")
+        start = recovery.index('systemctlRecoveryUnits("start")')
+        self.assertLess(stop, close)
+        self.assertLess(close, start)
+        self.assertIn('url.pathname === "/v1/recoveries"', server)
+        self.assertIn(
+            "BROWSER_RECOVERY_UNITS=recipes-cart-adapter.service,"
+            "hermes-gateway-{profile}.service",
+            script,
+        )
+
     def test_browser_proxy_forwards_only_its_dedicated_cookie(self):
         script = (ROOT / "scripts/deploy/configure-npm-proxy.sh").read_text()
 

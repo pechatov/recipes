@@ -559,6 +559,8 @@ class CartRun(models.Model):
     confirmed_at = models.DateTimeField(null=True, blank=True)
     cleanup_requested_at = models.DateTimeField(null=True, blank=True)
     cleaned_at = models.DateTimeField(null=True, blank=True)
+    cancellation_requested_at = models.DateTimeField(null=True, blank=True)
+    browser_operation_started_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -578,11 +580,31 @@ class CartRun(models.Model):
             self.Status.MANUAL_CHECK,
         }
 
+    @property
+    def can_stop(self):
+        return self.status in {
+            self.Status.PENDING,
+            self.Status.PROCESSING,
+            self.Status.CLEANUP_PENDING,
+            self.Status.CLEANING,
+            self.Status.MANUAL_CHECK,
+            self.Status.LOGIN_REQUIRED,
+        }
+
+    @property
+    def stop_is_pending(self):
+        return bool(
+            self.cancellation_requested_at
+            and self.status in {self.Status.PROCESSING, self.Status.CLEANING}
+        )
+
 
 class BrowserLoginSession(models.Model):
     class Status(models.TextChoices):
         STARTING = "starting", "Запускается"
         ACTIVE = "active", "Открыта"
+        STOPPING = "stopping", "Закрывается"
+        COMPLETING = "completing", "Сохраняется"
         COMPLETED = "completed", "Сохранена"
         EXPIRED = "expired", "Истекла"
         FAILED = "failed", "Ошибка"
@@ -609,6 +631,7 @@ class BrowserLoginSession(models.Model):
     error = models.CharField(max_length=500, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(db_index=True)
+    transition_started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

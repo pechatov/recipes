@@ -404,6 +404,12 @@ input[type="file"]::file-selector-button:hover { color: var(--accent); border-co
 .browser-connection-card { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .browser-connection-card h2 { margin: 4px 0 8px; }
 .browser-connection-card p:last-child { margin-bottom: 0; }
+.connection-actions { flex: 0 0 auto; }
+.connection-status { display: inline-flex; margin-bottom: 10px; color: var(--muted); font-size: 13px; font-weight: 700; }
+.connection-status.is-connected { color: var(--ok-ink); }
+.connection-explainer { max-width: 760px; padding: 26px 30px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.connection-explainer h2 { margin-top: 0; }
+.connection-explainer li + li { margin-top: 8px; }
 .browser-login-heading { margin-bottom: 20px; }
 .browser-login-card { padding: 12px; }
 .browser-login-frame { display: block; width: 100%; height: min(72vh, 900px); min-height: 520px; border: 0; border-radius: calc(var(--radius) - 6px); background: #111; }

@@ -10,6 +10,7 @@ from django.conf import settings
 
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,128}")
 ACCESS_PATH_PATTERN = re.compile(r"/browser-login/access/[A-Za-z0-9_-]{20,256}")
+SCOPE_PATTERN = re.compile(r"recipes-cart-user-[1-9][0-9]*")
 
 
 class BrowserLoginError(Exception):
@@ -31,11 +32,12 @@ def _request(
     payload: dict[str, Any] | None = None,
     allow_not_found: bool = False,
     session_not_found: bool = False,
+    timeout: int = 15,
 ) -> dict:
     if not is_configured():
         raise BrowserLoginError("Удалённый вход в Яндекс Еду ещё не настроен.")
     try:
-        with httpx.Client(timeout=15, trust_env=False) as client:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
             response = client.request(
                 method,
                 f"{settings.CART_BROWSER_CONTROL_URL}{path}",
@@ -109,3 +111,17 @@ def stop_session(session_id: str) -> None:
     # DELETE is deliberately idempotent: the Pi may have closed an expired
     # window just before the user pressed the completion button.
     _request("DELETE", f"/v1/sessions/{session_id}", allow_not_found=True)
+
+
+def recover_scope(scope: str) -> None:
+    """Fence remote automation and confirm that a cart profile is closed."""
+    if not SCOPE_PATTERN.fullmatch(scope):
+        raise BrowserLoginError("Неверная область профиля корзины.")
+    data = _request(
+        "POST",
+        "/v1/recoveries",
+        payload={"scope": scope},
+        timeout=120,
+    )
+    if data.get("status") != "recovered":
+        raise BrowserLoginError("Сервис браузера не подтвердил остановку операции.")

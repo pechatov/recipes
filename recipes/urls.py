@@ -13,6 +13,7 @@ urlpatterns = [
     path("imports/<int:pk>/retry/", views.import_retry, name="import-retry"),
     path("imports/<int:pk>/reprocess/", views.import_reprocess, name="import-reprocess"),
     path("shopping/stores/", views.store_preferences, name="store-preferences"),
+    path("shopping/yandex/", views.yandex_connection, name="yandex-connection"),
     path("shopping/browser-login/start/", views.browser_login_start, name="browser-login-start"),
     path("shopping/browser-login/<int:pk>/", views.browser_login, name="browser-login"),
     path("shopping/browser-login/<int:pk>/complete/", views.browser_login_complete, name="browser-login-complete"),
@@ -22,6 +23,7 @@ urlpatterns = [
     path("shopping/carts/<int:pk>/retry/", views.cart_retry, name="cart-retry"),
     path("shopping/carts/<int:pk>/confirm/", views.cart_confirm, name="cart-confirm"),
     path("shopping/carts/<int:pk>/cancel/", views.cart_cancel, name="cart-cancel"),
+    path("shopping/carts/<int:pk>/stop/", views.cart_stop, name="cart-stop"),
     path(
         "shopping/carts/<int:pk>/manual-resolved/",
         views.cart_manual_resolved,

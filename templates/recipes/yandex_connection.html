@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Яндекс Еда · Домашние рецепты{% endblock %}
+{% block content %}
+  <header class="page-heading">
+    <a class="back-link" href="{% if run %}{% url 'cart-detail' run.pk %}{% else %}{% url 'store-preferences' %}{% endif %}">← Назад</a>
+    <p class="eyebrow">Аккаунт для автосборки</p>
+    <h1>Яндекс Еда</h1>
+    <p class="lead">Привяжите свой аккаунт один раз: вход, адрес и cookies сохранятся в отдельном защищённом профиле вашего пользователя.</p>
+  </header>
+
+  <section class="browser-connection-card yandex-connection-card">
+    <div>
+      {% if active_session_conflict %}
+        <span class="status-badge">Окно занято другой сборкой</span>
+        <h2>Сначала завершите текущий вход</h2>
+        <p>Открытая сессия относится к другой корзине. Завершите её или остановите ту сборку, затем вернитесь сюда.</p>
+      {% elif active_session %}
+        <span class="status-badge">Окно входа открыто</span>
+        <h2>Завершите привязку</h2>
+        <p>Защищённый браузер уже запущен. Вернитесь в него, войдите в Яндекс и сохраните сессию.</p>
+      {% elif latest_connection %}
+        <span class="connection-status is-connected">✓ Аккаунт привязан</span>
+        <h2>Профиль готов к сборке</h2>
+        <p>Сессия сохранена {{ latest_connection.finished_at|date:"d.m.Y H:i" }}. Если Яндекс снова попросит вход, обновите привязку здесь.</p>
+      {% else %}
+        <span class="connection-status">Аккаунт ещё не привязан</span>
+        <h2>Подключите Яндекс Еду</h2>
+        <p>Пароль и SMS-код вводятся прямо на стороне Яндекса и не передаются книге рецептов.</p>
+      {% endif %}
+    </div>
+    <div class="connection-actions">
+      {% if active_session %}
+        {% if active_session_conflict %}
+          <a class="button" href="{% url 'cart-detail' active_session.run.pk %}">Перейти к текущей сборке</a>
+        {% elif run %}
+          <form method="post" action="{% url 'cart-browser-login-start' run.pk %}">
+            {% csrf_token %}
+            <button class="button" type="submit">Вернуться ко входу</button>
+          </form>
+        {% else %}
+          <a class="button" href="{% url 'browser-login' active_session.pk %}">Вернуться ко входу</a>
+        {% endif %}
+      {% elif browser_login_configured %}
+        <form method="post" action="{% if run %}{% url 'cart-browser-login-start' run.pk %}{% else %}{% url 'browser-login-start' %}{% endif %}">
+          {% csrf_token %}
+          <button class="button" type="submit">{% if latest_connection %}Обновить привязку{% else %}Привязать Яндекс Еду{% endif %}</button>
+        </form>
+      {% else %}
+        <button class="button button-secondary" type="button" disabled>Привязка временно недоступна</button>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="connection-explainer">
+    <h2>Как это работает</h2>
+    <ol>
+      <li>Откроется защищённый браузер с Яндекс Едой.</li>
+      <li>Войдите в аккаунт и выберите адрес доставки.</li>
+      <li>Нажмите «Сохранить сессию» — профиль запомнится только для вашего аккаунта сайта.</li>
+    </ol>
+  </section>
+{% endblock %}
