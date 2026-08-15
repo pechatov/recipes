@@ -28,6 +28,9 @@ MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
 YOUTUBE_OEMBED_PROBE_VIDEO_ID = "dQw4w9WgXcQ"
+DNS_PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+PUBLIC_DNS_JSON_ENDPOINT = "https://cloudflare-dns.com/dns-query"
+MAX_DNS_JSON_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,63 @@ def _fit_transcript_segment(
     return best_segment, best_size
 
 
+class _RejectAllRedirectsHandler(urllib.request.HTTPRedirectHandler):
+    """Keep requests to fixed infrastructure endpoints on their original host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _resolve_with_public_dns(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a hostname when the local DNS proxy only exposes fake IPs."""
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise SourceError("В ссылке указано некорректное имя сайта.") from error
+
+    opener = urllib.request.build_opener(_RejectAllRedirectsHandler())
+    resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for record_type, answer_type in (("A", 1), ("AAAA", 28)):
+        query = urlencode({"name": ascii_hostname, "type": record_type})
+        request = urllib.request.Request(
+            f"{PUBLIC_DNS_JSON_ENDPOINT}?{query}",
+            headers={"Accept": "application/dns-json", "User-Agent": USER_AGENT},
+        )
+        try:
+            with opener.open(request, timeout=5) as response:
+                content = response.read(MAX_DNS_JSON_BYTES + 1)
+            if len(content) > MAX_DNS_JSON_BYTES:
+                continue
+            payload = json.loads(content)
+        except (
+            http.client.HTTPException,
+            json.JSONDecodeError,
+            urllib.error.URLError,
+            OSError,
+        ):
+            continue
+        if not isinstance(payload, dict) or payload.get("Status") != 0:
+            continue
+        answers = payload.get("Answer", [])
+        if not isinstance(answers, list):
+            continue
+        for answer in answers:
+            if not isinstance(answer, dict) or answer.get("type") != answer_type:
+                continue
+            try:
+                address = ipaddress.ip_address(answer.get("data", ""))
+            except ValueError:
+                continue
+            if address not in resolved:
+                resolved.append(address)
+
+    if not resolved:
+        raise SourceError("Не удалось безопасно проверить адрес сайта.")
+    return resolved
+
+
 def _resolve_public_url(url: str):
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -131,15 +191,38 @@ def _resolve_public_url(url: str):
         raise SourceError("Не удалось найти сайт по указанному адресу.") from error
     if not addresses:
         raise SourceError("Не удалось найти сайт по указанному адресу.")
+    resolved_ips = list(
+        dict.fromkeys(ipaddress.ip_address(address[4][0]) for address in addresses)
+    )
+    try:
+        hostname_is_ip = ipaddress.ip_address(parsed.hostname) is not None
+    except ValueError:
+        hostname_is_ip = False
+    uses_dns_proxy_fake_ips = (
+        not hostname_is_ip
+        and resolved_ips
+        and all(ip in DNS_PROXY_FAKE_IP_NETWORK for ip in resolved_ips)
+    )
+    validation_ips = resolved_ips
+    if uses_dns_proxy_fake_ips:
+        # Clash/sing-box-style DNS proxies use the benchmarking-only
+        # 198.18.0.0/15 range as synthetic addresses. Validate the actual DNS
+        # answers through a fixed HTTPS endpoint, then keep the synthetic IP as
+        # the pinned route through the proxy. The fake range itself is never
+        # accepted as proof that a destination is public.
+        validation_ips = _resolve_with_public_dns(parsed.hostname)
+
     public_ips = []
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
+    for ip in validation_ips:
         if not ip.is_global:
             raise SourceError("Импорт из локальной или служебной сети запрещён.")
         public_ips.append(ip)
+    connection_ips = resolved_ips if uses_dns_proxy_fake_ips else public_ips
     # Many hosts publish IPv6 first even on machines without a working IPv6
     # route. Prefer the validated IPv4 address and retain IPv6-only support.
-    pinned_ip = next((ip for ip in public_ips if ip.version == 4), public_ips[0])
+    pinned_ip = next(
+        (ip for ip in connection_ips if ip.version == 4), connection_ips[0]
+    )
     return parsed, str(pinned_ip)
 
 
@@ -182,7 +265,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
-class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _RejectRedirectHandler(_RejectAllRedirectsHandler):
     """Keep the trusted YouTube oEmbed request on its fixed HTTPS endpoint."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
