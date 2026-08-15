@@ -28,6 +28,8 @@ MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
 YOUTUBE_OEMBED_PROBE_VIDEO_ID = "dQw4w9WgXcQ"
+DNS_PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+TRUSTED_FAKE_IP_HTTPS_HOSTS = frozenset({"russianfood.com", "www.russianfood.com"})
 
 
 @dataclass(frozen=True)
@@ -131,15 +133,40 @@ def _resolve_public_url(url: str):
         raise SourceError("Не удалось найти сайт по указанному адресу.") from error
     if not addresses:
         raise SourceError("Не удалось найти сайт по указанному адресу.")
-    public_ips = []
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
-        if not ip.is_global:
+    resolved_ips = list(
+        dict.fromkeys(ipaddress.ip_address(address[4][0]) for address in addresses)
+    )
+    try:
+        hostname_is_ip = ipaddress.ip_address(parsed.hostname) is not None
+    except ValueError:
+        hostname_is_ip = False
+    uses_dns_proxy_fake_ips = (
+        not hostname_is_ip
+        and resolved_ips
+        and all(ip in DNS_PROXY_FAKE_IP_NETWORK for ip in resolved_ips)
+    )
+    if uses_dns_proxy_fake_ips:
+        # A fake IP is a route through the local proxy, not the origin address,
+        # so it cannot preserve generic DNS pinning. Keep this exception exact
+        # and HTTPS-only: arbitrary user-controlled hosts remain blocked, while
+        # TLS hostname verification authenticates the trusted destination.
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname.lower() not in TRUSTED_FAKE_IP_HTTPS_HOSTS
+        ):
             raise SourceError("Импорт из локальной или служебной сети запрещён.")
-        public_ips.append(ip)
+        connection_ips = resolved_ips
+    else:
+        connection_ips = []
+        for ip in resolved_ips:
+            if not ip.is_global:
+                raise SourceError("Импорт из локальной или служебной сети запрещён.")
+            connection_ips.append(ip)
     # Many hosts publish IPv6 first even on machines without a working IPv6
     # route. Prefer the validated IPv4 address and retain IPv6-only support.
-    pinned_ip = next((ip for ip in public_ips if ip.version == 4), public_ips[0])
+    pinned_ip = next(
+        (ip for ip in connection_ips if ip.version == 4), connection_ips[0]
+    )
     return parsed, str(pinned_ip)
 
 

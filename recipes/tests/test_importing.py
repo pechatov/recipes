@@ -214,8 +214,39 @@ class ExtractorTests(TestCase):
         _, pinned_ip = _resolve_public_url("https://safe.example/image.jpg")
         self.assertEqual(pinned_ip, "93.184.216.34")
 
+    @patch("recipes.importing.extractors.socket.getaddrinfo")
+    def test_trusted_https_host_can_use_dns_proxy_fake_ip(self, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("198.18.19.226", 443))]
+
+        _, pinned_ip = _resolve_public_url(
+            "https://www.russianfood.com/recipes/recipe.php?rid=155770"
+        )
+
+        self.assertEqual(pinned_ip, "198.18.19.226")
+
+    @patch("recipes.importing.extractors.socket.getaddrinfo")
+    def test_dns_proxy_fake_ip_does_not_bypass_checks_for_arbitrary_hosts(
+        self, getaddrinfo
+    ):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("198.18.19.226", 443))]
+
+        with self.assertRaisesRegex(SourceError, "локальной или служебной"):
+            _resolve_public_url("https://attacker.example/recipe")
+
+    @patch("recipes.importing.extractors.socket.getaddrinfo")
+    def test_dns_proxy_fake_ip_requires_https_even_for_trusted_host(self, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("198.18.19.226", 80))]
+
+        with self.assertRaisesRegex(SourceError, "локальной или служебной"):
+            _resolve_public_url("http://www.russianfood.com/recipe")
+
     def test_rejects_local_source_addresses(self):
-        for url in ("http://127.0.0.1/secret", "http://[::1]/", "http://192.168.1.10/"):
+        for url in (
+            "http://127.0.0.1/secret",
+            "http://[::1]/",
+            "http://192.168.1.10/",
+            "http://198.18.1.1/",
+        ):
             with self.subTest(url=url), self.assertRaises(SourceError):
                 _validate_public_url(url)
 
