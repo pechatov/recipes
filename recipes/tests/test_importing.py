@@ -1,5 +1,4 @@
 import http.client
-import ipaddress
 import io
 import json
 from pathlib import Path
@@ -23,7 +22,6 @@ from recipes.importing.extractors import (
     _fetch_website_title,
     _fetch_youtube_title,
     _resolve_public_url,
-    _resolve_with_public_dns,
     _validate_public_url,
     extract_website,
     extract_youtube,
@@ -216,69 +214,31 @@ class ExtractorTests(TestCase):
         _, pinned_ip = _resolve_public_url("https://safe.example/image.jpg")
         self.assertEqual(pinned_ip, "93.184.216.34")
 
-    @patch("recipes.importing.extractors._resolve_with_public_dns")
     @patch("recipes.importing.extractors.socket.getaddrinfo")
-    def test_public_url_resolves_dns_proxy_fake_ip_securely(
-        self, getaddrinfo, resolve_with_public_dns
-    ):
+    def test_trusted_https_host_can_use_dns_proxy_fake_ip(self, getaddrinfo):
         getaddrinfo.return_value = [(2, 1, 6, "", ("198.18.19.226", 443))]
-        resolve_with_public_dns.return_value = [
-            ipaddress.ip_address("172.66.161.14"),
-            ipaddress.ip_address("104.20.31.139"),
-        ]
 
         _, pinned_ip = _resolve_public_url(
             "https://www.russianfood.com/recipes/recipe.php?rid=155770"
         )
 
         self.assertEqual(pinned_ip, "198.18.19.226")
-        resolve_with_public_dns.assert_called_once_with("www.russianfood.com")
 
-    @patch("recipes.importing.extractors._resolve_with_public_dns")
     @patch("recipes.importing.extractors.socket.getaddrinfo")
-    def test_public_url_rejects_private_address_returned_by_public_dns(
-        self, getaddrinfo, resolve_with_public_dns
+    def test_dns_proxy_fake_ip_does_not_bypass_checks_for_arbitrary_hosts(
+        self, getaddrinfo
     ):
         getaddrinfo.return_value = [(2, 1, 6, "", ("198.18.19.226", 443))]
-        resolve_with_public_dns.return_value = [ipaddress.ip_address("192.168.1.10")]
 
         with self.assertRaisesRegex(SourceError, "локальной или служебной"):
             _resolve_public_url("https://attacker.example/recipe")
 
-    @patch("recipes.importing.extractors.urllib.request.build_opener")
-    def test_public_dns_resolver_uses_only_ip_answers(self, build_opener):
-        ipv4_response = MagicMock()
-        ipv4_response.__enter__.return_value.read.return_value = json.dumps(
-            {
-                "Status": 0,
-                "Answer": [
-                    {"type": 5, "data": "safe.example.cdn.cloudflare.net."},
-                    {"type": 1, "data": "93.184.216.34"},
-                    {"type": 1, "data": "not-an-ip"},
-                ],
-            }
-        ).encode()
-        ipv6_response = MagicMock()
-        ipv6_response.__enter__.return_value.read.return_value = json.dumps(
-            {"Status": 0, "Answer": [{"type": 28, "data": "2001:4860::1"}]}
-        ).encode()
-        build_opener.return_value.open.side_effect = [ipv4_response, ipv6_response]
+    @patch("recipes.importing.extractors.socket.getaddrinfo")
+    def test_dns_proxy_fake_ip_requires_https_even_for_trusted_host(self, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("198.18.19.226", 80))]
 
-        addresses = _resolve_with_public_dns("safe.example")
-
-        self.assertEqual(
-            addresses,
-            [
-                ipaddress.ip_address("93.184.216.34"),
-                ipaddress.ip_address("2001:4860::1"),
-            ],
-        )
-        redirect_handler = build_opener.call_args.args[0]
-        self.assertIsNone(
-            redirect_handler.redirect_request(
-                Mock(), None, 302, "Found", {}, "http://127.0.0.1/private"
-            )
-        )
+        with self.assertRaisesRegex(SourceError, "локальной или служебной"):
+            _resolve_public_url("http://www.russianfood.com/recipe")
 
     def test_rejects_local_source_addresses(self):
         for url in (
