@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import http.client
 import ipaddress
 import json
@@ -11,9 +12,10 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
+from django.conf import settings
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import YouTubeTranscriptApiException
 
@@ -28,8 +30,9 @@ MAX_TITLE_BYTES = 256 * 1024
 MAX_REDIRECTS = 3
 USER_AGENT = "FamilyRecipesImporter/1.0"
 YOUTUBE_OEMBED_PROBE_VIDEO_ID = "dQw4w9WgXcQ"
-DNS_PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
-TRUSTED_FAKE_IP_HTTPS_HOSTS = frozenset({"russianfood.com", "www.russianfood.com"})
+PUBLIC_DNS_JSON_ENDPOINT = "https://cloudflare-dns.com/dns-query"
+MAX_DNS_JSON_BYTES = 64 * 1024
+MAX_PROXY_RESPONSE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,79 @@ def _fit_transcript_segment(
     return best_segment, best_size
 
 
+class _RejectAllRedirectsHandler(urllib.request.HTTPRedirectHandler):
+    """Keep fixed infrastructure requests on their original HTTPS host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _resolve_with_public_dns(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve actual addresses hidden by a local fake-IP DNS proxy."""
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise SourceError("В ссылке указано некорректное имя сайта.") from error
+
+    opener = urllib.request.build_opener(_RejectAllRedirectsHandler())
+    resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for record_type, answer_type in (("A", 1), ("AAAA", 28)):
+        query = urlencode({"name": ascii_hostname, "type": record_type})
+        request = urllib.request.Request(
+            f"{PUBLIC_DNS_JSON_ENDPOINT}?{query}",
+            headers={"Accept": "application/dns-json", "User-Agent": USER_AGENT},
+        )
+        try:
+            with opener.open(request, timeout=5) as response:
+                content = response.read(MAX_DNS_JSON_BYTES + 1)
+            if len(content) > MAX_DNS_JSON_BYTES:
+                continue
+            payload = json.loads(content.decode("utf-8"))
+        except (
+            http.client.HTTPException,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            urllib.error.URLError,
+            OSError,
+        ):
+            continue
+        if not isinstance(payload, dict) or payload.get("Status") != 0:
+            continue
+        answers = payload.get("Answer", [])
+        if not isinstance(answers, list):
+            continue
+        for answer in answers:
+            if not isinstance(answer, dict) or answer.get("type") != answer_type:
+                continue
+            raw_address = answer.get("data")
+            if not isinstance(raw_address, str):
+                continue
+            try:
+                address = ipaddress.ip_address(raw_address)
+            except ValueError:
+                continue
+            if address not in resolved:
+                resolved.append(address)
+
+    if not resolved:
+        raise SourceError("Не удалось безопасно проверить адрес сайта.")
+    return resolved
+
+
+def _configured_fake_ip_networks() -> list[
+    ipaddress.IPv4Network | ipaddress.IPv6Network
+]:
+    networks = []
+    for value in settings.IMPORT_FAKE_IP_NETWORKS:
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError as error:
+            raise SourceError("Некорректно настроен диапазон Fake-IP.") from error
+    return networks
+
+
 def _resolve_public_url(url: str):
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -137,41 +213,28 @@ def _resolve_public_url(url: str):
         dict.fromkeys(ipaddress.ip_address(address[4][0]) for address in addresses)
     )
     try:
-        hostname_is_ip = ipaddress.ip_address(parsed.hostname) is not None
+        ipaddress.ip_address(parsed.hostname)
+        hostname_is_ip = True
     except ValueError:
         hostname_is_ip = False
-    uses_dns_proxy_fake_ips = (
+    fake_ip_networks = _configured_fake_ip_networks()
+    uses_fake_ip = (
         not hostname_is_ip
-        and resolved_ips
-        and all(ip in DNS_PROXY_FAKE_IP_NETWORK for ip in resolved_ips)
+        and bool(fake_ip_networks)
+        and all(any(ip in network for network in fake_ip_networks) for ip in resolved_ips)
     )
-    if uses_dns_proxy_fake_ips:
-        # A fake IP is a route through the local proxy, not the origin address,
-        # so it cannot preserve generic DNS pinning. Keep this exception exact
-        # and HTTPS-only: arbitrary user-controlled hosts remain blocked, while
-        # TLS hostname verification authenticates the trusted destination.
-        if (
-            parsed.scheme != "https"
-            or parsed.hostname.lower() not in TRUSTED_FAKE_IP_HTTPS_HOSTS
-        ):
+    validation_ips = (
+        _resolve_with_public_dns(parsed.hostname) if uses_fake_ip else resolved_ips
+    )
+    public_ips = []
+    for ip in validation_ips:
+        if not ip.is_global:
             raise SourceError("Импорт из локальной или служебной сети запрещён.")
-        connection_ips = resolved_ips
-    else:
-        connection_ips = []
-        for ip in resolved_ips:
-            if not ip.is_global:
-                raise SourceError("Импорт из локальной или служебной сети запрещён.")
-            connection_ips.append(ip)
+        public_ips.append(ip)
     # Many hosts publish IPv6 first even on machines without a working IPv6
     # route. Prefer the validated IPv4 address and retain IPv6-only support.
-    pinned_ip = next(
-        (ip for ip in connection_ips if ip.version == 4), connection_ips[0]
-    )
+    pinned_ip = next((ip for ip in public_ips if ip.version == 4), public_ips[0])
     return parsed, str(pinned_ip)
-
-
-def _validate_public_url(url: str) -> None:
-    _resolve_public_url(url)
 
 
 def _decode_response_body(content: bytes, headers) -> str:
@@ -182,14 +245,91 @@ def _decode_response_body(content: bytes, headers) -> str:
         return content.decode("utf-8", errors="replace")
 
 
+def _connect_to_pinned_ip(
+    pinned_ip: str,
+    port: int,
+    timeout: float | None,
+    source_address,
+):
+    proxy_url = settings.IMPORT_HTTP_PROXY_URL
+    if not proxy_url:
+        return socket.create_connection(
+            (pinned_ip, port),
+            timeout,
+            source_address,
+        )
+
+    try:
+        parsed_proxy = urlsplit(proxy_url)
+        proxy_port = parsed_proxy.port or 80
+    except ValueError as error:
+        raise OSError("Invalid import HTTP proxy URL") from error
+    if (
+        parsed_proxy.scheme != "http"
+        or not parsed_proxy.hostname
+        or parsed_proxy.path not in {"", "/"}
+        or parsed_proxy.query
+        or parsed_proxy.fragment
+    ):
+        raise OSError("Invalid import HTTP proxy URL")
+
+    sock = socket.create_connection(
+        (parsed_proxy.hostname, proxy_port),
+        timeout,
+        source_address,
+    )
+    ip = ipaddress.ip_address(pinned_ip)
+    authority = f"[{ip}]:{port}" if ip.version == 6 else f"{ip}:{port}"
+    request_headers = [
+        f"CONNECT {authority} HTTP/1.1",
+        f"Host: {authority}",
+        "Proxy-Connection: Keep-Alive",
+    ]
+    if parsed_proxy.username is not None:
+        credentials = (
+            f"{unquote(parsed_proxy.username)}:"
+            f"{unquote(parsed_proxy.password or '')}"
+        )
+        encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+        request_headers.append(f"Proxy-Authorization: Basic {encoded}")
+    try:
+        sock.sendall(("\r\n".join(request_headers) + "\r\n\r\n").encode("ascii"))
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("Import HTTP proxy closed the CONNECT response")
+            response.extend(chunk)
+            if len(response) > MAX_PROXY_RESPONSE_BYTES:
+                raise OSError("Import HTTP proxy returned oversized headers")
+        header, remainder = bytes(response).split(b"\r\n\r\n", 1)
+        if remainder:
+            raise OSError("Import HTTP proxy sent unexpected tunnel data")
+        status_line = header.split(b"\r\n", 1)[0]
+        parts = status_line.split(b" ", 2)
+        if len(parts) < 2 or parts[0] not in {b"HTTP/1.0", b"HTTP/1.1"}:
+            raise OSError("Import HTTP proxy returned an invalid response")
+        try:
+            status = int(parts[1])
+        except ValueError as error:
+            raise OSError("Import HTTP proxy returned an invalid status") from error
+        if status != 200:
+            raise OSError(f"Import HTTP proxy CONNECT failed with status {status}")
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
 class _PinnedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host, port, pinned_ip, **kwargs):
         self._pinned_ip = pinned_ip
         super().__init__(host, port, **kwargs)
 
     def connect(self):
-        self.sock = socket.create_connection(
-            (self._pinned_ip, self.port),
+        self.sock = _connect_to_pinned_ip(
+            self._pinned_ip,
+            self.port,
             self.timeout,
             self.source_address,
         )
@@ -201,15 +341,16 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         super().__init__(host, port, **kwargs)
 
     def connect(self):
-        raw_socket = socket.create_connection(
-            (self._pinned_ip, self.port),
+        raw_socket = _connect_to_pinned_ip(
+            self._pinned_ip,
+            self.port,
             self.timeout,
             self.source_address,
         )
         self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
-class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _RejectRedirectHandler(_RejectAllRedirectsHandler):
     """Keep the trusted YouTube oEmbed request on its fixed HTTPS endpoint."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):

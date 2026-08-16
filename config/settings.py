@@ -17,6 +17,8 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "unsafe-development-key")
 DEBUG = env_bool("DEBUG", True)
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
 CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+IMPORT_FAKE_IP_NETWORKS = env_list("IMPORT_FAKE_IP_NETWORKS")
+IMPORT_HTTP_PROXY_URL = os.environ.get("IMPORT_HTTP_PROXY_URL", "").strip()
 
 INSTALLED_APPS = [
     "django.contrib.admin",
