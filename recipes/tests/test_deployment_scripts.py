@@ -230,7 +230,11 @@ class CartAdapterDeploymentContractTests(SimpleTestCase):
         self.assertIn("after_quantity", server)
         self.assertIn("sku_id: item.sku_id", server)
         self.assertIn("candidate.place_slug === context.place_slug", server)
-        self.assertIn("data.cart_places_list.length === 0", server)
+        # An empty unscoped cart may coexist with other places' summary rows;
+        # they must never be mistaken for the requested store's cart rows.
+        self.assertIn("candidate.place_slug !== context.place_slug", server)
+        self.assertIn("candidate.items.length === 0", server)
+        self.assertIn("Array.isArray(data?.cart_places_list)", server)
         self.assertIn("existing > item.before_quantity", server)
         self.assertIn('createCipheriv("aes-256-gcm"', server)
         self.assertIn("rawLatitude === null || rawLongitude === null", server)
