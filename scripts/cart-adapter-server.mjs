@@ -808,7 +808,14 @@ async function openBrandStorefront(browser, store, groupSlug) {
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
     const selected = classifyStorefrontUrl(store, state?.url);
     if (selected === null) return null;
-    if (selected) return selected;
+    if (selected) {
+      // Keep the coordinates already observed while the storefront redirect
+      // settled, mirroring the landing-page fallback path.
+      const location = Number.isFinite(state?.latitude) && Number.isFinite(state?.longitude)
+        ? { latitude: state.latitude, longitude: state.longitude }
+        : null;
+      return { ...selected, location };
+    }
     await sleep(500);
   }
   return null;
@@ -891,7 +898,10 @@ async function resolveStore(browser, store) {
   let fallbackLocation = null;
   for (const groupSlug of stores[store].groupSlugs) {
     selected = await openBrandStorefront(browser, store, groupSlug);
-    if (selected) break;
+    if (selected) {
+      fallbackLocation = selected.location;
+      break;
+    }
   }
   if (!selected) {
     await navigate(browser, "https://eda.yandex.ru/retail");
