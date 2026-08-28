@@ -1071,6 +1071,7 @@ function searchExpression(context, ingredients) {
         const candidates = [];
         const seen = new Set();
         let status = 0;
+        let succeeded = false;
         for (const query of queries) {
           const response = await fetch('/api/v1/menu/search', {
             method: 'POST',
@@ -1078,13 +1079,14 @@ function searchExpression(context, ingredients) {
             body: JSON.stringify({place_slug: context.place_slug, text: query, location: {lat: context.latitude, lon: context.longitude}}),
           });
           if (response.status < 200 || response.status >= 300) {
-            // A failed broader fallback must not discard candidates that a
-            // more precise query already returned. Only the first query
-            // determines the reported status when nothing was found yet.
-            if (!candidates.length) status = response.status;
+            // A failed broader fallback must not turn an already successful
+            // search (with or without products) into an error. The failure
+            // status is reported only when no query has succeeded yet.
+            if (!succeeded) status = response.status;
             break;
           }
           status = response.status;
+          succeeded = true;
           let data = {};
           try { data = await response.json(); } catch {}
           const products = (data.blocks || []).flatMap((block) => Array.isArray(block?.payload?.products) ? block.payload.products : []);
