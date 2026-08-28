@@ -819,6 +819,10 @@ async function openBrandStorefront(browser, store, groupSlug) {
 // page before collecting links for the fallback lookup.
 const scrollLandingExpression = `(() => {
   window.scrollBy(0, Math.max(800, window.innerHeight || 0));
+  return true;
+})()`;
+
+const landingGeometryExpression = `(() => {
   const height = document.documentElement.scrollHeight;
   return {
     height,
@@ -832,13 +836,16 @@ async function collectLandingLinks(browser) {
   const seen = new Set(links.map((link) => link.href));
   let previousHeight = -1;
   let stableRounds = 0;
-  // Stop only once the viewport has actually reached the bottom and two
-  // further rounds neither grew the page nor revealed new links. The attempt
-  // cap is a guard against endlessly growing pages, not the normal exit.
-  for (let attempt = 0; attempt < 40 && stableRounds < 2; attempt += 1) {
-    const scrolled = await evaluate(browser, scrollLandingExpression);
+  // Stop only once the viewport has actually reached the bottom and three
+  // further rounds neither grew the page nor revealed new links. Geometry is
+  // measured after the wait so a lazily loaded section that arrives during
+  // the pause is reflected in the same round. The attempt cap is a guard
+  // against endlessly growing pages, not the normal exit.
+  for (let attempt = 0; attempt < 40 && stableRounds < 3; attempt += 1) {
+    await evaluate(browser, scrollLandingExpression);
+    await sleep(700);
+    const scrolled = await evaluate(browser, landingGeometryExpression);
     const height = Number(scrolled?.height);
-    await sleep(400);
     const state = await evaluate(browser, pageStateExpression);
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
