@@ -1072,6 +1072,7 @@ function searchExpression(context, ingredients) {
         const seen = new Set();
         let status = 0;
         let succeeded = false;
+        let fallbackStatus = null;
         for (const query of queries) {
           const response = await fetch('/api/v1/menu/search', {
             method: 'POST',
@@ -1079,10 +1080,11 @@ function searchExpression(context, ingredients) {
             body: JSON.stringify({place_slug: context.place_slug, text: query, location: {lat: context.latitude, lon: context.longitude}}),
           });
           if (response.status < 200 || response.status >= 300) {
-            // A failed broader fallback must not turn an already successful
-            // search (with or without products) into an error. The failure
-            // status is reported only when no query has succeeded yet.
-            if (!succeeded) status = response.status;
+            // A failed broader fallback must not override the status of an
+            // already successful query. It is reported separately so the
+            // caller can still distinguish "no products" from an outage.
+            if (succeeded) fallbackStatus = response.status;
+            else status = response.status;
             break;
           }
           status = response.status;
@@ -1108,7 +1110,7 @@ function searchExpression(context, ingredients) {
           }
           if (candidates.length >= ${sufficientCandidates}) break;
         }
-        results[index] = { index, status, candidates };
+        results[index] = { index, status, fallback_status: fallbackStatus, candidates };
       }
     };
     await Promise.all(Array.from({length: Math.min(4, ingredients.length)}, worker));
@@ -1452,6 +1454,12 @@ async function search(body) {
     const allowed = Object.create(null);
     const results = rawResults.map((result, index) => {
       classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
+      if (!(result?.candidates || []).length && result?.fallback_status) {
+        // Without any candidate a failed fallback query is indistinguishable
+        // from a missing product, so surface the outage instead of silently
+        // reporting the ingredient as not found.
+        classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
+      }
       const candidates = [];
       for (const candidate of result.candidates || []) {
         const productId = text(candidate.product_id, 128);
