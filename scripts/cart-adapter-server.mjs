@@ -1050,8 +1050,14 @@ function searchExpression(context, ingredients) {
             headers: {'content-type': 'application/json'},
             body: JSON.stringify({place_slug: context.place_slug, text: query, location: {lat: context.latitude, lon: context.longitude}}),
           });
+          if (response.status < 200 || response.status >= 300) {
+            // A failed broader fallback must not discard candidates that a
+            // more precise query already returned. Only the first query
+            // determines the reported status when nothing was found yet.
+            if (!candidates.length) status = response.status;
+            break;
+          }
           status = response.status;
-          if (response.status < 200 || response.status >= 300) break;
           let data = {};
           try { data = await response.json(); } catch {}
           const products = (data.blocks || []).flatMap((block) => Array.isArray(block?.payload?.products) ? block.payload.products : []);
