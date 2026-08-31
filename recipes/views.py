@@ -526,8 +526,7 @@ def draft_list(request):
     recipes = Recipe.objects.filter(status=Recipe.Status.DRAFT).prefetch_related(
         "ingredients", "categories"
     )
-    jobs = ImportJob.objects.exclude(status=ImportJob.Status.COMPLETED)[:20]
-    return render(request, "recipes/draft_list.html", {"recipes": recipes, "jobs": jobs})
+    return render(request, "recipes/draft_list.html", {"recipes": recipes})
 
 
 @login_required
@@ -892,6 +891,22 @@ def import_retry(request, pk):
     job.save(update_fields=["status", "error", "started_at", "finished_at"])
     messages.success(request, "Импорт снова поставлен в очередь.")
     return redirect("import-detail", pk=job.pk)
+
+
+@login_required
+@require_POST
+def import_delete(request, pk):
+    with transaction.atomic():
+        job = get_object_or_404(
+            ImportJob.objects.select_for_update().exclude(
+                status=ImportJob.Status.PROCESSING
+            ),
+            pk=pk,
+            requested_by=request.user,
+        )
+        job.delete()
+    messages.success(request, "Импорт удалён.")
+    return redirect("task-list")
 
 
 @login_required

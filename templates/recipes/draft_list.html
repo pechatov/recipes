@@ -6,20 +6,6 @@
     <a class="button" href="{% url 'import-create' %}">Импортировать рецепт</a>
   </header>
 
-  {% if jobs %}
-    <section class="queue-panel">
-      <h2>Очередь импорта</h2>
-      <div class="queue-list">
-        {% for job in jobs %}
-          <a href="{% url 'import-detail' job.pk %}">
-            <span>{{ job.source_title|default:job.source_url|truncatechars:70 }}</span>
-            <strong>{{ job.get_status_display }}</strong>
-          </a>
-        {% endfor %}
-      </div>
-    </section>
-  {% endif %}
-
   {% if recipes %}
     <div class="recipe-grid">
       {% for recipe in recipes %}
@@ -42,7 +28,7 @@
         </article>
       {% endfor %}
     </div>
-  {% elif not jobs %}
-    <section class="empty-state"><h2>Черновиков пока нет</h2><p>Импортируйте рецепт по ссылке — результат появится здесь.</p></section>
+  {% else %}
+    <section class="empty-state"><h2>Черновиков пока нет</h2><p>Импортируйте рецепт по ссылке — результат появится здесь. За ходом импорта можно следить в <a href="{% url 'task-list' %}">задачах</a>.</p></section>
   {% endif %}
 {% endblock %}
