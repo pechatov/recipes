@@ -64,7 +64,13 @@ const stores = {
   perekrestok: { aliases: ["перекресток", "perekrestok"], groupSlugs: ["perekrestok"] },
   pyaterochka: { aliases: ["пятерочка", "pyaterochka"], groupSlugs: ["paterocka"] },
   magnit: { aliases: ["магнит", "magnit"], groupSlugs: ["magnit_celevaya"] },
-  lavka: { aliases: ["яндекс лавка", "лавка", "yandex lavka"], groupSlugs: ["lavka"] },
+  lavka: {
+    aliases: ["яндекс лавка", "лавка", "yandex lavka"],
+    groupSlugs: ["lavka"],
+    // The "Магазины" landing links Яндекс Лавка to lavka.yandex.ru, a separate
+    // site without the Yandex Food retail catalog and cart APIs.
+    unavailableSummary: "Яндекс Лавка работает на отдельном сайте и не поддерживается быстрой сборкой.",
+  },
 };
 
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -759,6 +765,113 @@ function selectStoreLink(store, links) {
   throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
 }
 
+// Yandex Food resolves https://eda.yandex.ru/retail/<brand> to the nearest
+// storefront of that brand for the saved address by appending placeSlug, and
+// bounces unknown or unavailable brands back to the landing page. Classify the
+// current URL as a confirmed storefront (object), an explicit brand miss
+// (null) or an intermediate redirect state (undefined).
+function classifyStorefrontUrl(store, value) {
+  const policy = stores[store];
+  let url;
+  try {
+    url = new URL(String(value || ""));
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru") return undefined;
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts[0] !== "retail") return undefined;
+  if (parts.length === 1) {
+    return url.searchParams.get("redirectFrom") === "not_found_place" ? null : undefined;
+  }
+  const pathGroupSlug = parts[1] || "";
+  const placeSlug = url.searchParams.get("placeSlug") || "";
+  if (
+    parts.length !== 2
+    || !policy.groupSlugs.includes(pathGroupSlug)
+    || !slugPattern.test(placeSlug)
+  ) {
+    return undefined;
+  }
+  url.search = "";
+  url.searchParams.set("placeSlug", placeSlug);
+  return { url: url.href, placeSlug, pathGroupSlug };
+}
+
+async function openBrandStorefront(browser, store, groupSlug) {
+  await navigate(browser, `https://eda.yandex.ru/retail/${encodeURIComponent(groupSlug)}`);
+  let state = null;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    state = await evaluate(browser, pageStateExpression);
+    if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
+    if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
+    if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
+    const selected = classifyStorefrontUrl(store, state?.url);
+    if (selected === null) return null;
+    if (selected) {
+      // Keep the coordinates already observed while the storefront redirect
+      // settled, mirroring the landing-page fallback path.
+      const location = Number.isFinite(state?.latitude) && Number.isFinite(state?.longitude)
+        ? { latitude: state.latitude, longitude: state.longitude }
+        : null;
+      return { ...selected, location };
+    }
+    await sleep(500);
+  }
+  return null;
+}
+
+// The landing page renders its store carousels lazily while scrolling, so a
+// single snapshot of links only covers the first section. Scroll through the
+// page before collecting links for the fallback lookup.
+const scrollLandingExpression = `(() => {
+  window.scrollBy(0, Math.max(800, window.innerHeight || 0));
+  return true;
+})()`;
+
+const landingGeometryExpression = `(() => {
+  const height = document.documentElement.scrollHeight;
+  return {
+    height,
+    atBottom: window.scrollY + window.innerHeight >= height - 2,
+  };
+})()`;
+
+async function collectLandingLinks(browser) {
+  const listingState = await waitForPageState(browser, { needLinks: true });
+  const links = [...(listingState.links || [])];
+  const seen = new Set(links.map((link) => link.href));
+  let previousHeight = -1;
+  let stableRounds = 0;
+  // Stop only once the viewport has actually reached the bottom and three
+  // further rounds neither grew the page nor revealed new links. Geometry is
+  // measured after the wait so a lazily loaded section that arrives during
+  // the pause is reflected in the same round. The attempt cap is a guard
+  // against endlessly growing pages, not the normal exit.
+  for (let attempt = 0; attempt < 40 && stableRounds < 3; attempt += 1) {
+    await evaluate(browser, scrollLandingExpression);
+    await sleep(700);
+    const scrolled = await evaluate(browser, landingGeometryExpression);
+    const height = Number(scrolled?.height);
+    const state = await evaluate(browser, pageStateExpression);
+    if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
+    if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
+    let added = 0;
+    for (const link of state?.links || []) {
+      if (!seen.has(link.href)) {
+        seen.add(link.href);
+        links.push(link);
+        added += 1;
+      }
+    }
+    stableRounds = scrolled?.atBottom && height === previousHeight && added === 0
+      ? stableRounds + 1
+      : 0;
+    previousHeight = height;
+  }
+  return { ...listingState, links };
+}
+
 function catalogExpression(input) {
   return `(async () => {
     const input = ${JSON.stringify(input)};
@@ -778,13 +891,29 @@ function classifyApiStatus(status, message) {
 }
 
 async function resolveStore(browser, store) {
-  const listingState = await waitForPageState(browser, { needLinks: true });
-  const selected = selectStoreLink(store, listingState.links);
-  await navigate(browser, selected.url);
+  if (stores[store].unavailableSummary) {
+    throw new OperationError("store_unavailable", stores[store].unavailableSummary);
+  }
+  let selected = null;
+  let fallbackLocation = null;
+  for (const groupSlug of stores[store].groupSlugs) {
+    selected = await openBrandStorefront(browser, store, groupSlug);
+    if (selected) {
+      fallbackLocation = selected.location;
+      break;
+    }
+  }
+  if (!selected) {
+    await navigate(browser, "https://eda.yandex.ru/retail");
+    const listingState = await collectLandingLinks(browser);
+    fallbackLocation = { latitude: listingState.latitude, longitude: listingState.longitude };
+    selected = selectStoreLink(store, listingState.links);
+    await navigate(browser, selected.url);
+  }
   const state = await waitForPageState(browser);
   const location = {
-    latitude: state.latitude ?? listingState.latitude,
-    longitude: state.longitude ?? listingState.longitude,
+    latitude: state.latitude ?? fallbackLocation?.latitude,
+    longitude: state.longitude ?? fallbackLocation?.longitude,
   };
   const catalog = await evaluate(browser, catalogExpression({ ...location, placeSlug: selected.placeSlug }));
   classifyApiStatus(Number(catalog?.status || 0), "Каталог магазина недоступен.");
@@ -936,27 +1065,52 @@ function searchExpression(context, ingredients) {
         const index = cursor++;
         if (index >= ingredients.length) return;
         const ingredient = ingredients[index];
-        const response = await fetch('/api/v1/menu/search', {
-          method: 'POST',
-          headers: {'content-type': 'application/json'},
-          body: JSON.stringify({place_slug: context.place_slug, text: ingredient.query, location: {lat: context.latitude, lon: context.longitude}}),
-        });
-        let data = {};
-        try { data = await response.json(); } catch {}
-        const products = (data.blocks || []).flatMap((block) => Array.isArray(block?.payload?.products) ? block.payload.products : []);
-        results[index] = {
-          index,
-          status: response.status,
-          candidates: products.slice(0, 5).map((product) => ({
-            product_id: String(product.public_id || product.publicId || product.uid || product.sku_id || product.skuId || ''),
-            sku_id: String(product.sku_id || product.skuId || product.public_id || product.publicId || product.uid || ''),
-            name: String(product.name || '').slice(0, 300),
-            weight: String(product.weight || '').slice(0, 80),
-            available: product.available !== false,
-            in_stock: product.inStock ?? product.in_stock ?? null,
-            price: product.decimalPromoPrice ?? product.decimalPrice ?? product.promoPrice ?? product.price ?? null,
-          })),
-        };
+        const queries = Array.isArray(ingredient.queries) && ingredient.queries.length
+          ? ingredient.queries
+          : [ingredient.query];
+        const candidates = [];
+        const seen = new Set();
+        let status = 0;
+        let succeeded = false;
+        let fallbackStatus = null;
+        for (const query of queries) {
+          const response = await fetch('/api/v1/menu/search', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({place_slug: context.place_slug, text: query, location: {lat: context.latitude, lon: context.longitude}}),
+          });
+          if (response.status < 200 || response.status >= 300) {
+            // A failed broader fallback must not override the status of an
+            // already successful query. It is reported separately so the
+            // caller can still distinguish "no products" from an outage.
+            if (succeeded) fallbackStatus = response.status;
+            else status = response.status;
+            break;
+          }
+          status = response.status;
+          succeeded = true;
+          let data = {};
+          try { data = await response.json(); } catch {}
+          const products = (data.blocks || []).flatMap((block) => Array.isArray(block?.payload?.products) ? block.payload.products : []);
+          for (const product of products) {
+            if (candidates.length >= ${maximumCandidatesPerIngredient}) break;
+            const productId = String(product.public_id || product.publicId || product.uid || product.sku_id || product.skuId || '');
+            if (!productId || seen.has(productId)) continue;
+            seen.add(productId);
+            candidates.push({
+              product_id: productId,
+              sku_id: String(product.sku_id || product.skuId || product.public_id || product.publicId || product.uid || ''),
+              name: String(product.name || '').slice(0, 300),
+              weight: String(product.weight || '').slice(0, 80),
+              available: product.available !== false,
+              in_stock: product.inStock ?? product.in_stock ?? null,
+              price: product.decimalPromoPrice ?? product.decimalPrice ?? product.promoPrice ?? product.price ?? null,
+              query,
+            });
+          }
+          if (candidates.length >= ${sufficientCandidates}) break;
+        }
+        results[index] = { index, status, fallback_status: fallbackStatus, candidates };
       }
     };
     await Promise.all(Array.from({length: Math.min(4, ingredients.length)}, worker));
@@ -1001,18 +1155,26 @@ function cartExpression(context) {
       candidate.place_slug === context.place_slug
       && (!candidate.place_business || candidate.place_business === context.place_business)
     ));
-    // Yandex represents a completely empty cart as one unscoped empty cart
-    // plus an empty cart_places_list. It contains no row that could belong
-    // to another store, so it is safe to treat only this exact shape as empty.
+    // Yandex represents an empty cart for the requested place as one unscoped
+    // empty cart. cart_places_list may still enumerate other places the user
+    // recently opened (summary rows without items). None of those rows can
+    // belong to the requested place because matching is empty, so the
+    // requested store cart is safely empty when the unscoped cart has no
+    // rows and no identifier.
     const unscopedEmpty = matching.length === 0
-      && candidates.length === 1
+      && candidates.length >= 1
       && candidates[0].source === 'cart'
       && !candidates[0].place_slug
       && !candidates[0].place_business
       && !candidates[0].cart_id
       && candidates[0].items.length === 0
-      && Array.isArray(data?.cart_places_list)
-      && data.cart_places_list.length === 0;
+      && candidates.slice(1).every((candidate) => (
+        candidate.source === 'cart_places_list'
+        && candidate.place_slug
+        && candidate.place_slug !== context.place_slug
+        && candidate.items.length === 0
+      ))
+      && Array.isArray(data?.cart_places_list);
     const selected = matching[0] || (unscopedEmpty ? candidates[0] : null);
     const conflicting = selected && matching.some((candidate) => (
       candidate !== selected
@@ -1233,8 +1395,43 @@ function validateIngredients(body) {
     const name = text(ingredient?.name, 180);
     const query = text(ingredient?.search_query || ingredient?.name, 180);
     if (!name || !query) throw new OperationError("invalid_request", "Ингредиент не имеет безопасного поискового запроса.");
-    return { name, query };
+    return { name, query, queries: searchQueries(query, name) };
   });
+}
+
+const queryStopWords = new Set([
+  "в", "для", "и", "из", "на", "по", "с", "со", "без", "или", "к", "от", "у",
+  "свежий", "свежая", "свежие", "свежее",
+]);
+const maximumCandidatesPerIngredient = 12;
+const sufficientCandidates = 6;
+
+// Some storefront search engines (Перекрёсток among them) require every
+// query word to match and answer "ничего не найдено" for descriptive queries
+// such as "целая курица". Fall back from the full query to the ingredient
+// name and then to its individual meaningful words. Later, broader queries
+// only fill remaining candidate slots, so the matcher still ranks results
+// from the precise query first.
+function searchQueries(query, name) {
+  const queries = [];
+  const seen = new Set();
+  const push = (value) => {
+    const candidate = String(value || "").trim().slice(0, 180);
+    const key = normalize(candidate);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    queries.push(candidate);
+  };
+  push(query);
+  push(name);
+  for (const source of [query, name]) {
+    const words = normalize(source).split(" ").filter((word) => (
+      word.length >= 3 && !queryStopWords.has(word) && !/^[0-9.,]+$/.test(word)
+    ));
+    if (words.length < 2) continue;
+    for (const word of words) push(word);
+  }
+  return queries.slice(0, 6);
 }
 
 async function search(body) {
@@ -1257,6 +1454,12 @@ async function search(body) {
     const allowed = Object.create(null);
     const results = rawResults.map((result, index) => {
       classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
+      if (!(result?.candidates || []).length && result?.fallback_status) {
+        // Without any candidate a failed fallback query is indistinguishable
+        // from a missing product, so surface the outage instead of silently
+        // reporting the ingredient as not found.
+        classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
+      }
       const candidates = [];
       for (const candidate of result.candidates || []) {
         const productId = text(candidate.product_id, 128);
@@ -1645,6 +1848,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 }
 
 export {
+  classifyStorefrontUrl,
+  searchQueries,
   errorBody,
   boundedOperationTimeout,
   deferScopeRecovery,

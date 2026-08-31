@@ -26,6 +26,8 @@ const {
   runWithOperationDeadline,
   sameLocation,
   selectStoreLink,
+  classifyStorefrontUrl,
+  searchQueries,
   scopeRecoveryAt,
   storeOperationRecord,
 } = await import("./cart-adapter-server.mjs");
@@ -197,6 +199,49 @@ assert.throws(
   }]),
   (error) => error.code === "store_unavailable",
 );
+
+assert.deepEqual(
+  classifyStorefrontUrl(
+    "perekrestok",
+    "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg&relatedBrandSlug=perekrestok",
+  ),
+  {
+    url: "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg",
+    placeSlug: "perekryostok_nr5vg",
+    pathGroupSlug: "perekrestok",
+  },
+);
+assert.equal(
+  classifyStorefrontUrl(
+    "perekrestok",
+    "https://eda.yandex.ru/retail?redirectFrom=not_found_place&relatedBrandSlug=perekrestok",
+  ),
+  null,
+  "a brand bounce back to the landing page is an explicit miss",
+);
+for (const intermediate of [
+  "https://eda.yandex.ru/retail/perekrestok",
+  "https://eda.yandex.ru/retail/perekrestok?relatedBrandSlug=perekrestok",
+  "https://eda.yandex.ru/retail",
+  "https://eda.yandex.ru/retail/perekrestok_kafe?placeSlug=perekryostok_kafe_select_lxg5z",
+  "https://eda.yandex.ru/retail/perekrestok/product/abc?placeSlug=perekryostok_nr5vg",
+  "http://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg",
+  "https://lavka.yandex.ru/",
+  "",
+]) {
+  assert.equal(classifyStorefrontUrl("perekrestok", intermediate), undefined, intermediate);
+}
+
+assert.deepEqual(
+  searchQueries("целая курица", "Курица"),
+  ["целая курица", "Курица", "целая"],
+);
+assert.deepEqual(
+  searchQueries("картофель для запекания", "Картофель"),
+  ["картофель для запекания", "Картофель", "запекания"],
+);
+assert.deepEqual(searchQueries("Лимон свежий", "Лимон"), ["Лимон свежий", "Лимон"]);
+assert.deepEqual(searchQueries("Молоко 3.2%", "молоко"), ["Молоко 3.2%", "молоко"]);
 
 let releaseFirst;
 let announceFirstStart;
