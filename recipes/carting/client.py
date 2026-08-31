@@ -53,6 +53,11 @@ STORE_INSTRUCTIONS = {
     ),
 }
 
+# The Hermes browser agent is prompted for the Yandex Food «Магазины» UI and
+# must never improvise on lavka.yandex.ru; Лавка is assembled only by the
+# deterministic adapter.
+ADAPTER_ONLY_STORES = {"lavka"}
+
 
 ASSEMBLE_PROMPT = """Ты агент-сборщик продуктовой корзины для семейной книги рецептов. Используй только браузерные инструменты.
 
@@ -591,11 +596,19 @@ def assemble_store_cart(run, store: str) -> dict[str, Any]:
         }
 
     if not settings.CART_ADAPTER_BASE_URL:
+        if store in ADAPTER_ONLY_STORES:
+            raise CartAgentError(
+                "Сборка в Яндекс Лавке требует подключённый быстрый адаптер корзины."
+            )
         return run_store_cart_task(run, store, "assemble")
     try:
         return _assemble_with_adapter(run, store)
     except CartAgentError as error:
-        if error.mutation_possible or not settings.CART_ADAPTER_FALLBACK_TO_HERMES:
+        if (
+            error.mutation_possible
+            or not settings.CART_ADAPTER_FALLBACK_TO_HERMES
+            or store in ADAPTER_ONLY_STORES
+        ):
             raise
         return run_store_cart_task(run, store, "assemble")
 
@@ -633,6 +646,12 @@ def cleanup_store_cart(
         raise CartAgentError(
             str(data.get("summary") or "Очистка корзины не была подтверждена."),
             mutation_possible=mutation_possible,
+        )
+    if store in ADAPTER_ONLY_STORES:
+        raise CartAgentError(
+            "Для Яндекс Лавки нет подписанного журнала очистки; проверьте "
+            "корзину вручную.",
+            mutation_possible=True,
         )
     return run_store_cart_task(
         run,

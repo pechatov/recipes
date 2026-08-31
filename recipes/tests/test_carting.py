@@ -14,6 +14,9 @@ from django.utils import timezone
 
 from recipes.carting.pipeline import (
     _release_browser_operation,
+    _safe_yandex_food_url,
+    _save_result,
+    _yandex_food_product_id,
     claim_cart_run,
     expire_unconfirmed_cart_runs,
     finish_requested_cart_stop,
@@ -2251,6 +2254,129 @@ class CartPipelineTests(TestCase):
 
         self.assertEqual(result, run_task.return_value)
         run_task.assert_called_once_with(run, "auchan", "assemble")
+
+    def test_cart_urls_accept_both_yandex_food_sites(self):
+        lavka_product = (
+            "https://lavka.yandex.ru/good/"
+            "089a924f0dbf4beba35a86e1d02c9df5000300010000"
+        )
+        eda_product = (
+            "https://eda.yandex.ru/retail/auchan/product/"
+            "12345678-1234-1234-1234-123456789abc?placeSlug=auchan-nearby"
+        )
+        self.assertEqual(_safe_yandex_food_url(lavka_product), lavka_product)
+        self.assertEqual(
+            _safe_yandex_food_url("https://lavka.yandex.ru/cart"),
+            "https://lavka.yandex.ru/cart",
+        )
+        self.assertEqual(
+            _yandex_food_product_id(lavka_product),
+            "089a924f0dbf4beba35a86e1d02c9df5000300010000",
+        )
+        self.assertEqual(
+            _yandex_food_product_id(eda_product),
+            "12345678-1234-1234-1234-123456789abc",
+        )
+        self.assertEqual(_safe_yandex_food_url("https://kuper.ru/cart"), "")
+        self.assertEqual(_safe_yandex_food_url("http://lavka.yandex.ru/cart"), "")
+        self.assertEqual(
+            _yandex_food_product_id("https://lavka.yandex.ru/search?text=x"),
+            "",
+        )
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="https://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_lavka_assembles_through_adapter_with_lavka_urls(
+        self, adapter_task, run_task
+    ):
+        product_id = "089a924f0dbf4beba35a86e1d02c9df5000300010000"
+        product_url = f"https://lavka.yandex.ru/good/{product_id}"
+        adapter_task.side_effect = [
+            {
+                "status": "ready",
+                "selection_token": "signed-selection",
+                "cart_url": "https://lavka.yandex.ru/cart",
+                "elapsed_ms": 400,
+                "results": [
+                    {
+                        "index": 0,
+                        "candidates": [
+                            {
+                                "product_id": product_id,
+                                "sku_id": product_id,
+                                "name": "Спагетти 450 г",
+                                "weight": "450 g",
+                                "available": True,
+                                "in_stock": 8,
+                                "price": "95",
+                                "product_url": product_url,
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "status": "applied",
+                "cart_url": "https://lavka.yandex.ru/cart",
+                "elapsed_ms": 250,
+                "additions": [{"product_id": product_id, "added_quantity": 1}],
+                "cleanup_token": "signed-cleanup",
+            },
+        ]
+        run = self.make_run(stores=["lavka"])
+
+        result = assemble_store_cart(run, "lavka")
+
+        self.assertEqual(result["status"], "exact")
+        self.assertEqual(result["cart_url"], "https://lavka.yandex.ru/cart")
+        self.assertEqual(result["items"][0]["product_url"], product_url)
+        run_task.assert_not_called()
+
+        attempt = CartAttempt.objects.create(
+            run=run,
+            store="lavka",
+            status=CartAttempt.Status.PROCESSING,
+        )
+        _save_result(attempt, result)
+
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, CartAttempt.Status.EXACT)
+        self.assertEqual(attempt.cart_url, "https://lavka.yandex.ru/cart")
+        match = attempt.matches.get()
+        self.assertEqual(match.product_url, product_url)
+        added_items = attempt.result["added_items"]
+        self.assertEqual(added_items[0]["product_id"], product_id)
+
+    @override_settings(
+        CART_ADAPTER_BASE_URL="https://adapter.example",
+        CART_ADAPTER_API_KEY="adapter-key",
+        CART_ADAPTER_FALLBACK_TO_HERMES=True,
+    )
+    @patch("recipes.carting.client.run_store_cart_task")
+    @patch("recipes.carting.client._search_with_adapter")
+    def test_lavka_never_falls_back_to_hermes(self, adapter_search, run_task):
+        adapter_search.side_effect = CartAgentError("Адаптер недоступен")
+
+        with self.assertRaises(CartAgentError):
+            assemble_store_cart(self.make_run(stores=["lavka"]), "lavka")
+
+        run_task.assert_not_called()
+
+    @override_settings(CART_ADAPTER_BASE_URL="")
+    @patch("recipes.carting.client.run_store_cart_task")
+    def test_lavka_requires_adapter_even_without_adapter_configured(self, run_task):
+        with self.assertRaisesMessage(
+            CartAgentError,
+            "Сборка в Яндекс Лавке требует подключённый быстрый адаптер корзины.",
+        ):
+            assemble_store_cart(self.make_run(stores=["lavka"]), "lavka")
+
+        run_task.assert_not_called()
 
     @override_settings(
         CART_ADAPTER_BASE_URL="https://adapter.example",

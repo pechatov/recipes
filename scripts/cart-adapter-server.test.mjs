@@ -10,8 +10,12 @@ process.env.CART_ADAPTER_QUARANTINE_FILE = `/tmp/recipes-cart-quarantine-${proce
 
 const {
   boundedOperationTimeout,
+  chooseLavkaAddress,
   deferScopeRecovery,
   errorBody,
+  removeOperationRecord,
+  storeSite,
+  validatedLavkaContext,
   finalBrowserError,
   isScopeQuarantined,
   OperationError,
@@ -281,3 +285,89 @@ assert.equal(
 );
 assert.equal(starts, 2, "the scope must be released after completion");
 await unlink(process.env.CART_ADAPTER_QUARANTINE_FILE);
+
+// --- Яндекс Лавка helpers ---------------------------------------------------
+
+assert.equal(storeSite("lavka"), "lavka");
+assert.equal(storeSite("perekrestok"), "eda");
+
+const lavkaFavorites = [
+  {
+    addressId: "01OLDADDRESS0000000000000A",
+    address: { location: [37.5, 55.7], created: "2025-01-01T00:00:00Z" },
+    tags: ["EDA", "HOME"],
+  },
+  {
+    addressId: "01NEWADDRESS0000000000000B",
+    address: { location: [37.6, 55.8], created: "2026-08-01T00:00:00Z" },
+    tags: ["EDA"],
+  },
+  {
+    addressId: "01WORKPLACE00000000000000C",
+    address: { location: [37.7, 55.9], created: "2026-08-30T00:00:00Z" },
+    tags: ["MARKET", "WORK"],
+  },
+];
+assert.equal(
+  chooseLavkaAddress(lavkaFavorites).address_id,
+  "01NEWADDRESS0000000000000B",
+  "the most recent EDA-tagged address wins over other tags",
+);
+assert.equal(
+  chooseLavkaAddress([lavkaFavorites[2]]).address_id,
+  "01WORKPLACE00000000000000C",
+  "a single saved address is usable without the EDA tag",
+);
+assert.equal(
+  chooseLavkaAddress([lavkaFavorites[2], {
+    addressId: "01SECONDPLACE000000000000D",
+    address: { location: [37.1, 55.1] },
+    tags: [],
+  }]),
+  null,
+  "several untagged addresses are ambiguous",
+);
+assert.equal(chooseLavkaAddress([]), null);
+assert.equal(
+  chooseLavkaAddress([{ addressId: "bad id", address: { location: [37.5, 55.7] }, tags: ["EDA"] }]),
+  null,
+  "a malformed address id is rejected",
+);
+assert.equal(
+  chooseLavkaAddress([{ addressId: "01BROKEN00000000000000000E", address: { location: [null, 55.7] }, tags: ["EDA"] }]),
+  null,
+  "an address without coordinates is rejected",
+);
+
+const lavkaContext = validatedLavkaContext({
+  site: "lavka",
+  address_id: "01NEWADDRESS0000000000000B",
+  latitude: 55.8,
+  longitude: 37.6,
+  store_url: "https://lavka.yandex.ru/",
+});
+assert.equal(lavkaContext.address_id, "01NEWADDRESS0000000000000B");
+for (const broken of [
+  {},
+  { site: "eda", address_id: "01NEWADDRESS0000000000000B", latitude: 55.8, longitude: 37.6, store_url: "https://lavka.yandex.ru/" },
+  { site: "lavka", address_id: "bad id", latitude: 55.8, longitude: 37.6, store_url: "https://lavka.yandex.ru/" },
+  { site: "lavka", address_id: "01NEWADDRESS0000000000000B", latitude: 555, longitude: 37.6, store_url: "https://lavka.yandex.ru/" },
+  { site: "lavka", address_id: "01NEWADDRESS0000000000000B", latitude: 55.8, longitude: 37.6, store_url: "https://eda.yandex.ru/retail" },
+]) {
+  assert.throws(
+    () => validatedLavkaContext(broken),
+    (error) => error.code === "invalid_selection",
+    JSON.stringify(broken),
+  );
+}
+
+await storeOperationRecord("scope:lavka-conflict", {
+  status: "started",
+  fingerprint: "lavka-fingerprint",
+  started_at: new Date().toISOString(),
+});
+assert.ok(await readOperationRecord("scope:lavka-conflict"));
+await removeOperationRecord("scope:lavka-conflict");
+assert.equal(await readOperationRecord("scope:lavka-conflict"), null);
+await removeOperationRecord("scope:lavka-conflict");
+assert.equal(await readOperationRecord("scope:lavka-conflict"), null);
