@@ -896,12 +896,15 @@ def import_retry(request, pk):
 @login_required
 @require_POST
 def import_delete(request, pk):
-    job = get_object_or_404(
-        ImportJob.objects.exclude(status=ImportJob.Status.PROCESSING),
-        pk=pk,
-        requested_by=request.user,
-    )
-    job.delete()
+    with transaction.atomic():
+        job = get_object_or_404(
+            ImportJob.objects.select_for_update().exclude(
+                status=ImportJob.Status.PROCESSING
+            ),
+            pk=pk,
+            requested_by=request.user,
+        )
+        job.delete()
     messages.success(request, "Импорт удалён.")
     return redirect("task-list")
 
