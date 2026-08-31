@@ -1014,6 +1014,74 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(response, "12.08.2026 03:29")
 
+    def test_draft_list_does_not_show_import_queue(self):
+        ImportJob.objects.create(
+            source_url="https://example.com/queued",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.FAILED,
+            requested_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("draft-list"))
+
+        self.assertNotContains(response, "Очередь импорта")
+        self.assertNotContains(response, "https://example.com/queued")
+
+    def test_failed_import_can_be_deleted(self):
+        job = ImportJob.objects.create(
+            source_url="https://example.com/broken",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.FAILED,
+            requested_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        tasks = self.client.get(reverse("task-list"))
+        delete_url = reverse("import-delete", args=[job.pk])
+        self.assertContains(tasks, f'action="{delete_url}"')
+
+        response = self.client.post(delete_url)
+
+        self.assertRedirects(response, reverse("task-list"))
+        self.assertFalse(ImportJob.objects.filter(pk=job.pk).exists())
+
+    def test_deleting_completed_import_keeps_draft_recipes(self):
+        draft = Recipe.objects.create(
+            title="Черновик из импорта",
+            status=Recipe.Status.DRAFT,
+            created_by=self.user,
+        )
+        job = ImportJob.objects.create(
+            source_url="https://example.com/done",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.COMPLETED,
+            recipe=draft,
+            requested_by=self.user,
+        )
+        job.recipes.add(draft)
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("import-delete", args=[job.pk]))
+
+        self.assertRedirects(response, reverse("task-list"))
+        self.assertFalse(ImportJob.objects.filter(pk=job.pk).exists())
+        self.assertTrue(Recipe.objects.filter(pk=draft.pk).exists())
+
+    def test_processing_import_cannot_be_deleted(self):
+        job = ImportJob.objects.create(
+            source_url="https://example.com/in-progress",
+            source_type=ImportJob.SourceType.WEBSITE,
+            status=ImportJob.Status.PROCESSING,
+            requested_by=self.user,
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("import-delete", args=[job.pk]))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(ImportJob.objects.filter(pk=job.pk).exists())
+
     def test_completed_draft_can_be_queued_for_reprocessing(self):
         draft = Recipe.objects.create(
             title="Суп с гренками",
@@ -1097,6 +1165,11 @@ class RecipeViewTests(TestCase):
             self.client.post(reverse("import-retry", args=[failed.pk])).status_code,
             404,
         )
+        self.assertEqual(
+            self.client.post(reverse("import-delete", args=[failed.pk])).status_code,
+            404,
+        )
+        self.assertTrue(ImportJob.objects.filter(pk=failed.pk).exists())
         completed.refresh_from_db()
         failed.refresh_from_db()
         self.assertEqual(completed.status, ImportJob.Status.COMPLETED)

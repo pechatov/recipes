@@ -11,6 +11,7 @@ urlpatterns = [
     path("imports/new/", views.import_create, name="import-create"),
     path("imports/<int:pk>/", views.import_detail, name="import-detail"),
     path("imports/<int:pk>/retry/", views.import_retry, name="import-retry"),
+    path("imports/<int:pk>/delete/", views.import_delete, name="import-delete"),
     path("imports/<int:pk>/reprocess/", views.import_reprocess, name="import-reprocess"),
     path("shopping/stores/", views.store_preferences, name="store-preferences"),
     path("shopping/yandex/", views.yandex_connection, name="yandex-connection"),

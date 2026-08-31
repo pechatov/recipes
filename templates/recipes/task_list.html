@@ -45,14 +45,28 @@
       {% if import_jobs %}
         <div class="task-list">
           {% for job in import_jobs %}
-            <a class="task-item" href="{% url 'import-detail' job.pk %}">
-              <span class="task-status status-{{ job.status }}" aria-hidden="true"></span>
-              <span class="task-copy">
-                <strong>{{ job.source_title|default:job.source_url|truncatechars:64 }}</strong>
-                <small>{{ job.created_at|date:"d.m.Y H:i" }} · {{ job.get_status_display }}</small>
-              </span>
-              <span class="task-arrow">→</span>
-            </a>
+            {% if job.status == "failed" %}
+              <div class="task-item">
+                <span class="task-status status-{{ job.status }}" aria-hidden="true"></span>
+                <a class="task-copy task-copy-link" href="{% url 'import-detail' job.pk %}">
+                  <strong>{{ job.source_title|default:job.source_url|truncatechars:64 }}</strong>
+                  <small>{{ job.created_at|date:"d.m.Y H:i" }} · {{ job.get_status_display }}</small>
+                </a>
+                <form method="post" action="{% url 'import-delete' job.pk %}">
+                  {% csrf_token %}
+                  <button class="task-delete-button" type="submit" aria-label="Удалить импорт «{{ job.source_title|default:job.source_url|truncatechars:64 }}»">Удалить</button>
+                </form>
+              </div>
+            {% else %}
+              <a class="task-item" href="{% url 'import-detail' job.pk %}">
+                <span class="task-status status-{{ job.status }}" aria-hidden="true"></span>
+                <span class="task-copy">
+                  <strong>{{ job.source_title|default:job.source_url|truncatechars:64 }}</strong>
+                  <small>{{ job.created_at|date:"d.m.Y H:i" }} · {{ job.get_status_display }}</small>
+                </span>
+                <span class="task-arrow">→</span>
+              </a>
+            {% endif %}
           {% endfor %}
         </div>
       {% else %}

@@ -3,7 +3,7 @@
 {% block content %}
   {% if job.status == "pending" or job.status == "processing" %}<meta http-equiv="refresh" content="4">{% endif %}
   <section class="status-card">
-    <a class="back-link" href="{% url 'draft-list' %}">← Черновики</a>
+    <a class="back-link" href="{% url 'task-list' %}">← Задачи</a>
     {% if job.status == "pending" %}
       <div class="status-orb is-working">…</div>
       <p class="eyebrow">В очереди</p>
@@ -48,10 +48,16 @@
       <p class="eyebrow">Не получилось</p>
       <h1>Импорт остановлен</h1>
       <p class="lead">{{ job.error|default:"Неизвестная ошибка импорта." }}</p>
-      <form method="post" action="{% url 'import-retry' job.pk %}">
-        {% csrf_token %}
-        <button class="button" type="submit">Попробовать снова</button>
-      </form>
+      <div class="action-row">
+        <form method="post" action="{% url 'import-retry' job.pk %}">
+          {% csrf_token %}
+          <button class="button" type="submit">Попробовать снова</button>
+        </form>
+        <form method="post" action="{% url 'import-delete' job.pk %}">
+          {% csrf_token %}
+          <button class="button button-secondary" type="submit">Удалить импорт</button>
+        </form>
+      </div>
     {% endif %}
     <p class="source-note"><a href="{{ job.source_url }}" target="_blank" rel="noopener noreferrer">Открыть исходную ссылку ↗</a></p>
   </section>
