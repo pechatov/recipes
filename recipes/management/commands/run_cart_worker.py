@@ -89,10 +89,15 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        recovered = self.recover_stale_jobs()
-        if recovered:
-            self.stdout.write(f"Recovered {recovered} stale cart run(s)")
         while True:
+            # A worker killed mid-operation (deploy, OOM) leaves its run
+            # holding the browser reservation, which blocks every future
+            # claim. Recovery must therefore run continuously, not only at
+            # start-up: the replacement worker may start before the stale
+            # operation crosses the timeout cutoff.
+            recovered = self.recover_stale_jobs()
+            if recovered:
+                self.stdout.write(f"Recovered {recovered} stale cart run(s)")
             expired = expire_unconfirmed_cart_runs()
             if expired:
                 self.stdout.write(f"Queued cleanup for {expired} expired cart(s)")

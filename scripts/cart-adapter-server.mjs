@@ -67,11 +67,16 @@ const stores = {
   lavka: {
     aliases: ["яндекс лавка", "лавка", "yandex lavka"],
     groupSlugs: ["lavka"],
-    // The "Магазины" landing links Яндекс Лавка to lavka.yandex.ru, a separate
-    // site without the Yandex Food retail catalog and cart APIs.
-    unavailableSummary: "Яндекс Лавка работает на отдельном сайте и не поддерживается быстрой сборкой.",
+    // Яндекс Лавка lives on lavka.yandex.ru, a separate site with its own
+    // catalog and versioned cart API; the shared passport cookies of the
+    // persistent profile authenticate it.
+    site: "lavka",
   },
 };
+
+function storeSite(store) {
+  return stores[store]?.site || "eda";
+}
 
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
 const tlsEnabled = Boolean(tlsCertPath && tlsKeyPath);
@@ -234,6 +239,28 @@ async function storeOperationRecord(key, record, writeState = durableWriteState)
     throw new OperationError(
       "operation_state_unavailable",
       "Не удалось сохранить журнал операции; проверьте корзину вручную.",
+      { mutationPossible: true },
+    );
+  }
+}
+
+async function removeOperationRecord(key, writeState = durableWriteState) {
+  const write = operationWriteQueue.then(async () => {
+    const currentRecords = await loadOperationRecords();
+    if (!Object.hasOwn(currentRecords, key)) return;
+    const records = Object.assign(Object.create(null), currentRecords);
+    delete records[key];
+    await writeState(operationStateFile, JSON.stringify(records));
+    operationRecordsPromise = Promise.resolve(records);
+  });
+  operationWriteQueue = write.catch(() => {});
+  try {
+    await write;
+  } catch (error) {
+    if (error instanceof OperationError) throw error;
+    throw new OperationError(
+      "operation_state_unavailable",
+      "Не удалось обновить журнал операции; проверьте корзину вручную.",
       { mutationPossible: true },
     );
   }
@@ -891,9 +918,6 @@ function classifyApiStatus(status, message) {
 }
 
 async function resolveStore(browser, store) {
-  if (stores[store].unavailableSummary) {
-    throw new OperationError("store_unavailable", stores[store].unavailableSummary);
-  }
   let selected = null;
   let fallbackLocation = null;
   for (const groupSlug of stores[store].groupSlugs) {
@@ -974,6 +998,494 @@ function sameLocation(left, right) {
     && Number.isFinite(longitude)
     && Math.abs(latitude - right.latitude) <= 0.00001
     && Math.abs(longitude - right.longitude) <= 0.00001;
+}
+
+// --- Яндекс Лавка (lavka.yandex.ru) ---------------------------------------
+// The Lavka web app talks to its backend through POST /api/v1/providers/*
+// with an x-csrf-token header taken from the SSR page props. The cart is
+// versioned: cart/v1/update writes absolute per-item quantities and the
+// server atomically rejects a stale cartVersion with HTTP 409, so a rejected
+// write provably changed nothing.
+
+const lavkaStoreUrl = "https://lavka.yandex.ru/";
+const lavkaCartUrl = "https://lavka.yandex.ru/cart";
+const lavkaAddressIdPattern = /^[A-Za-z0-9_-]{8,64}$/;
+const lavkaPricePattern = /^[0-9]+(?:\.[0-9]+)?$/;
+
+const lavkaBootstrapExpression = `(() => {
+  const body = String(document.body?.innerText || '').toLocaleLowerCase('ru');
+  let csrf = '';
+  try {
+    csrf = String(JSON.parse(document.getElementById('__page_props__-data')?.textContent || '{}').csrfToken || '');
+  } catch {}
+  return {
+    host: location.hostname,
+    csrf: location.hostname === 'lavka.yandex.ru' ? csrf : '',
+    blocked: body.includes('captcha') || body.includes('капч') || body.includes('подтвердите, что вы не робот'),
+  };
+})()`;
+
+async function lavkaBootstrap(browser) {
+  let state = null;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    state = await evaluate(browser, lavkaBootstrapExpression);
+    if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
+    if (state?.csrf) return state;
+    await sleep(500);
+  }
+  throw new OperationError("store_unavailable", "Сайт Яндекс Лавки не загрузился.");
+}
+
+function lavkaApiExpression(path, payload) {
+  return `(async () => {
+    const path = ${JSON.stringify(`/api/v1/providers/${path}`)};
+    let csrf = '';
+    try {
+      csrf = String(JSON.parse(document.getElementById('__page_props__-data')?.textContent || '{}').csrfToken || '');
+    } catch {}
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: {'accept': 'application/json', 'content-type': 'application/json', 'x-csrf-token': csrf},
+      body: JSON.stringify(${JSON.stringify(payload)}),
+    });
+    let data = {};
+    try { data = await response.json(); } catch {}
+    return {status: response.status, data};
+  })()`;
+}
+
+// Choose the delivery address the assembly must use. The favorites book is
+// shared with the rest of the Yandex account; the entry tagged EDA is the
+// address already saved in Яндекс Еда, so all stores assemble to one place.
+function chooseLavkaAddress(rawEntries) {
+  const coordinate = (value) => (
+    typeof value === "number" && Number.isFinite(value) ? value : NaN
+  );
+  const entries = (Array.isArray(rawEntries) ? rawEntries : [])
+    .map((entry) => ({
+      address_id: String(entry?.addressId || ""),
+      longitude: coordinate(entry?.address?.location?.[0]),
+      latitude: coordinate(entry?.address?.location?.[1]),
+      tags: Array.isArray(entry?.tags) ? entry.tags.map(String) : [],
+      created: Date.parse(String(entry?.address?.created || "")) || 0,
+    }))
+    .filter((entry) => (
+      lavkaAddressIdPattern.test(entry.address_id)
+      && Number.isFinite(entry.latitude)
+      && entry.latitude >= -90
+      && entry.latitude <= 90
+      && Number.isFinite(entry.longitude)
+      && entry.longitude >= -180
+      && entry.longitude <= 180
+    ));
+  const tagged = entries.filter((entry) => entry.tags.includes("EDA"));
+  const pool = tagged.length ? tagged : entries.length === 1 ? entries : [];
+  if (!pool.length) return null;
+  return pool.reduce((best, entry) => (entry.created > best.created ? entry : best));
+}
+
+async function resolveLavkaAddress(browser) {
+  const favorites = await evaluate(
+    browser,
+    lavkaApiExpression("address/v1/get-favorite-addresses", {}),
+  );
+  const status = Number(favorites?.status || 0);
+  if (status === 401 || status === 403) {
+    throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
+  }
+  classifyApiStatus(status, "Адресная книга Яндекс Лавки недоступна.");
+  const selected = chooseLavkaAddress(favorites?.data);
+  if (!selected) {
+    throw new OperationError(
+      "login_required",
+      "Нужно сохранить адрес доставки в Яндекс Еде.",
+    );
+  }
+  return selected;
+}
+
+function validatedLavkaContext(value) {
+  const context = {
+    site: "lavka",
+    address_id: text(value?.address_id, 64),
+    latitude: Number(value?.latitude),
+    longitude: Number(value?.longitude),
+    store_url: text(value?.store_url, 2048),
+  };
+  if (
+    String(value?.site || "") !== "lavka"
+    || !lavkaAddressIdPattern.test(context.address_id)
+    || !Number.isFinite(context.latitude)
+    || context.latitude < -90
+    || context.latitude > 90
+    || !Number.isFinite(context.longitude)
+    || context.longitude < -180
+    || context.longitude > 180
+    || context.store_url !== lavkaStoreUrl
+  ) {
+    throw new OperationError("invalid_selection", "Контекст поиска недействителен.");
+  }
+  return context;
+}
+
+async function requireSignedLavkaAddress(browser, signedContext) {
+  const address = await resolveLavkaAddress(browser);
+  if (
+    address.address_id !== signedContext.address_id
+    || !sameLocation(address, signedContext)
+  ) {
+    throw new OperationError(
+      "invalid_selection",
+      "Адрес доставки изменился после поиска; соберите корзину заново.",
+    );
+  }
+  return { ...signedContext, latitude: address.latitude, longitude: address.longitude };
+}
+
+function lavkaErrorCode(data) {
+  return text(
+    data?.data?.data?.response?.code
+      || data?.data?.data?.response?.message
+      || data?.data?.message,
+    120,
+  );
+}
+
+async function readLavkaCart(browser, context) {
+  const cart = await evaluate(browser, lavkaApiExpression("cart/v1/retrieve", {
+    position: { location: [context.longitude, context.latitude] },
+  }));
+  const status = Number(cart?.status || 0);
+  if (status === 404) {
+    throw new OperationError(
+      "store_unavailable",
+      "Лавка не доставляет по сохранённому адресу.",
+    );
+  }
+  classifyApiStatus(status, "Корзина Яндекс Лавки недоступна.");
+  const data = cart?.data && typeof cart.data === "object" ? cart.data : {};
+  const cartVersion = Number(data.cartVersion);
+  const items = Array.isArray(data.items) ? data.items : [];
+  return {
+    cart_id: text(data.cartId, 128),
+    cart_version: Number.isInteger(cartVersion) ? cartVersion : null,
+    items: items
+      .map((item) => ({
+        ids: [String(item?.id || "")].filter((value) => productIdPattern.test(value)),
+        quantity: Number(item?.quantity ?? 0),
+      }))
+      .filter((item) => (
+        item.ids.length && Number.isFinite(item.quantity) && item.quantity >= 0
+      )),
+  };
+}
+
+async function readLavkaCartUntil(browser, context, predicate) {
+  let cart = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    cart = await readLavkaCart(browser, context);
+    if (predicate(cart)) return cart;
+    await sleep(300);
+  }
+  return cart;
+}
+
+function lavkaSearchExpression(context, ingredients) {
+  return `(async () => {
+    const position = ${JSON.stringify({ location: [context.longitude, context.latitude] })};
+    const ingredients = ${JSON.stringify(ingredients)};
+    let csrf = '';
+    try {
+      csrf = String(JSON.parse(document.getElementById('__page_props__-data')?.textContent || '{}').csrfToken || '');
+    } catch {}
+    let cursor = 0;
+    const results = new Array(ingredients.length);
+    const worker = async () => {
+      while (true) {
+        const index = cursor++;
+        if (index >= ingredients.length) return;
+        const ingredient = ingredients[index];
+        const queries = Array.isArray(ingredient.queries) && ingredient.queries.length
+          ? ingredient.queries
+          : [ingredient.query];
+        const candidates = [];
+        const seen = new Set();
+        let status = 0;
+        let succeeded = false;
+        let fallbackStatus = null;
+        for (const query of queries) {
+          const response = await fetch('/api/v1/providers/search/v3/lavka', {
+            method: 'POST',
+            headers: {'accept': 'application/json', 'content-type': 'application/json', 'x-csrf-token': csrf},
+            body: JSON.stringify({
+              text: query,
+              productsLimit: ${maximumCandidatesPerIngredient},
+              subcategoriesLimit: 0,
+              position,
+            }),
+          });
+          if (response.status < 200 || response.status >= 300) {
+            if (succeeded) fallbackStatus = response.status;
+            else status = response.status;
+            break;
+          }
+          status = response.status;
+          succeeded = true;
+          let data = {};
+          try { data = await response.json(); } catch {}
+          // Only "good" layout tiles of the regular depot are orderable in
+          // this cart; supermarket suggestions belong to a separate depot
+          // cart and must never be added here.
+          const regularIds = new Set((Array.isArray(data.layoutItems) ? data.layoutItems : [])
+            .filter((item) => (
+              item?.type === 'good'
+              && item.isSupermarket !== true
+              && (item.depotType || 'regular') === 'regular'
+            ))
+            .map((item) => String(item.id || '')));
+          const products = Array.isArray(data.cacheProducts) ? data.cacheProducts : [];
+          for (const product of products) {
+            if (candidates.length >= ${maximumCandidatesPerIngredient}) break;
+            const productId = String(product?.id || '');
+            if (!productId || seen.has(productId) || !regularIds.has(productId)) continue;
+            if (product.available === false || product.comingSoon === true) continue;
+            if (product.adult === true || product.requiredRestriction) continue;
+            seen.add(productId);
+            const stock = Number(product.maxAmount ?? product.quantityLimit);
+            candidates.push({
+              product_id: productId,
+              sku_id: productId,
+              name: String(product.longTitle || product.title || '').replace(/\\u00ad/g, '').slice(0, 300),
+              weight: String(product.amount || '').slice(0, 80),
+              available: product.available !== false,
+              in_stock: Number.isFinite(stock) && stock > 0 ? stock : null,
+              price: product.currentPrice ?? null,
+              query,
+            });
+          }
+          if (candidates.length >= ${sufficientCandidates}) break;
+        }
+        results[index] = { index, status, fallback_status: fallbackStatus, candidates };
+      }
+    };
+    await Promise.all(Array.from({length: Math.min(4, ingredients.length)}, worker));
+    return results;
+  })()`;
+}
+
+function lavkaUpdateExpression(context, cart, updates) {
+  return lavkaApiExpression("cart/v1/update", {
+    position: { location: [context.longitude, context.latitude] },
+    cartId: cart.cart_id,
+    cartVersion: cart.cart_version,
+    items: updates,
+  });
+}
+
+async function searchLavka(scope, store, operationId, ingredients, started) {
+  return withBrowser(scope, async (browser) => {
+    await lavkaBootstrap(browser);
+    const address = await resolveLavkaAddress(browser);
+    const context = {
+      site: "lavka",
+      address_id: address.address_id,
+      latitude: address.latitude,
+      longitude: address.longitude,
+      store_url: lavkaStoreUrl,
+    };
+    // Reading the cart validates the authenticated session and confirms the
+    // saved address is inside a Lavka delivery zone. It changes nothing.
+    await readLavkaCart(browser, context);
+    const rawResults = await evaluate(
+      browser,
+      lavkaSearchExpression(context, ingredients),
+      90_000,
+    );
+    if (!Array.isArray(rawResults) || rawResults.length !== ingredients.length) {
+      throw new OperationError("upstream_failed", "Поиск товаров вернул неполный ответ.");
+    }
+    const allowed = Object.create(null);
+    const prices = Object.create(null);
+    const results = rawResults.map((result, index) => {
+      classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
+      if (!(result?.candidates || []).length && result?.fallback_status) {
+        classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
+      }
+      const candidates = [];
+      for (const candidate of result.candidates || []) {
+        const productId = text(candidate.product_id, 128);
+        const name = text(candidate.name, 300);
+        const price = text(candidate.price, 24);
+        if (
+          !productIdPattern.test(productId)
+          || !name
+          || !lavkaPricePattern.test(price)
+        ) {
+          continue;
+        }
+        allowed[productId] = productId;
+        prices[productId] = price;
+        candidates.push({
+          ...candidate,
+          product_id: productId,
+          sku_id: productId,
+          name,
+          price,
+          product_url: `https://lavka.yandex.ru/good/${encodeURIComponent(productId)}`,
+        });
+      }
+      return { index, candidates };
+    });
+    const selectionToken = sealSelection({
+      scope,
+      store,
+      operation_id: operationId,
+      context,
+      allowed,
+      prices,
+      expires_at: Date.now() + tokenLifetimeMs,
+    });
+    return {
+      status: "ready",
+      cart_url: lavkaCartUrl,
+      selection_token: selectionToken,
+      results,
+      elapsed_ms: Date.now() - started,
+    };
+  }, { possible: false }, lavkaStoreUrl);
+}
+
+async function applyLavkaSelection({
+  scope,
+  store,
+  signedContext,
+  selection,
+  requested,
+  recordKey,
+  fingerprint,
+  mutationState,
+  started,
+}) {
+  return withBrowser(scope, async (browser) => {
+    await lavkaBootstrap(browser);
+    const context = await requireSignedLavkaAddress(browser, signedContext);
+    const before = await readLavkaCart(browser, context);
+    if (before.cart_version === null || !before.cart_id) {
+      throw new OperationError("upstream_failed", "Корзина Лавки не вернула версию.");
+    }
+    const quantitiesBefore = new Map();
+    const quantitiesExpected = new Map();
+    const updates = [];
+    for (const item of requested) {
+      const existing = quantityInCart(before, item.product_id, item.sku_id);
+      const expected = existing + item.quantity;
+      if (
+        !Number.isInteger(existing)
+        || existing < 0
+        || !Number.isInteger(expected)
+        || expected > 100
+      ) {
+        throw new OperationError(
+          "quantity_limit",
+          "Количество товара в корзине не позволяет безопасно добавить рецепт.",
+        );
+      }
+      quantitiesBefore.set(item.product_id, existing);
+      quantitiesExpected.set(item.product_id, expected);
+      // cart/v1/update writes the absolute quantity for each listed item and
+      // leaves the others untouched. Together with the cartVersion check the
+      // write is a compare-and-swap over the state read above.
+      updates.push({
+        id: item.product_id,
+        price: String(selection.prices[item.product_id]),
+        quantity: String(expected),
+        currency: "RUB",
+      });
+    }
+
+    // Persist intent before crossing the mutation boundary. If the process or
+    // response is lost afterwards, a retry fails closed instead of adding the
+    // same recipe twice.
+    await storeOperationRecord(recordKey, {
+      status: "started",
+      fingerprint,
+      started_at: new Date().toISOString(),
+    });
+    const changed = await dispatchCartMutation(
+      browser,
+      lavkaUpdateExpression(context, before, updates),
+      mutationState,
+    );
+    const changedStatus = Number(changed?.status || 0);
+    if (changedStatus === 409) {
+      // The versioned write was atomically rejected; the cart provably kept
+      // the state read above, so no cleanup or manual check is needed and the
+      // journal entry may be released for a clean retry. A failed release
+      // keeps the conservative fail-closed record instead.
+      await removeOperationRecord(recordKey);
+      mutationState.possible = false;
+      throw new OperationError(
+        "verification_failed",
+        "Корзина изменилась во время сборки; запустите её ещё раз.",
+      );
+    }
+    if (changedStatus < 200 || changedStatus >= 300) {
+      const errorCode = lavkaErrorCode(changed);
+      console.warn("Lavka cart mutation rejected", {
+        status: changedStatus,
+        code: errorCode,
+      });
+      classifyApiStatus(
+        changedStatus,
+        `Яндекс Лавка не смогла изменить корзину${errorCode ? ` (${errorCode})` : ""}.`,
+      );
+    }
+    const after = await readLavkaCartUntil(browser, context, (cart) => requested.every((item) => {
+      const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
+      return quantityInCart(cart, item.product_id, item.sku_id) === expectedQuantity;
+    }));
+    const additions = [];
+    for (const item of requested) {
+      const beforeQuantity = quantitiesBefore.get(item.product_id) || 0;
+      const afterQuantity = quantityInCart(after, item.product_id, item.sku_id);
+      const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
+      if (afterQuantity !== expectedQuantity) {
+        throw new OperationError(
+          "verification_failed",
+          "Количество товара в корзине не удалось подтвердить.",
+          { mutationPossible: mutationState.possible },
+        );
+      }
+      additions.push({
+        product_id: item.product_id,
+        sku_id: item.sku_id,
+        before_quantity: beforeQuantity,
+        after_quantity: afterQuantity,
+        added_quantity: Math.max(0, afterQuantity - beforeQuantity),
+      });
+    }
+    const cleanupItems = additions.filter((item) => item.added_quantity > 0);
+    const cleanupToken = cleanupItems.length ? sealCleanup({
+      scope,
+      store,
+      context,
+      operation_id: selection.operation_id,
+      items: cleanupItems.map((item) => ({
+        product_id: item.product_id,
+        sku_id: item.sku_id,
+        before_quantity: item.before_quantity,
+        after_quantity: item.after_quantity,
+      })),
+      expires_at: Date.now() + cleanupTokenLifetimeMs,
+    }) : "";
+    return {
+      status: "applied",
+      cart_url: lavkaCartUrl,
+      additions,
+      cleanup_token: cleanupToken,
+      elapsed_ms: Date.now() - started,
+    };
+  }, mutationState, lavkaStoreUrl);
 }
 
 async function validateSignedStore(browser, context) {
@@ -1442,6 +1954,9 @@ async function search(body) {
   }
   const ingredients = validateIngredients(body);
   const started = Date.now();
+  if (storeSite(store) === "lavka") {
+    return searchLavka(scope, store, operationId, ingredients, started);
+  }
   return withBrowser(scope, async (browser) => {
     const context = await resolveStore(browser, store);
     // Reading the cart here validates the authenticated cookie/session before
@@ -1495,19 +2010,36 @@ async function search(body) {
   });
 }
 
+function publicCartItems(cart) {
+  return (cart.items || []).map((item) => ({
+    product_ids: (item.ids || []).filter((value) => productIdPattern.test(String(value))).slice(0, 8),
+    quantity: Number(item.quantity || 0),
+  })).filter((item) => item.product_ids.length && Number.isFinite(item.quantity));
+}
+
 async function cartState(body) {
   const { scope, store } = validateBaseRequest(body);
   const started = Date.now();
+  if (storeSite(store) === "lavka") {
+    return withBrowser(scope, async (browser) => {
+      await lavkaBootstrap(browser);
+      const address = await resolveLavkaAddress(browser);
+      const cart = await readLavkaCart(browser, address);
+      return {
+        status: "ready",
+        cart_url: lavkaCartUrl,
+        items: publicCartItems(cart),
+        elapsed_ms: Date.now() - started,
+      };
+    }, { possible: false }, lavkaStoreUrl);
+  }
   return withBrowser(scope, async (browser) => {
     const context = await resolveStore(browser, store);
     const cart = await readCart(browser, context);
     return {
       status: "ready",
       cart_url: context.store_url,
-      items: (cart.items || []).map((item) => ({
-        product_ids: (item.ids || []).filter((value) => productIdPattern.test(String(value))).slice(0, 8),
-        quantity: Number(item.quantity || 0),
-      })).filter((item) => item.product_ids.length && Number.isFinite(item.quantity)),
+      items: publicCartItems(cart),
       elapsed_ms: Date.now() - started,
     };
   });
@@ -1553,8 +2085,21 @@ async function applySelection(body) {
   ) {
     throw new OperationError("invalid_selection", "Поиск относится к другому пользователю или магазину.");
   }
-  const signedContext = validatedContext(selection.context);
+  const site = storeSite(store);
+  const signedContext = site === "lavka"
+    ? validatedLavkaContext(selection.context)
+    : validatedContext(selection.context);
   const requested = validateApplyItems(body, selection);
+  if (site === "lavka") {
+    for (const item of requested) {
+      if (!lavkaPricePattern.test(String(selection.prices?.[item.product_id] || ""))) {
+        throw new OperationError(
+          "invalid_selection",
+          "Выбран товар без подписанной цены; запустите сборку ещё раз.",
+        );
+      }
+    }
+  }
   const recordKey = `${scope}:${operationId}`;
   const fingerprint = operationFingerprint(scope, store, requested);
   const previous = await readOperationRecord(recordKey);
@@ -1588,107 +2133,119 @@ async function applySelection(body) {
   }
   const started = Date.now();
   const mutationState = { possible: false };
-  const result = await withBrowser(scope, async (browser) => {
-    const context = await validateSignedStore(browser, signedContext);
-    const before = await readCart(browser, context);
-    const quantitiesBefore = new Map();
-    const quantitiesExpected = new Map();
-    const itemsToAdd = [];
-    for (const item of requested) {
-      const existing = quantityInCart(before, item.product_id, item.sku_id);
-      const expected = existing + item.quantity;
-      if (
-        !Number.isInteger(existing)
-        || existing < 0
-        || !Number.isInteger(expected)
-        || expected > 100
-      ) {
-        throw new OperationError(
-          "quantity_limit",
-          "Количество товара в корзине не позволяет безопасно добавить рецепт.",
-        );
-      }
-      quantitiesBefore.set(item.product_id, existing);
-      quantitiesExpected.set(item.product_id, expected);
-      // POST applies a positive delta. Never write an absolute
-      // quantity here: a user may increase this SKU after the preceding read.
-      itemsToAdd.push({ ...item, delta: item.quantity });
-    }
-
-    const runMutation = async (mutationExpression) => {
-      const changed = await dispatchCartMutation(
-        browser,
-        mutationExpression,
-        mutationState,
-      );
-      const changedStatus = Number(changed?.status || 0);
-      const errorCode = text(changed?.error_code, 80);
-      const errorMessage = text(changed?.error_message, 240);
-      if (changedStatus < 200 || changedStatus >= 300) {
-        console.warn("Yandex legacy cart mutation rejected", {
-          status: changedStatus,
-          code: errorCode,
-          message: errorMessage,
-          response_keys: Array.isArray(changed?.response_keys) ? changed.response_keys : [],
-        });
-      }
-      classifyApiStatus(
-        changedStatus,
-        `Яндекс Еда не смогла изменить товар в корзине${errorCode ? ` (${errorCode})` : ""}${errorMessage ? `: ${errorMessage}` : ""}.`,
-      );
-    };
-
-    // Persist intent before crossing the mutation boundary. If the process or
-    // response is lost afterwards, a retry fails closed instead of adding the
-    // same recipe twice.
-    await storeOperationRecord(recordKey, {
-      status: "started",
-      fingerprint,
-      started_at: new Date().toISOString(),
-    });
-    await runMutation(addLegacyItemsExpression(context, itemsToAdd));
-    const after = await readCartUntil(browser, context, (cart) => requested.every((item) => {
-      const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
-      return quantityInCart(cart, item.product_id, item.sku_id) === expectedQuantity;
-    }));
-    const additions = [];
-    for (const item of requested) {
-      const beforeQuantity = quantitiesBefore.get(item.product_id) || 0;
-      const afterQuantity = quantityInCart(after, item.product_id, item.sku_id);
-      const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
-      if (afterQuantity !== expectedQuantity) {
-        throw new OperationError("verification_failed", "Количество товара в корзине не удалось подтвердить.", { mutationPossible: mutationState.possible });
-      }
-      additions.push({
-        product_id: item.product_id,
-        sku_id: item.sku_id,
-        before_quantity: beforeQuantity,
-        after_quantity: afterQuantity,
-        added_quantity: Math.max(0, afterQuantity - beforeQuantity),
-      });
-    }
-    const cleanupItems = additions.filter((item) => item.added_quantity > 0);
-    const cleanupToken = cleanupItems.length ? sealCleanup({
+  const result = site === "lavka"
+    ? await applyLavkaSelection({
       scope,
       store,
-      context,
-      operation_id: operationId,
-      items: cleanupItems.map((item) => ({
-        product_id: item.product_id,
-        sku_id: item.sku_id,
-        before_quantity: item.before_quantity,
-        after_quantity: item.after_quantity,
-      })),
-      expires_at: Date.now() + cleanupTokenLifetimeMs,
-    }) : "";
-    return {
-      status: "applied",
-      cart_url: context.store_url,
-      additions,
-      cleanup_token: cleanupToken,
-      elapsed_ms: Date.now() - started,
-    };
-  }, mutationState, signedContext.store_url);
+      signedContext,
+      selection,
+      requested,
+      recordKey,
+      fingerprint,
+      mutationState,
+      started,
+    })
+    : await withBrowser(scope, async (browser) => {
+      const context = await validateSignedStore(browser, signedContext);
+      const before = await readCart(browser, context);
+      const quantitiesBefore = new Map();
+      const quantitiesExpected = new Map();
+      const itemsToAdd = [];
+      for (const item of requested) {
+        const existing = quantityInCart(before, item.product_id, item.sku_id);
+        const expected = existing + item.quantity;
+        if (
+          !Number.isInteger(existing)
+          || existing < 0
+          || !Number.isInteger(expected)
+          || expected > 100
+        ) {
+          throw new OperationError(
+            "quantity_limit",
+            "Количество товара в корзине не позволяет безопасно добавить рецепт.",
+          );
+        }
+        quantitiesBefore.set(item.product_id, existing);
+        quantitiesExpected.set(item.product_id, expected);
+        // POST applies a positive delta. Never write an absolute
+        // quantity here: a user may increase this SKU after the preceding read.
+        itemsToAdd.push({ ...item, delta: item.quantity });
+      }
+
+      const runMutation = async (mutationExpression) => {
+        const changed = await dispatchCartMutation(
+          browser,
+          mutationExpression,
+          mutationState,
+        );
+        const changedStatus = Number(changed?.status || 0);
+        const errorCode = text(changed?.error_code, 80);
+        const errorMessage = text(changed?.error_message, 240);
+        if (changedStatus < 200 || changedStatus >= 300) {
+          console.warn("Yandex legacy cart mutation rejected", {
+            status: changedStatus,
+            code: errorCode,
+            message: errorMessage,
+            response_keys: Array.isArray(changed?.response_keys) ? changed.response_keys : [],
+          });
+        }
+        classifyApiStatus(
+          changedStatus,
+          `Яндекс Еда не смогла изменить товар в корзине${errorCode ? ` (${errorCode})` : ""}${errorMessage ? `: ${errorMessage}` : ""}.`,
+        );
+      };
+
+      // Persist intent before crossing the mutation boundary. If the process or
+      // response is lost afterwards, a retry fails closed instead of adding the
+      // same recipe twice.
+      await storeOperationRecord(recordKey, {
+        status: "started",
+        fingerprint,
+        started_at: new Date().toISOString(),
+      });
+      await runMutation(addLegacyItemsExpression(context, itemsToAdd));
+      const after = await readCartUntil(browser, context, (cart) => requested.every((item) => {
+        const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
+        return quantityInCart(cart, item.product_id, item.sku_id) === expectedQuantity;
+      }));
+      const additions = [];
+      for (const item of requested) {
+        const beforeQuantity = quantitiesBefore.get(item.product_id) || 0;
+        const afterQuantity = quantityInCart(after, item.product_id, item.sku_id);
+        const expectedQuantity = quantitiesExpected.get(item.product_id) || 0;
+        if (afterQuantity !== expectedQuantity) {
+          throw new OperationError("verification_failed", "Количество товара в корзине не удалось подтвердить.", { mutationPossible: mutationState.possible });
+        }
+        additions.push({
+          product_id: item.product_id,
+          sku_id: item.sku_id,
+          before_quantity: beforeQuantity,
+          after_quantity: afterQuantity,
+          added_quantity: Math.max(0, afterQuantity - beforeQuantity),
+        });
+      }
+      const cleanupItems = additions.filter((item) => item.added_quantity > 0);
+      const cleanupToken = cleanupItems.length ? sealCleanup({
+        scope,
+        store,
+        context,
+        operation_id: operationId,
+        items: cleanupItems.map((item) => ({
+          product_id: item.product_id,
+          sku_id: item.sku_id,
+          before_quantity: item.before_quantity,
+          after_quantity: item.after_quantity,
+        })),
+        expires_at: Date.now() + cleanupTokenLifetimeMs,
+      }) : "";
+      return {
+        status: "applied",
+        cart_url: context.store_url,
+        additions,
+        cleanup_token: cleanupToken,
+        elapsed_ms: Date.now() - started,
+      };
+    }, mutationState, signedContext.store_url);
   // A completed record is written only after withBrowser confirms that the
   // persistent profile was closed. A replay can then return this exact result
   // without touching Yandex or opening the profile again.
@@ -1709,7 +2266,9 @@ function validateCleanup(body, scope, store) {
       "Журнал очистки относится к другому пользователю или магазину.",
     );
   }
-  const context = validatedContext(cleanup.context);
+  const context = storeSite(store) === "lavka"
+    ? validatedLavkaContext(cleanup.context)
+    : validatedContext(cleanup.context);
   if (!cleanupOperationIdPattern.test(String(cleanup.operation_id || ""))) {
     throw new OperationError("invalid_cleanup", "Журнал очистки не содержит операцию.");
   }
@@ -1747,28 +2306,40 @@ function validateCleanup(body, scope, store) {
   return { context, items };
 }
 
+function outstandingCleanupResult(cart, cleanupRequest) {
+  let outstanding = 0;
+  for (const item of cleanupRequest.items) {
+    const existing = quantityInCart(cart, item.product_id, item.sku_id);
+    if (existing > item.before_quantity) outstanding += 1;
+  }
+  if (outstanding === 0) {
+    return { status: "cleared", summary: "Добавления этой сборки уже удалены из корзины." };
+  }
+  // Yandex Food exposes no conditional/versioned decrement, and an automatic
+  // downward write could overwrite a change made by the user after this read,
+  // so the adapter deliberately performs no downward mutation on either site.
+  return {
+    status: "login_required",
+    summary: `Удалите вручную добавления этой сборки (${outstanding} поз.).`,
+    mutation_possible: false,
+  };
+}
+
 async function cleanup(body) {
   const { scope, store } = validateBaseRequest(body);
   const cleanupRequest = validateCleanup(body, scope, store);
+  if (storeSite(store) === "lavka") {
+    return withBrowser(scope, async (browser) => {
+      await lavkaBootstrap(browser);
+      const context = await requireSignedLavkaAddress(browser, cleanupRequest.context);
+      const cart = await readLavkaCart(browser, context);
+      return outstandingCleanupResult(cart, cleanupRequest);
+    }, { possible: false }, lavkaStoreUrl);
+  }
   return withBrowser(scope, async (browser) => {
     const context = await validateSignedStore(browser, cleanupRequest.context);
     const cart = await readCart(browser, context);
-    let outstanding = 0;
-    for (const item of cleanupRequest.items) {
-      const existing = quantityInCart(cart, item.product_id, item.sku_id);
-      if (existing > item.before_quantity) outstanding += 1;
-    }
-    if (outstanding === 0) {
-      return { status: "cleared", summary: "Добавления этой сборки уже удалены из корзины." };
-    }
-    // Yandex exposes no conditional/versioned decrement. An automatic PUT or
-    // DELETE could overwrite a change made by the user after this read, so the
-    // adapter deliberately performs no downward mutation.
-    return {
-      status: "login_required",
-      summary: `Удалите вручную добавления этой сборки (${outstanding} поз.).`,
-      mutation_possible: false,
-    };
+    return outstandingCleanupResult(cart, cleanupRequest);
   }, { possible: false }, cleanupRequest.context.store_url);
 }
 
@@ -1848,8 +2419,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 }
 
 export {
+  chooseLavkaAddress,
   classifyStorefrontUrl,
+  removeOperationRecord,
   searchQueries,
+  storeSite,
+  validatedLavkaContext,
   errorBody,
   boundedOperationTimeout,
   deferScopeRecovery,

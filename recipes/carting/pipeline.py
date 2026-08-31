@@ -33,6 +33,10 @@ MATCH_QUALITIES = {
     CartItemMatch.MatchQuality.MISSING,
 }
 PRODUCT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,128}")
+# Яндекс Еда storefronts live on eda.yandex.ru; Яндекс Лавка is a separate
+# site with /good/<id> product pages.
+SAFE_CART_HOSTS = {"eda.yandex.ru", "lavka.yandex.ru"}
+PRODUCT_PATH_MARKERS = {"product", "good"}
 
 
 def _text(value, limit: int) -> str:
@@ -45,7 +49,7 @@ def _safe_yandex_food_url(value) -> str:
         parsed = urlparse(url)
     except ValueError:
         return ""
-    if parsed.scheme != "https" or parsed.hostname != "eda.yandex.ru":
+    if parsed.scheme != "https" or parsed.hostname not in SAFE_CART_HOSTS:
         return ""
     return url
 
@@ -55,7 +59,7 @@ def _yandex_food_product_id(value) -> str:
     if not url:
         return ""
     parts = [part for part in urlparse(url).path.split("/") if part]
-    if len(parts) < 2 or parts[-2] != "product":
+    if len(parts) < 2 or parts[-2] not in PRODUCT_PATH_MARKERS:
         return ""
     product_id = parts[-1]
     return product_id if PRODUCT_ID_PATTERN.fullmatch(product_id) else ""
