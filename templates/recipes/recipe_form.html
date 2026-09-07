@@ -80,11 +80,12 @@
       </div>
     </section>
 
-    <section class="form-section">
-      <div class="section-heading">
+    <details class="form-section collapsible-section" open>
+      <summary class="section-heading">
         <span>02</span>
         <div><h2>Ингредиенты</h2><p>Запрос для Лавки можно уточнить: например, «сливки 20%».</p></div>
-      </div>
+        <span class="section-toggle"><span class="when-open">Свернуть</span><span class="when-closed">Развернуть</span></span>
+      </summary>
       {{ ingredient_formset.management_form }}
       {% if ingredient_formset.non_form_errors %}<div class="form-errors">{{ ingredient_formset.non_form_errors }}</div>{% endif %}
       <div id="ingredient-forms" class="formset-list">
@@ -92,13 +93,14 @@
       </div>
       <template id="ingredient-empty-form">{% include "recipes/_ingredient_form.html" with ingredient=ingredient_formset.empty_form %}</template>
       <button class="button button-secondary add-form" type="button" data-prefix="ingredients">＋ Добавить ингредиент</button>
-    </section>
+    </details>
 
-    <section class="form-section">
-      <div class="section-heading">
+    <details class="form-section collapsible-section" open>
+      <summary class="section-heading">
         <span>03</span>
         <div><h2>Шаги приготовления</h2><p>У каждого шага может быть своя фотография.</p></div>
-      </div>
+        <span class="section-toggle"><span class="when-open">Свернуть</span><span class="when-closed">Развернуть</span></span>
+      </summary>
       {{ step_formset.management_form }}
       {% if step_formset.non_form_errors %}<div class="form-errors">{{ step_formset.non_form_errors }}</div>{% endif %}
       <div id="step-forms" class="formset-list">
@@ -106,7 +108,7 @@
       </div>
       <template id="step-empty-form">{% include "recipes/_step_form.html" with step=step_formset.empty_form %}</template>
       <button class="button button-secondary add-form" type="button" data-prefix="steps">＋ Добавить шаг</button>
-    </section>
+    </details>
 
     <div class="sticky-actions">
       <a href="{% if is_create %}{% url 'recipe-list' %}{% else %}{{ recipe.get_absolute_url }}{% endif %}" class="button button-ghost">Отмена</a>

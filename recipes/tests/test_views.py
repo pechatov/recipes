@@ -6,7 +6,7 @@ from django.db import IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
-from recipes.forms import IngredientForm
+from recipes.forms import IngredientForm, RecipeForm
 from recipes.models import (
     CartRun,
     Category,
@@ -372,7 +372,8 @@ class RecipeViewTests(TestCase):
 
     def test_youtube_import_embeds_video_and_links_step_to_timestamp(self):
         self.recipe.source_url = "https://youtu.be/dQw4w9WgXcQ"
-        self.recipe.save(update_fields=["source_url", "updated_at"])
+        self.recipe.video_url = self.recipe.source_url
+        self.recipe.save(update_fields=["source_url", "video_url", "updated_at"])
         step = self.recipe.steps.get()
         step.video_timestamp_seconds = 95
         step.save(update_fields=["video_timestamp_seconds"])
@@ -396,6 +397,86 @@ class RecipeViewTests(TestCase):
         self.assertContains(response, 'data-video-start="95"')
         self.assertContains(response, "Смотреть с 01:35")
         self.assertContains(response, "recipes/recipe-video.js")
+
+    def test_manual_recipe_shows_text_and_video_without_import_job(self):
+        self.recipe.text_source_url = "https://example.com/recipe.txt"
+        self.recipe.video_url = "https://youtu.be/dQw4w9WgXcQ"
+        self.recipe.save()
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertContains(response, 'href="https://example.com/recipe.txt"')
+        self.assertContains(response, 'href="https://youtu.be/dQw4w9WgXcQ"')
+        self.assertContains(response, "Исходный текст ↗")
+        self.assertContains(response, "Видео рецепта ↗")
+        self.assertContains(response, "youtube-nocookie.com/embed/dQw4w9WgXcQ")
+        self.assertContains(response, "Прогреть сливки")
+
+    def test_non_youtube_video_is_available_as_external_link(self):
+        self.recipe.video_url = "https://example.com/video.mp4"
+        self.recipe.save()
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertContains(response, 'href="https://example.com/video.mp4"')
+        self.assertNotContains(response, "data-recipe-video")
+
+    def test_source_links_can_be_updated_and_cleared(self):
+        self.client.force_login(self.user)
+        url = reverse("recipe-update", args=[self.recipe.slug])
+        response = self.client.get(url)
+        # Submit the actual editor fields, including all existing formset rows.
+        forms = [response.context["form"]]
+        for key in ("ingredient_formset", "step_formset"):
+            formset = response.context[key]
+            forms.extend([formset.management_form, *formset.forms])
+        data = {}
+        for form in forms:
+            for field in form:
+                if getattr(field.field.widget, "input_type", "") == "file":
+                    continue
+                value = field.value()
+                if value is not None and value is not False:
+                    data[field.html_name] = value
+        for text_url, video_url in (
+            ("https://example.com/recipe.txt", "https://youtu.be/dQw4w9WgXcQ"),
+            ("", ""),
+        ):
+            with self.subTest(text_url=text_url, video_url=video_url):
+                data.update(text_source_url=text_url, video_url=video_url)
+                response = self.client.post(url, data)
+                self.assertRedirects(response, self.recipe.get_absolute_url())
+                self.recipe.refresh_from_db()
+                self.assertEqual(self.recipe.text_source_url, text_url)
+                self.assertEqual(self.recipe.video_url, video_url)
+                self.assertEqual(self.recipe.ingredients.get().name, "Сливки")
+                self.assertEqual(self.recipe.steps.get().instruction, "Прогреть сливки")
+
+    def test_replacing_video_does_not_reuse_original_timestamps(self):
+        self.recipe.source_url = "https://youtu.be/dQw4w9WgXcQ"
+        self.recipe.video_url = "https://youtu.be/kHf5Jdwwxns"
+        self.recipe.save()
+        self.recipe.steps.update(video_timestamp_seconds=95)
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertContains(response, "youtube-nocookie.com/embed/kHf5Jdwwxns")
+        self.assertNotContains(response, 'data-video-start="95"')
+        self.assertContains(response, "Прогреть сливки")
+
+    def test_source_links_reject_unsafe_schemes(self):
+        for field in ("text_source_url", "video_url"):
+            with self.subTest(field=field):
+                form = RecipeForm(data={
+                    "title": "Рецепт", "servings": 2,
+                    "prep_minutes": 0, "cook_minutes": 0,
+                    field: "javascript:alert(1)",
+                })
+                self.assertFalse(form.is_valid())
+                self.assertIn(field, form.errors)
 
     def test_non_youtube_recipe_does_not_render_video_player(self):
         self.client.force_login(self.user)
@@ -762,6 +843,8 @@ class RecipeViewTests(TestCase):
             reverse("recipe-create"),
             {
                 "title": "Новый суп",
+                "text_source_url": "https://example.com/soup.txt",
+                "video_url": "https://youtu.be/dQw4w9WgXcQ",
                 "description": "",
                 "servings": 4,
                 "prep_minutes": 5,
@@ -793,6 +876,8 @@ class RecipeViewTests(TestCase):
 
         created = Recipe.objects.get(title="Новый суп")
         self.assertRedirects(response, created.get_absolute_url())
+        self.assertEqual(created.text_source_url, "https://example.com/soup.txt")
+        self.assertEqual(created.video_url, "https://youtu.be/dQw4w9WgXcQ")
         self.assertEqual(created.ingredients.count(), 1)
         self.assertEqual(created.steps.count(), 1)
         self.assertEqual(str(created.calories_per_serving), "96.2")

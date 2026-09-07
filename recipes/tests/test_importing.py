@@ -1002,6 +1002,8 @@ class PipelineTests(TestCase):
 
         self.assertEqual([recipe.title for recipe in recipes], ["Картофель", "Драники"])
         self.assertTrue(all(recipe.status == Recipe.Status.DRAFT for recipe in recipes))
+        self.assertTrue(all(recipe.video_url == job.source_url for recipe in recipes))
+        self.assertTrue(all(recipe.text_source_url == "" for recipe in recipes))
         self.assertTrue(
             all(recipe.steps.get().video_timestamp_seconds == 75 for recipe in recipes)
         )
@@ -1747,12 +1749,31 @@ class PipelineTests(TestCase):
         ):
             recipe = process_import_job(job)[0]
 
+        self.assertEqual(recipe.text_source_url, job.source_url)
+        self.assertEqual(recipe.video_url, "")
         self.assertTrue(Path(recipe.cover.name).stem.startswith("cover"))
         self.assertEqual(Path(recipe.cover.name).suffix, ".jpg")
         step = recipe.steps.get()
         self.assertTrue(Path(step.image.name).stem.startswith("step"))
         self.assertTrue(recipe.cover_imported)
         self.assertTrue(step.image_imported)
+
+    def test_reprocess_preserves_edited_source_links(self):
+        job = ImportJob.objects.create(
+            source_url="https://example.com/original",
+            source_type=ImportJob.SourceType.WEBSITE,
+        )
+        draft = save_draft(job, self.recipe_data("Рецепт"))[0]
+        draft.text_source_url = "https://example.com/updated.txt"
+        draft.video_url = "https://youtu.be/dQw4w9WgXcQ"
+        draft.save()
+
+        updated = save_draft(job, self.recipe_data("Обновлённый рецепт"))[0]
+
+        self.assertEqual(updated.pk, draft.pk)
+        self.assertEqual(updated.source_url, job.source_url)
+        self.assertEqual(updated.text_source_url, draft.text_source_url)
+        self.assertEqual(updated.video_url, draft.video_url)
 
     @patch("recipes.importing.pipeline._prepare_images")
     @patch("django.core.files.storage.FileSystemStorage.delete")

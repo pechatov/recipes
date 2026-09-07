@@ -116,6 +116,11 @@
 
   const form = document.getElementById("recipe-form");
   if (form) {
+    // Reveal invalid fields before the browser tries to focus them.
+    form.addEventListener("invalid", event => {
+      const section = event.target.closest("details.form-section");
+      if (section) section.open = true;
+    }, true);
     form.addEventListener("submit", () => {
       updateOrder("ingredients");
       updateOrder("steps");

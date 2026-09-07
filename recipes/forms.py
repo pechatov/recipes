@@ -49,7 +49,13 @@ class RecipeForm(forms.ModelForm):
             "fats_per_100g",
             "carbohydrates_per_100g",
             "cover",
+            "text_source_url",
+            "video_url",
         )
+        help_texts = {
+            "text_source_url": "Страница с рецептом или текстовый файл. Можно указать вместе с видео.",
+            "video_url": "YouTube можно смотреть прямо в рецепте; другие видео откроются в новой вкладке.",
+        }
         widgets = {
             "description": forms.Textarea(attrs={"rows": 4}),
             "categories": forms.CheckboxSelectMultiple(attrs={"class": "category-checkboxes"}),

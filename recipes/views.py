@@ -547,11 +547,7 @@ def recipe_detail(request, slug):
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
     )
-    video_id = (
-        youtube_video_id(recipe.source_url)
-        if import_job and import_job.source_type == ImportJob.SourceType.YOUTUBE
-        else None
-    )
+    video_id = youtube_video_id(recipe.video_url)
     return render(
         request,
         "recipes/recipe_detail.html",
@@ -561,6 +557,8 @@ def recipe_detail(request, slug):
             "pantry_ingredients": [item for item in ingredients if item.is_pantry],
             "source_import_job": import_job,
             "youtube_video_id": video_id,
+            "video_timestamps_match_source": bool(video_id)
+            and video_id == youtube_video_id(recipe.source_url),
         },
     )
 

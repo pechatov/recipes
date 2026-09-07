@@ -31,8 +31,11 @@
           {% endif %}
           <a class="button button-secondary" href="{% url 'recipe-update' recipe.slug %}">Редактировать</a>
         </div>
-        {% if recipe.source_url %}
-          <p class="source-note">Создано по <a href="{{ recipe.source_url }}" target="_blank" rel="noopener noreferrer">исходной ссылке ↗</a></p>
+        {% if recipe.text_source_url or recipe.video_url %}
+          <div class="action-row recipe-source-links" aria-label="Источники рецепта">
+            {% if recipe.text_source_url %}<a class="text-link" href="{{ recipe.text_source_url }}" target="_blank" rel="noopener noreferrer">Исходный текст ↗</a>{% endif %}
+            {% if recipe.video_url %}<a class="text-link" href="{{ recipe.video_url }}" target="_blank" rel="noopener noreferrer">Видео рецепта ↗</a>{% endif %}
+          </div>
         {% endif %}
       </div>
       <div class="recipe-hero-image">
@@ -131,7 +134,7 @@
               <li class="step-card">
                 <div class="step-number">{{ forloop.counter }}</div>
                 <div class="step-content">
-                  {% if youtube_video_id and step.video_timestamp_seconds != None %}
+                  {% if video_timestamps_match_source and step.video_timestamp_seconds != None %}
                     <a
                       class="step-video-link"
                       href="https://www.youtube.com/watch?v={{ youtube_video_id }}&amp;t={{ step.video_timestamp_seconds }}s"

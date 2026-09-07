@@ -444,9 +444,18 @@ input[type="file"]::file-selector-button:hover { color: var(--accent); border-co
 .recipe-form { display: grid; gap: 28px; }
 .form-section { padding: clamp(22px, 4vw, 38px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .section-heading { display: flex; gap: 17px; margin-bottom: 28px; }
-.section-heading > span { width: 42px; height: 42px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--accent); background: var(--accent-soft); font-size: 13px; font-weight: 700; }
+.section-heading > span:first-child { width: 42px; height: 42px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--accent); background: var(--accent-soft); font-size: 13px; font-weight: 700; }
 .section-heading h2 { margin: 0 0 5px; font-size: 29px; }
 .section-heading p { margin: 0; color: var(--muted); }
+.collapsible-section > summary { align-items: center; cursor: pointer; list-style: none; flex-wrap: wrap; }
+.collapsible-section > summary::-webkit-details-marker { display: none; }
+.collapsible-section > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 8px; border-radius: 4px; }
+.collapsible-section > summary:hover h2 { color: var(--accent); }
+.collapsible-section > summary > div { flex: 1 1 180px; }
+.collapsible-section:not([open]) > summary { margin-bottom: 0; }
+.section-toggle { margin-left: auto; color: var(--accent); font-size: 14px; font-weight: 700; }
+.collapsible-section[open] .when-closed, .collapsible-section:not([open]) .when-open { display: none; }
+.recipe-source-links { margin-top: 20px; }
 .form-grid { display: grid; gap: 18px; }
 .two-columns { grid-template-columns: repeat(2, 1fr); }
 .two-columns .field:nth-child(1), .two-columns .field:nth-child(2), .two-columns .field:nth-child(3), .two-columns .field:nth-child(9) { grid-column: 1 / -1; }

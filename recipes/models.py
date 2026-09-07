@@ -178,6 +178,8 @@ class Recipe(models.Model):
         db_index=True,
     )
     source_url = models.URLField("источник", max_length=2048, blank=True)
+    text_source_url = models.URLField("ссылка на исходный текст", max_length=2048, blank=True)
+    video_url = models.URLField("ссылка на видео", max_length=2048, blank=True)
     categories = models.ManyToManyField(
         Category,
         blank=True,

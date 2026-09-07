@@ -646,6 +646,16 @@ def save_draft(
                 else:
                     recipe = Recipe(
                         **_recipe_values(locked_job, values),
+                        video_url=(
+                            locked_job.source_url
+                            if locked_job.source_type == ImportJob.SourceType.YOUTUBE
+                            else ""
+                        ),
+                        text_source_url=(
+                            locked_job.source_url
+                            if locked_job.source_type != ImportJob.SourceType.YOUTUBE
+                            else ""
+                        ),
                         status=Recipe.Status.DRAFT,
                         created_by=locked_job.requested_by,
                     )
