@@ -19,7 +19,9 @@ from django.db.models import Q
 from django.utils import timezone
 
 from recipes.categories import CATEGORY_TAXONOMY
+from recipes.nutrition import apply_imported_nutrition
 from recipes.models import (
+    NUTRITION_FIELDS,
     Category,
     ImportJob,
     Recipe,
@@ -447,16 +449,7 @@ def _recipe_content_values(data: dict) -> dict:
         "servings": data["servings"],
         "prep_minutes": data["prep_minutes"],
         "cook_minutes": data["cook_minutes"],
-        "calories_per_serving": data.get("calories_per_serving"),
-        "calories_per_100g": data.get("calories_per_100g"),
-        "proteins_per_serving": data.get("proteins_per_serving"),
-        "fats_per_serving": data.get("fats_per_serving"),
-        "carbohydrates_per_serving": data.get("carbohydrates_per_serving"),
-        "proteins_per_100g": data.get("proteins_per_100g"),
-        "fats_per_100g": data.get("fats_per_100g"),
-        "carbohydrates_per_100g": data.get("carbohydrates_per_100g"),
-        "calories_estimated": True,
-        "nutrition_manual_fields": [],
+        "main_protein": data.get("main_protein", ""),
     }
 
 
@@ -564,6 +557,19 @@ def save_draft(
         if isinstance(segment, dict)
         and isinstance(segment.get("start_seconds"), int)
     }
+    video_job = job.source_type == ImportJob.SourceType.YOUTUBE
+    if video_job:
+        # The transcript and its timestamps belong to the imported video.
+        discovered_video_url = job.source_url
+        discovered_text_urls: set[str] = {
+            link["url"] for link in (document.source_links if document else ())
+        }
+    else:
+        # One article video cannot be attributed when the page yields several dishes.
+        discovered_video_url = (
+            document.video_url if document and len(recipe_data) == 1 else ""
+        )
+        discovered_text_urls = set()
     new_files: list[tuple[Any, str]] = []
     old_files: list[tuple[Any, str]] = []
     try:
@@ -621,10 +627,23 @@ def save_draft(
             saved_recipes: list[Recipe] = []
             for recipe_index, values in enumerate(recipe_data):
                 cover_image, step_images = prepared_images[recipe_index]
+                if video_job:
+                    text_source_url = (
+                        values.get("text_source_url", "")
+                        if values.get("text_source_url") in discovered_text_urls
+                        else ""
+                    )
+                else:
+                    text_source_url = locked_job.source_url
                 if recipe_index < len(existing_drafts):
                     recipe = existing_drafts[recipe_index]
                     for field, value in _recipe_values(locked_job, values).items():
                         setattr(recipe, field, value)
+                    # Manually edited links survive; only empty ones are filled.
+                    if not recipe.video_url:
+                        recipe.video_url = discovered_video_url
+                    if not recipe.text_source_url:
+                        recipe.text_source_url = text_source_url
                     if cover_image and (not recipe.cover or recipe.cover_imported):
                         if recipe.cover_imported:
                             old_cover = _stored_file(recipe.cover)
@@ -646,16 +665,8 @@ def save_draft(
                 else:
                     recipe = Recipe(
                         **_recipe_values(locked_job, values),
-                        video_url=(
-                            locked_job.source_url
-                            if locked_job.source_type == ImportJob.SourceType.YOUTUBE
-                            else ""
-                        ),
-                        text_source_url=(
-                            locked_job.source_url
-                            if locked_job.source_type != ImportJob.SourceType.YOUTUBE
-                            else ""
-                        ),
+                        video_url=discovered_video_url,
+                        text_source_url=text_source_url,
                         status=Recipe.Status.DRAFT,
                         created_by=locked_job.requested_by,
                     )
@@ -671,19 +682,23 @@ def save_draft(
                         recipe.cover_imported = True
                     recipe.save()
 
-                RecipeIngredient.objects.bulk_create(
+                ingredients = RecipeIngredient.objects.bulk_create(
                     [
                         RecipeIngredient(recipe=recipe, order=index, **ingredient)
                         for index, ingredient in enumerate(values["ingredients"])
                     ]
                 )
+                apply_imported_nutrition(recipe, values.get("nutrition"), ingredients)
                 steps = []
                 for index, step in enumerate(values["steps"]):
                     step_values = {
                         key: value for key, value in step.items() if key != "image_url"
                     }
+                    # Timestamps are meaningful only for the video whose
+                    # transcript produced them.
                     if (
-                        locked_job.source_type != ImportJob.SourceType.YOUTUBE
+                        not discovered_video_url
+                        or recipe.video_url != discovered_video_url
                         or step_values.get("video_timestamp_seconds")
                         not in allowed_video_timestamps
                     ):
@@ -788,6 +803,15 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
     )
 
 
+def _nutrition_payload(recipe: Recipe) -> dict[str, Any]:
+    nutrition = recipe.nutrition_or_none
+    if nutrition is None:
+        return {}
+    payload = {field: str(getattr(nutrition, field)) for field in NUTRITION_FIELDS}
+    payload["notes"] = nutrition.notes
+    return payload
+
+
 def _recipe_refinement_payload(recipe: Recipe) -> dict[str, Any]:
     def json_number(value):
         return str(value) if value is not None else None
@@ -798,15 +822,9 @@ def _recipe_refinement_payload(recipe: Recipe) -> dict[str, Any]:
         "servings": recipe.servings,
         "prep_minutes": recipe.prep_minutes,
         "cook_minutes": recipe.cook_minutes,
-        "calories_per_serving": json_number(recipe.calories_per_serving),
-        "proteins_per_serving": json_number(recipe.proteins_per_serving),
-        "fats_per_serving": json_number(recipe.fats_per_serving),
-        "carbohydrates_per_serving": json_number(recipe.carbohydrates_per_serving),
-        "calories_per_100g": json_number(recipe.calories_per_100g),
-        "proteins_per_100g": json_number(recipe.proteins_per_100g),
-        "fats_per_100g": json_number(recipe.fats_per_100g),
-        "carbohydrates_per_100g": json_number(recipe.carbohydrates_per_100g),
+        "nutrition": _nutrition_payload(recipe),
         "categories": list(recipe.categories.values_list("slug", flat=True)),
+        "main_protein": recipe.main_protein,
         "cover_image_url": "",
         "cover_image_search_query": "",
         "ingredients": [
@@ -875,10 +893,6 @@ def save_refined_recipe(
                 "Пожелание не применено, чтобы не привязать их к другим шагам."
             )
 
-        manual_nutrition_fields = set(recipe.nutrition_manual_fields or [])
-        manual_nutrition = {
-            field: getattr(recipe, field) for field in manual_nutrition_fields
-        }
         obsolete_images = [
             stored
             for step in recipe.steps.all()
@@ -887,31 +901,16 @@ def save_refined_recipe(
 
         for field, value in _recipe_content_values(values).items():
             setattr(recipe, field, value)
-        for field, value in manual_nutrition.items():
-            setattr(recipe, field, value)
-        recipe.nutrition_manual_fields = sorted(manual_nutrition_fields)
-        recipe.calories_estimated = any(
-            field not in manual_nutrition_fields and getattr(recipe, field) is not None
-            for field in (
-                "calories_per_serving",
-                "proteins_per_serving",
-                "fats_per_serving",
-                "carbohydrates_per_serving",
-                "calories_per_100g",
-                "proteins_per_100g",
-                "fats_per_100g",
-                "carbohydrates_per_100g",
-            )
-        )
         recipe.save()
         recipe.ingredients.all().delete()
         recipe.steps.all().delete()
-        RecipeIngredient.objects.bulk_create(
+        ingredients = RecipeIngredient.objects.bulk_create(
             [
                 RecipeIngredient(recipe=recipe, order=index, **ingredient)
                 for index, ingredient in enumerate(values["ingredients"])
             ]
         )
+        apply_imported_nutrition(recipe, values.get("nutrition"), ingredients)
         steps = []
         for index, step in enumerate(values["steps"]):
             step_values = {key: value for key, value in step.items() if key != "image_url"}

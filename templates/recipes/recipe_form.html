@@ -80,9 +80,20 @@
       </div>
     </section>
 
+    <section class="form-section">
+      <div class="section-heading">
+        <span>02</span>
+        <div><h2>КБЖУ</h2><p>Пустые поля заполнятся автоматической оценкой по ингредиентам; введённые числа не пересчитываются.</p></div>
+      </div>
+      {% if nutrition_form.non_field_errors %}<div class="form-errors">{{ nutrition_form.non_field_errors }}</div>{% endif %}
+      <div class="form-grid two-columns">
+        {% for field in nutrition_form %}{% include "recipes/_form_field.html" with field=field %}{% endfor %}
+      </div>
+    </section>
+
     <details class="form-section collapsible-section" open>
       <summary class="section-heading">
-        <span>02</span>
+        <span>03</span>
         <div><h2>Ингредиенты</h2><p>Запрос для Лавки можно уточнить: например, «сливки 20%».</p></div>
         <span class="section-toggle"><span class="when-open">Свернуть</span><span class="when-closed">Развернуть</span></span>
       </summary>
@@ -97,7 +108,7 @@
 
     <details class="form-section collapsible-section" open>
       <summary class="section-heading">
-        <span>03</span>
+        <span>04</span>
         <div><h2>Шаги приготовления</h2><p>У каждого шага может быть своя фотография.</p></div>
         <span class="section-toggle"><span class="when-open">Свернуть</span><span class="when-closed">Развернуть</span></span>
       </summary>

@@ -8,6 +8,8 @@ from django.urls import reverse
 
 from recipes.forms import IngredientForm, RecipeForm
 from recipes.models import (
+    NUTRITION_FIELDS,
+    RecipeNutrition,
     CartRun,
     Category,
     ImportJob,
@@ -18,7 +20,6 @@ from recipes.models import (
     RecipeStep,
     RegistrationInvite,
 )
-from recipes.views import _fill_missing_recipe_calories
 
 
 class FirstRunTests(TestCase):
@@ -161,16 +162,6 @@ class RecipeViewTests(TestCase):
             response,
             f'href="{reverse("shopping-list", args=[self.recipe.slug])}"',
         )
-
-    def test_authenticated_user_can_view_recipe(self):
-        self.client.force_login(self.user)
-        response = self.client.get(self.recipe.get_absolute_url())
-        self.assertContains(response, "Семейная паста")
-        self.assertContains(response, "Прогреть сливки")
-        self.assertEqual(str(response.context["recipe"].calories_per_serving), "205.0")
-        self.assertEqual(str(response.context["recipe"].calories_per_100g), "205.0")
-        self.assertEqual(str(response.context["recipe"].proteins_per_serving), "2.8")
-        self.assertEqual(str(response.context["recipe"].fats_per_100g), "20.0")
 
     def test_draft_editor_shows_hermes_refinement_chat(self):
         self.recipe.status = Recipe.Status.DRAFT
@@ -543,100 +534,6 @@ class RecipeViewTests(TestCase):
         self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
         self.assertEqual(run.recipe, self.recipe)
 
-    def test_estimated_calories_can_be_recalculated_after_ingredient_changes(self):
-        _fill_missing_recipe_calories(self.recipe, save=True)
-        ingredient = self.recipe.ingredients.get()
-        ingredient.quantity = 400
-        ingredient.save(update_fields=["quantity"])
-
-        _fill_missing_recipe_calories(self.recipe, save=True, overwrite=True)
-
-        self.recipe.refresh_from_db()
-        self.assertEqual(str(self.recipe.calories_per_serving), "410.0")
-        self.assertEqual(str(self.recipe.calories_per_100g), "205.0")
-
-    def test_pantry_toggle_does_not_overwrite_manual_calories(self):
-        self.recipe.calories_per_serving = 999
-        self.recipe.calories_per_100g = 888
-        self.recipe.calories_estimated = False
-        self.recipe.save(
-            update_fields=[
-                "calories_per_serving",
-                "calories_per_100g",
-                "calories_estimated",
-            ]
-        )
-        ingredient = self.recipe.ingredients.get()
-        step = self.recipe.steps.get()
-        self.client.force_login(self.user)
-
-        response = self.client.post(
-            reverse("recipe-update", args=[self.recipe.slug]),
-            {
-                "title": self.recipe.title,
-                "description": self.recipe.description,
-                "servings": self.recipe.servings,
-                "prep_minutes": self.recipe.prep_minutes,
-                "cook_minutes": self.recipe.cook_minutes,
-                "calories_per_serving": "999",
-                "calories_per_100g": "888",
-                "ingredients-TOTAL_FORMS": 1,
-                "ingredients-INITIAL_FORMS": 1,
-                "ingredients-MIN_NUM_FORMS": 1,
-                "ingredients-MAX_NUM_FORMS": 1000,
-                "ingredients-0-id": ingredient.pk,
-                "ingredients-0-section": ingredient.section,
-                "ingredients-0-name": ingredient.name,
-                "ingredients-0-quantity": ingredient.quantity,
-                "ingredients-0-unit": ingredient.unit,
-                "ingredients-0-search_query": ingredient.search_query,
-                "ingredients-0-is_pantry": "on",
-                "steps-TOTAL_FORMS": 1,
-                "steps-INITIAL_FORMS": 1,
-                "steps-MIN_NUM_FORMS": 1,
-                "steps-MAX_NUM_FORMS": 1000,
-                "steps-0-id": step.pk,
-                "steps-0-section": step.section,
-                "steps-0-title": step.title,
-                "steps-0-instruction": step.instruction,
-            },
-        )
-
-        self.assertRedirects(response, self.recipe.get_absolute_url())
-        self.recipe.refresh_from_db()
-        ingredient.refresh_from_db()
-        self.assertTrue(ingredient.is_pantry)
-        self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
-        self.assertEqual(str(self.recipe.calories_per_100g), "888.0")
-        self.assertFalse(self.recipe.calories_estimated)
-
-    def test_detail_fills_missing_macros_around_historical_manual_calories(self):
-        self.recipe.calories_per_serving = 999
-        self.recipe.calories_per_100g = 888
-        self.recipe.calories_estimated = False
-        self.recipe.nutrition_manual_fields = [
-            "calories_per_serving",
-            "calories_per_100g",
-        ]
-        self.recipe.save(
-            update_fields=[
-                "calories_per_serving",
-                "calories_per_100g",
-                "calories_estimated",
-                "nutrition_manual_fields",
-            ]
-        )
-        self.client.force_login(self.user)
-
-        response = self.client.get(self.recipe.get_absolute_url())
-
-        displayed = response.context["recipe"]
-        self.assertEqual(str(displayed.calories_per_serving), "999.0")
-        self.assertEqual(str(displayed.calories_per_100g), "888.0")
-        self.assertEqual(str(displayed.proteins_per_serving), "2.8")
-        self.assertEqual(str(displayed.fats_per_100g), "20.0")
-        self.assertTrue(displayed.calories_estimated)
-
     def test_edit_form_has_clipboard_zones_for_cover_and_step_images(self):
         self.client.force_login(self.user)
         response = self.client.get(reverse("recipe-update", args=[self.recipe.slug]))
@@ -778,21 +675,6 @@ class RecipeViewTests(TestCase):
         self.assertNotContains(response, "Яблочный пирог")
         self.assertContains(response, 'data-server-filtered="true"')
 
-    def test_water_is_hidden_without_deleting_historical_quantity(self):
-        water = RecipeIngredient.objects.create(
-            recipe=self.recipe,
-            name="Горячая вода",
-            quantity=500,
-            unit="мл",
-        )
-        self.client.force_login(self.user)
-
-        response = self.client.get(self.recipe.get_absolute_url())
-
-        self.assertNotContains(response, "Горячая вода")
-        self.assertEqual(str(response.context["recipe"].calories_per_100g), "58.6")
-        self.assertTrue(RecipeIngredient.objects.filter(pk=water.pk).exists())
-
     def test_unchanged_historical_water_does_not_block_ingredient_edit_form(self):
         water = RecipeIngredient.objects.create(
             recipe=self.recipe,
@@ -837,163 +719,41 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("shopping-list", args=[self.recipe.slug]), {"servings": "oops"})
         self.assertEqual(response.context["servings"], 2)
 
-    def test_create_recipe_accepts_one_filled_and_one_empty_extra_form(self):
+    def test_main_protein_badge_is_saved_from_form_and_rendered(self):
         self.client.force_login(self.user)
         response = self.client.post(
             reverse("recipe-create"),
             {
-                "title": "Новый суп",
-                "text_source_url": "https://example.com/soup.txt",
-                "video_url": "https://youtu.be/dQw4w9WgXcQ",
-                "description": "",
-                "servings": 4,
+                "title": "Рыба в духовке",
+                "main_protein": "fish",
+                "servings": 2,
                 "prep_minutes": 5,
-                "cook_minutes": 30,
-                "ingredients-TOTAL_FORMS": 2,
-                "ingredients-INITIAL_FORMS": 0,
-                "ingredients-MIN_NUM_FORMS": 1,
-                "ingredients-MAX_NUM_FORMS": 1000,
-                "ingredients-0-name": "Картофель",
-                "ingredients-0-quantity": 500,
-                "ingredients-0-unit": "г",
-                "ingredients-0-note": "",
-                "ingredients-0-search_query": "картофель",
-                "ingredients-1-name": "",
-                "ingredients-1-quantity": "",
-                "ingredients-1-unit": "",
-                "ingredients-1-note": "",
-                "ingredients-1-search_query": "",
-                "steps-TOTAL_FORMS": 2,
-                "steps-INITIAL_FORMS": 0,
-                "steps-MIN_NUM_FORMS": 1,
-                "steps-MAX_NUM_FORMS": 1000,
-                "steps-0-title": "Варка",
-                "steps-0-instruction": "Сварить до мягкости.",
-                "steps-1-title": "",
-                "steps-1-instruction": "",
-            },
-        )
-
-        created = Recipe.objects.get(title="Новый суп")
-        self.assertRedirects(response, created.get_absolute_url())
-        self.assertEqual(created.text_source_url, "https://example.com/soup.txt")
-        self.assertEqual(created.video_url, "https://youtu.be/dQw4w9WgXcQ")
-        self.assertEqual(created.ingredients.count(), 1)
-        self.assertEqual(created.steps.count(), 1)
-        self.assertEqual(str(created.calories_per_serving), "96.2")
-        self.assertEqual(str(created.calories_per_100g), "77.0")
-
-    def test_create_recipe_tracks_manual_and_estimated_nutrition(self):
-        self.client.force_login(self.user)
-        response = self.client.post(
-            reverse("recipe-create"),
-            {
-                "title": "Суп с ручной калорийностью",
-                "servings": 4,
-                "prep_minutes": 5,
-                "cook_minutes": 30,
-                "calories_per_serving": "123",
-                "calories_per_100g": "",
+                "cook_minutes": 20,
                 "ingredients-TOTAL_FORMS": 1,
                 "ingredients-INITIAL_FORMS": 0,
                 "ingredients-MIN_NUM_FORMS": 1,
                 "ingredients-MAX_NUM_FORMS": 1000,
-                "ingredients-0-name": "Картофель",
+                "ingredients-0-name": "Филе трески",
                 "ingredients-0-quantity": 500,
                 "ingredients-0-unit": "г",
                 "steps-TOTAL_FORMS": 1,
                 "steps-INITIAL_FORMS": 0,
                 "steps-MIN_NUM_FORMS": 1,
                 "steps-MAX_NUM_FORMS": 1000,
-                "steps-0-title": "Варка",
-                "steps-0-instruction": "Сварить до мягкости.",
+                "steps-0-title": "",
+                "steps-0-instruction": "Запечь.",
             },
         )
 
-        created = Recipe.objects.get(title="Суп с ручной калорийностью")
+        created = Recipe.objects.get(title="Рыба в духовке")
         self.assertRedirects(response, created.get_absolute_url())
-        self.assertEqual(str(created.calories_per_serving), "123.0")
-        self.assertEqual(str(created.calories_per_100g), "77.0")
-        self.assertTrue(created.calories_estimated)
-        self.assertEqual(created.nutrition_manual_fields, ["calories_per_serving"])
+        self.assertEqual(created.main_protein, Recipe.MainProtein.FISH)
         detail = self.client.get(created.get_absolute_url())
-        self.assertEqual(str(detail.context["recipe"].calories_per_100g), "77.0")
-
-    def test_manual_nutrition_edit_preserves_unchanged_values(self):
-        _fill_missing_recipe_calories(self.recipe, save=True)
-        original_per_100g = str(self.recipe.calories_per_100g)
-        self.recipe.calories_estimated = True
-        self.recipe.save(update_fields=["calories_estimated", "updated_at"])
-        ingredient = self.recipe.ingredients.get()
-        step = self.recipe.steps.get()
-        self.client.force_login(self.user)
-
-        response = self.client.post(
-            reverse("recipe-update", args=[self.recipe.slug]),
-            {
-                "title": self.recipe.title,
-                "description": self.recipe.description,
-                "servings": self.recipe.servings,
-                "prep_minutes": self.recipe.prep_minutes,
-                "cook_minutes": self.recipe.cook_minutes,
-                "calories_per_serving": "999",
-                "calories_per_100g": self.recipe.calories_per_100g,
-                "ingredients-TOTAL_FORMS": 1,
-                "ingredients-INITIAL_FORMS": 1,
-                "ingredients-MIN_NUM_FORMS": 1,
-                "ingredients-MAX_NUM_FORMS": 1000,
-                "ingredients-0-id": ingredient.pk,
-                "ingredients-0-name": ingredient.name,
-                "ingredients-0-quantity": ingredient.quantity,
-                "ingredients-0-unit": ingredient.unit,
-                "ingredients-0-search_query": ingredient.search_query,
-                "steps-TOTAL_FORMS": 1,
-                "steps-INITIAL_FORMS": 1,
-                "steps-MIN_NUM_FORMS": 1,
-                "steps-MAX_NUM_FORMS": 1000,
-                "steps-0-id": step.pk,
-                "steps-0-title": step.title,
-                "steps-0-instruction": step.instruction,
-            },
-        )
-
-        self.assertRedirects(response, self.recipe.get_absolute_url())
-        self.recipe.refresh_from_db()
-        self.assertEqual(str(self.recipe.calories_per_serving), "999.0")
-        self.assertEqual(str(self.recipe.calories_per_100g), original_per_100g)
-        self.assertTrue(self.recipe.calories_estimated)
-        self.assertEqual(
-            self.recipe.nutrition_manual_fields, ["calories_per_serving"]
-        )
-        detail = self.client.get(self.recipe.get_absolute_url())
-        self.assertEqual(
-            str(detail.context["recipe"].calories_per_serving), "999.0"
-        )
-        self.assertEqual(
-            str(detail.context["recipe"].calories_per_100g), original_per_100g
-        )
-
-    def test_detail_renders_partial_nutrition_without_empty_labels(self):
-        ingredient = self.recipe.ingredients.get()
-        ingredient.name = "Ксантановая камедь"
-        ingredient.save(update_fields=["name"])
-        self.recipe.calories_per_serving = None
-        self.recipe.calories_per_100g = None
-        self.recipe.proteins_per_serving = 7
-        self.recipe.save(
-            update_fields=[
-                "calories_per_serving",
-                "calories_per_100g",
-                "proteins_per_serving",
-            ]
-        )
-        self.client.force_login(self.user)
-
-        response = self.client.get(self.recipe.get_absolute_url())
-
-        self.assertContains(response, "Б 7,0 г")
-        self.assertNotContains(response, "К  ккал")
-        self.assertNotContains(response, "Ж  г")
+        self.assertContains(detail, 'class="protein-tag protein-fish"')
+        self.assertContains(detail, "Рыба")
+        listing = self.client.get(reverse("recipe-list"))
+        self.assertContains(listing, 'class="protein-tag protein-fish"')
+        self.assertNotContains(listing, 'class="protein-tag protein-chicken"')
 
     def test_detail_groups_pantry_items_under_their_section(self):
         self.recipe.ingredients.all().delete()
@@ -1295,3 +1055,273 @@ class RecipeViewTests(TestCase):
         failed.refresh_from_db()
         self.assertEqual(completed.status, ImportJob.Status.COMPLETED)
         self.assertEqual(failed.status, ImportJob.Status.FAILED)
+
+    def test_authenticated_user_can_view_recipe(self):
+        self.client.force_login(self.user)
+        response = self.client.get(self.recipe.get_absolute_url())
+        self.assertContains(response, "Семейная паста")
+        self.assertContains(response, "Прогреть сливки")
+        self.assertEqual(str(response.context["nutrition"].calories_per_serving), "205.0")
+        self.assertEqual(str(response.context["nutrition"].calories_per_100g), "205.0")
+        self.assertEqual(str(response.context["nutrition"].proteins_per_serving), "2.8")
+        self.assertEqual(str(response.context["nutrition"].fats_per_100g), "20.0")
+
+    def test_water_is_hidden_without_deleting_historical_quantity(self):
+        water = RecipeIngredient.objects.create(
+            recipe=self.recipe,
+            name="Горячая вода",
+            quantity=500,
+            unit="мл",
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        self.assertNotContains(response, "Горячая вода")
+        self.assertEqual(str(response.context["nutrition"].calories_per_100g), "58.6")
+        self.assertTrue(RecipeIngredient.objects.filter(pk=water.pk).exists())
+
+    def test_create_recipe_accepts_one_filled_and_one_empty_extra_form(self):
+        self.client.force_login(self.user)
+        response = self.client.post(
+            reverse("recipe-create"),
+            {
+                "title": "Новый суп",
+                "text_source_url": "https://example.com/soup.txt",
+                "video_url": "https://youtu.be/dQw4w9WgXcQ",
+                "description": "",
+                "servings": 4,
+                "prep_minutes": 5,
+                "cook_minutes": 30,
+                "ingredients-TOTAL_FORMS": 2,
+                "ingredients-INITIAL_FORMS": 0,
+                "ingredients-MIN_NUM_FORMS": 1,
+                "ingredients-MAX_NUM_FORMS": 1000,
+                "ingredients-0-name": "Картофель",
+                "ingredients-0-quantity": 500,
+                "ingredients-0-unit": "г",
+                "ingredients-0-note": "",
+                "ingredients-0-search_query": "картофель",
+                "ingredients-1-name": "",
+                "ingredients-1-quantity": "",
+                "ingredients-1-unit": "",
+                "ingredients-1-note": "",
+                "ingredients-1-search_query": "",
+                "steps-TOTAL_FORMS": 2,
+                "steps-INITIAL_FORMS": 0,
+                "steps-MIN_NUM_FORMS": 1,
+                "steps-MAX_NUM_FORMS": 1000,
+                "steps-0-title": "Варка",
+                "steps-0-instruction": "Сварить до мягкости.",
+                "steps-1-title": "",
+                "steps-1-instruction": "",
+            },
+        )
+
+        created = Recipe.objects.get(title="Новый суп")
+        self.assertRedirects(response, created.get_absolute_url())
+        self.assertEqual(created.text_source_url, "https://example.com/soup.txt")
+        self.assertEqual(created.video_url, "https://youtu.be/dQw4w9WgXcQ")
+        self.assertEqual(created.ingredients.count(), 1)
+        self.assertEqual(created.steps.count(), 1)
+        self.assertEqual(str(created.nutrition.calories_per_serving), "96.2")
+        self.assertEqual(str(created.nutrition.calories_per_100g), "77.0")
+
+class RecipeNutritionTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="cook", password="safe-test-pass")
+        self.recipe = Recipe.objects.create(title="Семейная паста", servings=2, created_by=self.user)
+        self.ingredient = RecipeIngredient.objects.create(
+            recipe=self.recipe, name="Сливки", quantity="200", unit="мл", search_query="сливки 20%"
+        )
+        self.step = RecipeStep.objects.create(
+            recipe=self.recipe, title="Соус", instruction="Прогреть сливки"
+        )
+        self.client.force_login(self.user)
+
+    def _update_payload(self, **overrides):
+        payload = {
+            "title": self.recipe.title,
+            "description": self.recipe.description,
+            "servings": self.recipe.servings,
+            "prep_minutes": self.recipe.prep_minutes,
+            "cook_minutes": self.recipe.cook_minutes,
+            "ingredients-TOTAL_FORMS": 1,
+            "ingredients-INITIAL_FORMS": 1,
+            "ingredients-MIN_NUM_FORMS": 1,
+            "ingredients-MAX_NUM_FORMS": 1000,
+            "ingredients-0-id": self.ingredient.pk,
+            "ingredients-0-name": self.ingredient.name,
+            "ingredients-0-quantity": self.ingredient.quantity,
+            "ingredients-0-unit": self.ingredient.unit,
+            "ingredients-0-search_query": self.ingredient.search_query,
+            "steps-TOTAL_FORMS": 1,
+            "steps-INITIAL_FORMS": 1,
+            "steps-MIN_NUM_FORMS": 1,
+            "steps-MAX_NUM_FORMS": 1000,
+            "steps-0-id": self.step.pk,
+            "steps-0-title": self.step.title,
+            "steps-0-instruction": self.step.instruction,
+        }
+        payload.update(overrides)
+        return payload
+
+    def _update(self, **overrides):
+        response = self.client.post(
+            reverse("recipe-update", args=[self.recipe.slug]), self._update_payload(**overrides)
+        )
+        self.assertRedirects(response, self.recipe.get_absolute_url())
+        return RecipeNutrition.objects.get(recipe=self.recipe)
+
+    def test_detail_creates_estimated_nutrition_for_legacy_recipe(self):
+        self.assertIsNone(self.recipe.nutrition_or_none)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        nutrition = response.context["nutrition"]
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.ESTIMATED)
+        self.assertEqual(str(nutrition.calories_per_serving), "205.0")
+        self.assertEqual(str(nutrition.calories_per_100g), "205.0")
+        self.assertTrue(nutrition.is_estimated)
+        self.assertTrue(RecipeNutrition.objects.filter(recipe=self.recipe).exists())
+        self.assertContains(response, "оценено по ингредиентам")
+        self.assertContains(response, "На порцию:")
+
+    def test_update_form_estimates_empty_fields_and_marks_manual_ones(self):
+        nutrition = self._update(**{"nutrition-calories_per_serving": "999"})
+
+        self.assertEqual(str(nutrition.calories_per_serving), "999.0")
+        self.assertEqual(str(nutrition.calories_per_100g), "205.0")
+        self.assertEqual(nutrition.manual_fields, ["calories_per_serving"])
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.ESTIMATED)
+        self.assertTrue(nutrition.is_estimated)
+
+    def test_ingredient_change_recalculates_only_automatic_fields(self):
+        self._update(**{"nutrition-calories_per_serving": "999"})
+
+        nutrition = self._update(
+            **{"nutrition-calories_per_serving": "999", "ingredients-0-quantity": "400"}
+        )
+
+        self.assertEqual(str(nutrition.calories_per_serving), "999.0")
+        self.assertEqual(str(nutrition.fats_per_serving), "40.0")
+        self.assertEqual(nutrition.manual_fields, ["calories_per_serving"])
+
+    def test_pantry_toggle_keeps_ai_values_untouched(self):
+        RecipeNutrition.objects.create(
+            recipe=self.recipe,
+            calories_per_serving=500,
+            proteins_per_serving=10,
+            fats_per_serving=20,
+            carbohydrates_per_serving=30,
+            calories_per_100g=150,
+            proteins_per_100g=3,
+            fats_per_100g=6,
+            carbohydrates_per_100g=9,
+            source=RecipeNutrition.Source.AI,
+            notes="Масло слито.",
+        )
+
+        nutrition = self._update(**{
+            "nutrition-calories_per_serving": "500",
+            "nutrition-proteins_per_serving": "10",
+            "nutrition-fats_per_serving": "20",
+            "nutrition-carbohydrates_per_serving": "30",
+            "nutrition-calories_per_100g": "150",
+            "nutrition-proteins_per_100g": "3",
+            "nutrition-fats_per_100g": "6",
+            "nutrition-carbohydrates_per_100g": "9",
+            "nutrition-notes": "Масло слито.",
+            "ingredients-0-is_pantry": "on",
+        })
+
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.AI)
+        self.assertEqual(str(nutrition.calories_per_serving), "500.0")
+        self.assertEqual(nutrition.notes, "Масло слито.")
+        self.assertEqual(nutrition.manual_fields, [])
+
+    def test_editing_one_field_keeps_other_ai_values(self):
+        RecipeNutrition.objects.create(
+            recipe=self.recipe,
+            calories_per_serving=500,
+            proteins_per_serving=10,
+            fats_per_serving=20,
+            carbohydrates_per_serving=30,
+            calories_per_100g=150,
+            proteins_per_100g=3,
+            fats_per_100g=6,
+            carbohydrates_per_100g=9,
+            source=RecipeNutrition.Source.AI,
+        )
+
+        nutrition = self._update(**{
+            "nutrition-calories_per_serving": "777",
+            "nutrition-proteins_per_serving": "10",
+            "nutrition-fats_per_serving": "20",
+            "nutrition-carbohydrates_per_serving": "30",
+            "nutrition-calories_per_100g": "150",
+            "nutrition-proteins_per_100g": "3",
+            "nutrition-fats_per_100g": "6",
+            "nutrition-carbohydrates_per_100g": "9",
+        })
+
+        self.assertEqual(str(nutrition.calories_per_serving), "777.0")
+        self.assertEqual(str(nutrition.calories_per_100g), "150.0")
+        self.assertEqual(nutrition.manual_fields, ["calories_per_serving"])
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.AI)
+
+    def test_all_fields_entered_manually_mark_source_manual(self):
+        nutrition = self._update(**{
+            f"nutrition-{field}": "1" for field in NUTRITION_FIELDS
+        })
+
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.MANUAL)
+        self.assertFalse(nutrition.is_estimated)
+        self.assertEqual(nutrition.manual_fields, sorted(NUTRITION_FIELDS))
+
+    def test_create_recipe_stores_required_nutrition(self):
+        response = self.client.post(
+            reverse("recipe-create"),
+            {
+                "title": "Суп с ручной калорийностью",
+                "servings": 4,
+                "prep_minutes": 5,
+                "cook_minutes": 30,
+                "nutrition-calories_per_serving": "123",
+                "ingredients-TOTAL_FORMS": 1,
+                "ingredients-INITIAL_FORMS": 0,
+                "ingredients-MIN_NUM_FORMS": 1,
+                "ingredients-MAX_NUM_FORMS": 1000,
+                "ingredients-0-name": "Картофель",
+                "ingredients-0-quantity": 500,
+                "ingredients-0-unit": "г",
+                "steps-TOTAL_FORMS": 1,
+                "steps-INITIAL_FORMS": 0,
+                "steps-MIN_NUM_FORMS": 1,
+                "steps-MAX_NUM_FORMS": 1000,
+                "steps-0-title": "Варка",
+                "steps-0-instruction": "Сварить до мягкости.",
+            },
+        )
+
+        created = Recipe.objects.get(title="Суп с ручной калорийностью")
+        self.assertRedirects(response, created.get_absolute_url())
+        nutrition = created.nutrition
+        self.assertEqual(str(nutrition.calories_per_serving), "123.0")
+        self.assertEqual(str(nutrition.calories_per_100g), "77.0")
+        self.assertEqual(nutrition.manual_fields, ["calories_per_serving"])
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.ESTIMATED)
+        detail = self.client.get(created.get_absolute_url())
+        self.assertEqual(str(detail.context["nutrition"].calories_per_100g), "77.0")
+
+    def test_negative_nutrition_is_rejected(self):
+        response = self.client.post(
+            reverse("recipe-update", args=[self.recipe.slug]),
+            self._update_payload(**{"nutrition-calories_per_serving": "-5"}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "field-error")
+        nutrition = RecipeNutrition.objects.get(recipe=self.recipe)
+        self.assertEqual(nutrition.manual_fields, [])
+        self.assertEqual(str(nutrition.calories_per_serving), "205.0")

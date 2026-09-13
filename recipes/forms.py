@@ -4,9 +4,11 @@ from django.contrib.auth.forms import UserCreationForm
 from django.forms import BaseInlineFormSet, inlineformset_factory
 
 from .models import (
+    NUTRITION_FIELDS,
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeNutrition,
     RecipeRefinement,
     RecipeStep,
     is_water_ingredient_name,
@@ -37,22 +39,16 @@ class RecipeForm(forms.ModelForm):
             "title",
             "description",
             "categories",
+            "main_protein",
             "servings",
             "prep_minutes",
             "cook_minutes",
-            "calories_per_serving",
-            "proteins_per_serving",
-            "fats_per_serving",
-            "carbohydrates_per_serving",
-            "calories_per_100g",
-            "proteins_per_100g",
-            "fats_per_100g",
-            "carbohydrates_per_100g",
             "cover",
             "text_source_url",
             "video_url",
         )
         help_texts = {
+            "main_protein": "Для вторых блюд: из чего готовится. Для остальных можно не указывать.",
             "text_source_url": "Страница с рецептом или текстовый файл. Можно указать вместе с видео.",
             "video_url": "YouTube можно смотреть прямо в рецепте; другие видео откроются в новой вкладке.",
         }
@@ -75,6 +71,42 @@ class RecipeForm(forms.ModelForm):
             recipe.save()
             self._save_m2m()
         return recipe
+
+
+class RecipeNutritionForm(forms.ModelForm):
+    """КБЖУ в форме рецепта.
+
+    В базе все значения обязательны, но в форме их можно оставить пустыми:
+    пустое поле заполняется автоматической оценкой по ингредиентам, а
+    введённое число помечается как ручное и больше не пересчитывается.
+    """
+
+    class Meta:
+        model = RecipeNutrition
+        fields = (*NUTRITION_FIELDS, "notes")
+        widgets = {
+            **{
+                field: forms.NumberInput(attrs={"step": "0.1", "min": 0})
+                for field in NUTRITION_FIELDS
+            },
+            "notes": forms.Textarea(
+                attrs={
+                    "rows": 2,
+                    "placeholder": "Например: масло после пассеровки слито, кости не учтены.",
+                }
+            ),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for field in NUTRITION_FIELDS:
+            self.fields[field].required = False
+
+    def submitted_values(self):
+        return {field: self.cleaned_data.get(field) for field in NUTRITION_FIELDS}
+
+    def changed_nutrition_fields(self) -> set[str]:
+        return set(NUTRITION_FIELDS).intersection(self.changed_data)
 
 
 class ImportRecipeForm(forms.ModelForm):

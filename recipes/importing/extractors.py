@@ -4,6 +4,7 @@ import base64
 import http.client
 import ipaddress
 import json
+import logging
 import re
 import socket
 import ssl
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 
+import yt_dlp
 from bs4 import BeautifulSoup
 from django.conf import settings
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -21,6 +23,8 @@ from youtube_transcript_api._errors import YouTubeTranscriptApiException
 
 from .exceptions import SourceError
 
+
+logger = logging.getLogger(__name__)
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CHARS = 60_000
@@ -33,6 +37,50 @@ YOUTUBE_OEMBED_PROBE_VIDEO_ID = "dQw4w9WgXcQ"
 PUBLIC_DNS_JSON_ENDPOINT = "https://cloudflare-dns.com/dns-query"
 MAX_DNS_JSON_BYTES = 64 * 1024
 MAX_PROXY_RESPONSE_BYTES = 64 * 1024
+MAX_SOURCE_LINKS = 20
+MAX_SOURCE_LINK_CONTEXT_CHARS = 200
+MAX_YOUTUBE_COMMENTS = 20
+YOUTUBE_METADATA_TIMEOUT_SECONDS = 20
+# Only embed URLs: plain youtu.be or watch links in a page usually point to a
+# channel or another video, so they must not become the article video.
+YOUTUBE_EMBED_PATTERN = re.compile(
+    r"youtube(?:-nocookie)?\.com/(?:embed|v)/([A-Za-z0-9_-]{11})"
+)
+SOURCE_LINK_PATTERN = re.compile(r"https?://[^\s<>\"'()\[\]]+")
+HOSTNAME_PATTERN = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
+# Social networks, messengers and stores never host the text version of a
+# recipe, so they are dropped before the model sees the candidate list.
+IGNORED_SOURCE_LINK_HOSTS = frozenset(
+    {
+        "youtube.com",
+        "youtu.be",
+        "instagram.com",
+        "facebook.com",
+        "fb.com",
+        "tiktok.com",
+        "twitter.com",
+        "x.com",
+        "t.me",
+        "telegram.me",
+        "vk.com",
+        "ok.ru",
+        "threads.net",
+        "pinterest.com",
+        "patreon.com",
+        "boosty.to",
+        "amazon.com",
+        "amzn.to",
+        "wildberries.ru",
+        "ozon.ru",
+        "rutube.ru",
+        "dzen.ru",
+        "discord.gg",
+        "discord.com",
+        "whatsapp.com",
+        "wa.me",
+        "epidemicsound.com",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +95,11 @@ class SourceDocument:
     recipe_cover_image_urls: tuple[tuple[str, ...], ...] = ()
     recipe_step_image_urls: tuple[tuple[str, ...], ...] = ()
     transcript_segments: tuple[dict[str, Any], ...] = ()
+    # Video found inside an article; the transcript above then belongs to it.
+    video_url: str = ""
+    # Links from a video description or pinned comment that may point to the
+    # text version of the recipe: {"url", "context", "origin"}.
+    source_links: tuple[dict[str, str], ...] = ()
 
     @property
     def all_structured_recipes(self) -> tuple[dict[str, Any], ...]:
@@ -77,6 +130,62 @@ def youtube_video_id(url: str) -> str | None:
 
 def detect_source_type(url: str) -> str:
     return "youtube" if youtube_video_id(url) else "website"
+
+
+def youtube_watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _link_host(url: str) -> str:
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host.removeprefix("www.").removeprefix("m.")
+
+
+def _is_ignored_source_link(url: str) -> bool:
+    host = _link_host(url)
+    if not HOSTNAME_PATTERN.fullmatch(host):
+        return True
+    return any(
+        host == ignored or host.endswith(f".{ignored}")
+        for ignored in IGNORED_SOURCE_LINK_HOSTS
+    )
+
+
+def _clean_source_link(url: str) -> str:
+    url = url.rstrip(".,;:!?»›)»\"'")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    return url[:2048]
+
+
+def source_links_from_text(text: str, origin: str) -> list[dict[str, str]]:
+    """Collect candidate text-recipe links with the line they appear on."""
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in str(text or "").splitlines():
+        for match in SOURCE_LINK_PATTERN.finditer(line):
+            url = _clean_source_link(match.group())
+            if not url or url in seen or _is_ignored_source_link(url):
+                continue
+            seen.add(url)
+            context = " ".join(SOURCE_LINK_PATTERN.sub(" ", line).split())
+            links.append(
+                {
+                    "url": url,
+                    "context": context[:MAX_SOURCE_LINK_CONTEXT_CHARS],
+                    "origin": origin,
+                }
+            )
+            if len(links) >= MAX_SOURCE_LINKS:
+                return links
+    return links
 
 
 def _fit_transcript_segment(
@@ -646,11 +755,71 @@ def _structured_step_image_slots(value: Any, base_url: str) -> tuple[str, ...]:
     return tuple(slots)
 
 
+def _schema_video_ids(value: Any) -> list[str]:
+    if isinstance(value, list):
+        ids: list[str] = []
+        for item in value:
+            ids.extend(_schema_video_ids(item))
+        return ids
+    if isinstance(value, dict):
+        candidates = [value.get("embedUrl"), value.get("contentUrl"), value.get("url")]
+    else:
+        candidates = [value]
+    ids = []
+    for candidate in candidates:
+        video_id = youtube_video_id(str(candidate or ""))
+        if video_id:
+            ids.append(video_id)
+    return ids
+
+
+def article_video_url(
+    soup: BeautifulSoup,
+    recipes: list[dict[str, Any]],
+    html: str,
+) -> str:
+    """Find the YouTube video embedded in an article, if there is one.
+
+    Only recipe markup and embeds count: plain links to YouTube usually lead to
+    channels or unrelated videos. A page with several recipes gets a video only
+    when their markup agrees on one; a shared embed cannot be attributed.
+    """
+    recipe_video_ids = [
+        next(iter(_schema_video_ids(recipe.get("video"))), "") for recipe in recipes
+    ]
+    if len(recipes) > 1:
+        distinct = set(recipe_video_ids)
+        return youtube_watch_url(distinct.pop()) if len(distinct) == 1 and "" not in distinct else ""
+    for video_id in recipe_video_ids:
+        if video_id:
+            return youtube_watch_url(video_id)
+    for element in soup.select("iframe, lite-youtube, youtube-video, [data-youtube-id]"):
+        for attribute in ("src", "data-src", "data-lazy-src", "videoid", "data-youtube-id"):
+            value = str(element.get(attribute) or "")
+            video_id = youtube_video_id(value) or (
+                value if re.fullmatch(r"[A-Za-z0-9_-]{11}", value) else None
+            )
+            if video_id:
+                return youtube_watch_url(video_id)
+    match = YOUTUBE_EMBED_PATTERN.search(html)
+    if match:
+        return youtube_watch_url(match.group(1))
+    return ""
+
+
 def extract_website(url: str) -> SourceDocument:
     html, final_url = _download_html(url)
     soup = BeautifulSoup(html, "html.parser")
     recipes = _structured_recipes(soup)
     cover_image_urls, step_image_urls = _source_images(soup, recipes, final_url)
+    video_url = article_video_url(soup, recipes, html)
+    transcript_segments: list[dict[str, Any]] = []
+    if video_url:
+        try:
+            transcript_segments = _fetch_transcript_segments(youtube_video_id(video_url))
+        except SourceError:
+            # Silent cooking videos have no subtitles; the link is still useful.
+            logger.info("No transcript for the article video %s", video_url)
     for element in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
         element.decompose()
     title = _page_title(soup)
@@ -677,6 +846,8 @@ def extract_website(url: str) -> SourceDocument:
             _structured_step_image_slots(recipe.get("recipeInstructions", []), final_url)
             for recipe in recipes
         ),
+        transcript_segments=tuple(transcript_segments),
+        video_url=video_url,
     )
 
 
@@ -689,6 +860,73 @@ def extract_youtube(
     video_id = youtube_video_id(url)
     if not video_id:
         raise SourceError("Не удалось распознать ссылку на YouTube-видео.")
+    transcript_segments = _fetch_transcript_segments(video_id)
+    text = " ".join(segment["text"] for segment in transcript_segments)
+    if len(text) < 80:
+        raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
+    metadata = _fetch_youtube_metadata(video_id)
+    source_links = source_links_from_text(metadata.get("description", ""), "description")
+    for comment in metadata.get("uploader_comments", ()):
+        for link in source_links_from_text(comment, "pinned_comment"):
+            if len(source_links) >= MAX_SOURCE_LINKS:
+                break
+            if all(link["url"] != existing["url"] for existing in source_links):
+                source_links.append(link)
+    return SourceDocument(
+        "youtube",
+        source_title
+        or (_fetch_youtube_title(video_id) if fetch_title else "")
+        or f"YouTube {video_id}",
+        text[:MAX_SOURCE_CHARS],
+        cover_image_urls=(
+            f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
+            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        ),
+        transcript_segments=tuple(transcript_segments),
+        video_url=youtube_watch_url(video_id),
+        source_links=tuple(source_links),
+    )
+
+
+def _fetch_youtube_metadata(video_id: str) -> dict[str, Any]:
+    """Return the description and uploader comments; failures yield nothing."""
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "getcomments": True,
+        "socket_timeout": YOUTUBE_METADATA_TIMEOUT_SECONDS,
+        "extractor_args": {
+            "youtube": {
+                "max_comments": [str(MAX_YOUTUBE_COMMENTS), "all", "0", "0"],
+                "comment_sort": ["top"],
+            }
+        },
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(youtube_watch_url(video_id), download=False)
+    except Exception:  # yt-dlp raises many unrelated error types.
+        logger.info("YouTube metadata is unavailable for %s", video_id, exc_info=True)
+        return {}
+    if not isinstance(info, dict):
+        return {}
+    uploader_comments = []
+    for comment in info.get("comments") or []:
+        if not isinstance(comment, dict):
+            continue
+        if comment.get("is_pinned") or comment.get("author_is_uploader"):
+            text = str(comment.get("text") or "")
+            if text:
+                uploader_comments.append(text)
+    return {
+        "description": str(info.get("description") or ""),
+        "uploader_comments": uploader_comments,
+    }
+
+
+def _fetch_transcript_segments(video_id: str) -> list[dict[str, Any]]:
     try:
         transcript = YouTubeTranscriptApi().fetch(video_id, languages=["ru", "uk", "en"])
     except YouTubeTranscriptApiException as error:
@@ -725,22 +963,7 @@ def extract_youtube(
         transcript_json_bytes += separator_bytes + segment_json_bytes
         if segment["text"] != snippet_text:
             break
-    text = " ".join(segment["text"] for segment in transcript_segments)
-    if len(text) < 80:
-        raise SourceError("В субтитрах слишком мало текста, чтобы составить рецепт.")
-    return SourceDocument(
-        "youtube",
-        source_title
-        or (_fetch_youtube_title(video_id) if fetch_title else "")
-        or f"YouTube {video_id}",
-        text[:MAX_SOURCE_CHARS],
-        cover_image_urls=(
-            f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-            f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
-            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-        ),
-        transcript_segments=tuple(transcript_segments),
-    )
+    return transcript_segments
 
 
 def extract_source(

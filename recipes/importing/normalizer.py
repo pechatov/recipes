@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 from typing import Any
 
-from recipes.categories import CATEGORY_SLUGS
+from recipes.categories import CATEGORY_SLUGS, MAIN_PROTEIN_SLUGS, infer_main_protein
 from recipes.models import is_water_ingredient_name
 
 from .exceptions import AIResponseError
@@ -34,6 +35,17 @@ def _optional_integer(value: Any, maximum: int) -> int | None:
     if number < 0 or number > maximum:
         return None
     return number
+
+
+def _http_url(value: Any) -> str:
+    url = _text(value, 2048)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    return url
 
 
 def _quantity(value: Any) -> str | None:
@@ -231,11 +243,47 @@ def estimate_nutrition(ingredients: list[dict[str, Any]], servings: int) -> dict
     return result
 
 
-def estimate_calories(
-    ingredients: list[dict[str, Any]], servings: int
-) -> tuple[str | None, str | None]:
-    nutrition = estimate_nutrition(ingredients, servings)
-    return nutrition["calories_per_serving"], nutrition["calories_per_100g"]
+NUTRITION_FIELDS = (
+    "calories_per_serving",
+    "proteins_per_serving",
+    "fats_per_serving",
+    "carbohydrates_per_serving",
+    "calories_per_100g",
+    "proteins_per_100g",
+    "fats_per_100g",
+    "carbohydrates_per_100g",
+)
+
+
+def normalize_nutrition(
+    value: dict[str, Any], ingredients: list[dict[str, Any]], servings: int
+) -> dict[str, Any]:
+    """Собрать полное КБЖУ из ответа модели.
+
+    Значения читаются из вложенного объекта ``nutrition`` или из полей верхнего
+    уровня (Schema.org-импорт). Если модель указала все восемь чисел, источник
+    ``ai``; иначе пропуски закрываются локальной оценкой и источник ``estimated``.
+    """
+    nested = value.get("nutrition")
+    provided = nested if isinstance(nested, dict) else value
+    parsed = {
+        field: (_calories if field.startswith("calories") else _nutrient)(
+            provided.get(field)
+        )
+        for field in NUTRITION_FIELDS
+    }
+    notes = _text(provided.get("notes"), 1000)
+    if all(parsed[field] is not None for field in NUTRITION_FIELDS):
+        return {**parsed, "notes": notes, "source": "ai"}
+    estimated = estimate_nutrition(ingredients, servings)
+    return {
+        **{
+            field: parsed[field] if parsed[field] is not None else estimated[field]
+            for field in NUTRITION_FIELDS
+        },
+        "notes": notes,
+        "source": "estimated",
+    }
 
 
 def normalize_recipe(
@@ -335,34 +383,28 @@ def normalize_recipe(
     if require_categories and not categories:
         raise AIResponseError("Модель не выбрала ни одной допустимой категории рецепта.")
     servings = max(1, _integer(value.get("servings"), 2, 100))
-    estimated_nutrition = estimate_nutrition(all_ingredients, servings)
+    main_protein = _text(value.get("main_protein"), 16).lower()
+    if "main-course" not in categories:
+        # The badge belongs to main courses only, whatever the model says.
+        main_protein = ""
+    elif main_protein not in MAIN_PROTEIN_SLUGS:
+        main_protein = infer_main_protein(
+            item["name"] for item in ingredients if not item["is_pantry"]
+        )
     return {
         "title": title,
+        "main_protein": main_protein,
         "description": _text(value.get("description"), 2000),
         "servings": servings,
         "prep_minutes": _integer(value.get("prep_minutes"), 0, 1440),
         "cook_minutes": _integer(value.get("cook_minutes"), 0, 10080),
         "categories": categories,
-        "calories_per_serving": (
-            _calories(value.get("calories_per_serving"))
-            or estimated_nutrition["calories_per_serving"]
-        ),
-        "calories_per_100g": (
-            _calories(value.get("calories_per_100g"))
-            or estimated_nutrition["calories_per_100g"]
-        ),
-        **{
-            field: _nutrient(value.get(field)) or estimated_nutrition[field]
-            for field in (
-                "proteins_per_serving", "fats_per_serving",
-                "carbohydrates_per_serving", "proteins_per_100g", "fats_per_100g",
-                "carbohydrates_per_100g",
-            )
-        },
+        "nutrition": normalize_nutrition(value, all_ingredients, servings),
         "cover_image_url": _text(value.get("cover_image_url"), 2048),
         "cover_image_search_query": _text(
             value.get("cover_image_search_query"), 200
         ),
+        "text_source_url": _http_url(value.get("text_source_url")),
         "ingredients": ingredients,
         "steps": steps,
     }
