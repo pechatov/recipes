@@ -57,6 +57,7 @@ from recipes.models import (
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeNutrition,
     RecipeRefinement,
     RecipeStep,
 )
@@ -755,8 +756,48 @@ class NormalizerTests(TestCase):
         self.assertEqual([item["name"] for item in recipe["ingredients"]], ["Картофель", "Соль"])
         self.assertFalse(recipe["ingredients"][0]["is_pantry"])
         self.assertTrue(recipe["ingredients"][1]["is_pantry"])
-        self.assertEqual(recipe["calories_per_serving"], "192.5")
-        self.assertEqual(recipe["calories_per_100g"], "25.6")
+        self.assertEqual(recipe["nutrition"]["calories_per_serving"], "192.5")
+        self.assertEqual(recipe["nutrition"]["calories_per_100g"], "25.6")
+        self.assertEqual(recipe["nutrition"]["source"], "estimated")
+
+    def test_complete_ai_nutrition_is_kept_with_notes(self):
+        recipe = normalize_recipe(
+            {
+                "title": "Суп",
+                "servings": 2,
+                "nutrition": {
+                    "calories_per_serving": 300,
+                    "proteins_per_serving": 10,
+                    "fats_per_serving": 12,
+                    "carbohydrates_per_serving": 35,
+                    "calories_per_100g": 80,
+                    "proteins_per_100g": 2.7,
+                    "fats_per_100g": 3.2,
+                    "carbohydrates_per_100g": 9.3,
+                    "notes": "Масло после пассеровки слито.",
+                },
+                "ingredients": [{"name": "Картофель", "quantity": 500, "unit": "г"}],
+                "steps": [{"instruction": "Сварить."}],
+            }
+        )
+        self.assertEqual(recipe["nutrition"]["source"], "ai")
+        self.assertEqual(recipe["nutrition"]["calories_per_serving"], "300.0")
+        self.assertEqual(recipe["nutrition"]["fats_per_100g"], "3.2")
+        self.assertEqual(recipe["nutrition"]["notes"], "Масло после пассеровки слито.")
+
+    def test_partial_ai_nutrition_is_completed_by_estimate(self):
+        recipe = normalize_recipe(
+            {
+                "title": "Суп",
+                "servings": 2,
+                "nutrition": {"calories_per_serving": 300},
+                "ingredients": [{"name": "Картофель", "quantity": 500, "unit": "г"}],
+                "steps": [{"instruction": "Сварить."}],
+            }
+        )
+        self.assertEqual(recipe["nutrition"]["source"], "estimated")
+        self.assertEqual(recipe["nutrition"]["calories_per_serving"], "300.0")
+        self.assertEqual(recipe["nutrition"]["calories_per_100g"], "77.0")
 
     def test_large_amount_of_a_staple_is_not_marked_as_pantry(self):
         recipe = normalize_recipe(
@@ -1014,10 +1055,19 @@ class PipelineTests(TestCase):
             title="Ручная калорийность",
             status=Recipe.Status.DRAFT,
             created_by=user,
+        )
+        RecipeNutrition.objects.create(
+            recipe=recipe,
             calories_per_serving="777.0",
             proteins_per_serving="12.0",
-            nutrition_manual_fields=["calories_per_serving"],
-            calories_estimated=True,
+            fats_per_serving="1.0",
+            carbohydrates_per_serving="1.0",
+            calories_per_100g="1.0",
+            proteins_per_100g="1.0",
+            fats_per_100g="1.0",
+            carbohydrates_per_100g="1.0",
+            manual_fields=["calories_per_serving"],
+            source=RecipeNutrition.Source.ESTIMATED,
         )
         RecipeIngredient.objects.create(
             recipe=recipe, name="Картофель", quantity=300, unit="г"
@@ -1035,8 +1085,18 @@ class PipelineTests(TestCase):
             "title": "Ручная калорийность",
             "description": "Коротко.",
             "servings": 2,
-            "calories_per_serving": 100,
-            "proteins_per_serving": 5,
+            "nutrition": {
+                "calories_per_serving": "100.0",
+                "proteins_per_serving": "5.0",
+                "fats_per_serving": "2.0",
+                "carbohydrates_per_serving": "20.0",
+                "calories_per_100g": "60.0",
+                "proteins_per_100g": "3.0",
+                "fats_per_100g": "1.0",
+                "carbohydrates_per_100g": "12.0",
+                "notes": "Порция около 170 г.",
+                "source": "ai",
+            },
             "categories": ["main-course"],
             "ingredients": [
                 {"name": "Картофель", "quantity": 300, "unit": "г"}
@@ -1046,11 +1106,47 @@ class PipelineTests(TestCase):
 
         process_recipe_refinement(refinement)
 
-        recipe.refresh_from_db()
-        self.assertEqual(recipe.calories_per_serving, 777)
-        self.assertEqual(recipe.proteins_per_serving, 5)
-        self.assertEqual(recipe.nutrition_manual_fields, ["calories_per_serving"])
-        self.assertTrue(recipe.calories_estimated)
+        nutrition = RecipeNutrition.objects.get(recipe=recipe)
+        self.assertEqual(nutrition.calories_per_serving, 777)
+        self.assertEqual(nutrition.proteins_per_serving, 5)
+        self.assertEqual(nutrition.manual_fields, ["calories_per_serving"])
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.AI)
+        self.assertEqual(nutrition.notes, "Порция около 170 г.")
+        self.assertTrue(nutrition.is_estimated)
+
+    @patch("recipes.importing.pipeline.refine_with_ai")
+    def test_refinement_without_nutrition_falls_back_to_estimate(self, refine_with_ai):
+        user = get_user_model().objects.create_user("nutrition-fallback-owner")
+        recipe = Recipe.objects.create(
+            title="Без КБЖУ", status=Recipe.Status.DRAFT, created_by=user
+        )
+        RecipeIngredient.objects.create(
+            recipe=recipe, name="Картофель", quantity=300, unit="г"
+        )
+        RecipeStep.objects.create(recipe=recipe, instruction="Приготовить.")
+        refinement = RecipeRefinement.objects.create(
+            recipe=recipe,
+            requested_by=user,
+            prompt="Сделай описание короче",
+            expected_recipe_updated_at=recipe.updated_at,
+            status=RecipeRefinement.Status.PROCESSING,
+            attempts=1,
+        )
+        refine_with_ai.return_value = {
+            "title": "Без КБЖУ",
+            "description": "Коротко.",
+            "servings": 2,
+            "categories": ["main-course"],
+            "ingredients": [{"name": "Картофель", "quantity": 300, "unit": "г"}],
+            "steps": [{"instruction": "Приготовить."}],
+        }
+
+        process_recipe_refinement(refinement)
+
+        nutrition = RecipeNutrition.objects.get(recipe=recipe)
+        self.assertEqual(nutrition.source, RecipeNutrition.Source.ESTIMATED)
+        self.assertEqual(str(nutrition.calories_per_serving), "115.5")
+        self.assertEqual(str(nutrition.calories_per_100g), "77.0")
 
     @patch("recipes.importing.pipeline.refine_with_ai")
     @patch("django.core.files.storage.FileSystemStorage.delete")
@@ -1199,8 +1295,18 @@ class PipelineTests(TestCase):
             "prep_minutes": 0,
             "cook_minutes": 10,
             "categories": ["main-course"],
-            "calories_per_serving": "200.0",
-            "calories_per_100g": "100.0",
+            "nutrition": {
+                "calories_per_serving": "200.0",
+                "proteins_per_serving": "4.0",
+                "fats_per_serving": "0.5",
+                "carbohydrates_per_serving": "45.0",
+                "calories_per_100g": "100.0",
+                "proteins_per_100g": "2.0",
+                "fats_per_100g": "0.2",
+                "carbohydrates_per_100g": "22.0",
+                "notes": "",
+                "source": "ai",
+            },
             "cover_image_url": "",
             "ingredients": [{
                 "section": "", "name": "Картофель", "quantity": "300.00", "unit": "г",

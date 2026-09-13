@@ -11,6 +11,7 @@ from .models import (
     ImportJob,
     Recipe,
     RecipeIngredient,
+    RecipeNutrition,
     RecipeRefinement,
     RecipeSlugAlias,
     RecipeStep,
@@ -52,6 +53,14 @@ class StepInline(admin.StackedInline):
     extra = 1
 
 
+class NutritionInline(admin.StackedInline):
+    model = RecipeNutrition
+    can_delete = False
+    extra = 0
+    max_num = 1
+    readonly_fields = ("manual_fields", "created_at", "updated_at")
+
+
 @admin.register(Recipe)
 class RecipeAdmin(admin.ModelAdmin):
     form = AdminRecipeForm
@@ -59,7 +68,7 @@ class RecipeAdmin(admin.ModelAdmin):
     list_filter = ("status", "categories")
     search_fields = ("title", "description", "ingredients__name")
     readonly_fields = ("created_at", "updated_at")
-    inlines = (IngredientInline, StepInline)
+    inlines = (NutritionInline, IngredientInline, StepInline)
 
 
 @admin.register(RecipeSlugAlias)

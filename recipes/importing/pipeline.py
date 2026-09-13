@@ -19,7 +19,9 @@ from django.db.models import Q
 from django.utils import timezone
 
 from recipes.categories import CATEGORY_TAXONOMY
+from recipes.nutrition import apply_imported_nutrition
 from recipes.models import (
+    NUTRITION_FIELDS,
     Category,
     ImportJob,
     Recipe,
@@ -447,16 +449,6 @@ def _recipe_content_values(data: dict) -> dict:
         "servings": data["servings"],
         "prep_minutes": data["prep_minutes"],
         "cook_minutes": data["cook_minutes"],
-        "calories_per_serving": data.get("calories_per_serving"),
-        "calories_per_100g": data.get("calories_per_100g"),
-        "proteins_per_serving": data.get("proteins_per_serving"),
-        "fats_per_serving": data.get("fats_per_serving"),
-        "carbohydrates_per_serving": data.get("carbohydrates_per_serving"),
-        "proteins_per_100g": data.get("proteins_per_100g"),
-        "fats_per_100g": data.get("fats_per_100g"),
-        "carbohydrates_per_100g": data.get("carbohydrates_per_100g"),
-        "calories_estimated": True,
-        "nutrition_manual_fields": [],
     }
 
 
@@ -686,12 +678,13 @@ def save_draft(
                         recipe.cover_imported = True
                     recipe.save()
 
-                RecipeIngredient.objects.bulk_create(
+                ingredients = RecipeIngredient.objects.bulk_create(
                     [
                         RecipeIngredient(recipe=recipe, order=index, **ingredient)
                         for index, ingredient in enumerate(values["ingredients"])
                     ]
                 )
+                apply_imported_nutrition(recipe, values.get("nutrition"), ingredients)
                 steps = []
                 for index, step in enumerate(values["steps"]):
                     step_values = {
@@ -806,6 +799,15 @@ def process_import_job(job: ImportJob) -> list[Recipe]:
     )
 
 
+def _nutrition_payload(recipe: Recipe) -> dict[str, Any]:
+    nutrition = recipe.nutrition_or_none
+    if nutrition is None:
+        return {}
+    payload = {field: str(getattr(nutrition, field)) for field in NUTRITION_FIELDS}
+    payload["notes"] = nutrition.notes
+    return payload
+
+
 def _recipe_refinement_payload(recipe: Recipe) -> dict[str, Any]:
     def json_number(value):
         return str(value) if value is not None else None
@@ -816,14 +818,7 @@ def _recipe_refinement_payload(recipe: Recipe) -> dict[str, Any]:
         "servings": recipe.servings,
         "prep_minutes": recipe.prep_minutes,
         "cook_minutes": recipe.cook_minutes,
-        "calories_per_serving": json_number(recipe.calories_per_serving),
-        "proteins_per_serving": json_number(recipe.proteins_per_serving),
-        "fats_per_serving": json_number(recipe.fats_per_serving),
-        "carbohydrates_per_serving": json_number(recipe.carbohydrates_per_serving),
-        "calories_per_100g": json_number(recipe.calories_per_100g),
-        "proteins_per_100g": json_number(recipe.proteins_per_100g),
-        "fats_per_100g": json_number(recipe.fats_per_100g),
-        "carbohydrates_per_100g": json_number(recipe.carbohydrates_per_100g),
+        "nutrition": _nutrition_payload(recipe),
         "categories": list(recipe.categories.values_list("slug", flat=True)),
         "cover_image_url": "",
         "cover_image_search_query": "",
@@ -893,10 +888,6 @@ def save_refined_recipe(
                 "Пожелание не применено, чтобы не привязать их к другим шагам."
             )
 
-        manual_nutrition_fields = set(recipe.nutrition_manual_fields or [])
-        manual_nutrition = {
-            field: getattr(recipe, field) for field in manual_nutrition_fields
-        }
         obsolete_images = [
             stored
             for step in recipe.steps.all()
@@ -905,31 +896,16 @@ def save_refined_recipe(
 
         for field, value in _recipe_content_values(values).items():
             setattr(recipe, field, value)
-        for field, value in manual_nutrition.items():
-            setattr(recipe, field, value)
-        recipe.nutrition_manual_fields = sorted(manual_nutrition_fields)
-        recipe.calories_estimated = any(
-            field not in manual_nutrition_fields and getattr(recipe, field) is not None
-            for field in (
-                "calories_per_serving",
-                "proteins_per_serving",
-                "fats_per_serving",
-                "carbohydrates_per_serving",
-                "calories_per_100g",
-                "proteins_per_100g",
-                "fats_per_100g",
-                "carbohydrates_per_100g",
-            )
-        )
         recipe.save()
         recipe.ingredients.all().delete()
         recipe.steps.all().delete()
-        RecipeIngredient.objects.bulk_create(
+        ingredients = RecipeIngredient.objects.bulk_create(
             [
                 RecipeIngredient(recipe=recipe, order=index, **ingredient)
                 for index, ingredient in enumerate(values["ingredients"])
             ]
         )
+        apply_imported_nutrition(recipe, values.get("nutrition"), ingredients)
         steps = []
         for index, step in enumerate(values["steps"]):
             step_values = {key: value for key, value in step.items() if key != "image_url"}

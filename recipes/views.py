@@ -43,13 +43,14 @@ from .forms import (
     ImportRecipeForm,
     IngredientFormSet,
     RecipeForm,
+    RecipeNutritionForm,
     RecipeRefinementForm,
     RegistrationForm,
     SetupForm,
     StepFormSet,
 )
 from .importing.extractors import detect_source_type, youtube_video_id
-from .importing.normalizer import estimate_nutrition
+from .nutrition import ensure_nutrition, save_form_nutrition
 from .locking import (
     CART_BROWSER_LOCK,
     REGISTRATION_LOCK,
@@ -91,16 +92,6 @@ SEARCH_FIELDS = (
     "created_by__last_name",
     "categories__name",
     "ingredients__name",
-)
-NUTRITION_FIELDS = (
-    "calories_per_serving",
-    "proteins_per_serving",
-    "fats_per_serving",
-    "carbohydrates_per_serving",
-    "calories_per_100g",
-    "proteins_per_100g",
-    "fats_per_100g",
-    "carbohydrates_per_100g",
 )
 
 
@@ -538,11 +529,7 @@ def recipe_detail(request, slug):
     if used_alias and request.method in {"GET", "HEAD"}:
         return _canonical_recipe_redirect(request, recipe, "recipe-detail")
     all_ingredients = list(recipe.ingredients.all())
-    if any(getattr(recipe, field) is None for field in NUTRITION_FIELDS):
-        _fill_missing_recipe_calories(recipe, all_ingredients, save=False)
-        recipe.calories_estimated = _nutrition_has_estimated_values(
-            recipe, set(recipe.nutrition_manual_fields or [])
-        )
+    nutrition = ensure_nutrition(recipe, all_ingredients)
     ingredients = [ingredient for ingredient in all_ingredients if not ingredient.is_water]
     import_job = getattr(recipe, "import_job", None) or next(
         iter(recipe.import_jobs.all()), None
@@ -553,6 +540,7 @@ def recipe_detail(request, slug):
         "recipes/recipe_detail.html",
         {
             "recipe": recipe,
+            "nutrition": nutrition,
             "ingredient_sections": _group_ingredient_sections(ingredients),
             "source_import_job": import_job,
             "youtube_video_id": video_id,
@@ -576,58 +564,14 @@ def _group_ingredient_sections(ingredients):
     return list(sections.values())
 
 
-def _fill_missing_recipe_calories(
-    recipe,
-    ingredients=None,
-    *,
-    save: bool,
-    overwrite: bool = False,
-    preserve_fields: set[str] | None = None,
-) -> None:
-    if preserve_fields is None:
-        preserve_fields = set(recipe.nutrition_manual_fields or [])
-    else:
-        preserve_fields = set(preserve_fields)
-    if (
-        not overwrite
-        and all(getattr(recipe, field) is not None for field in NUTRITION_FIELDS)
-    ):
-        return
-    ingredients = list(ingredients if ingredients is not None else recipe.ingredients.all())
-    nutrition = estimate_nutrition(
-        [
-            {
-                "name": ingredient.name,
-                "quantity": (
-                    str(ingredient.quantity) if ingredient.quantity is not None else None
-                ),
-                "unit": ingredient.unit,
-            }
-            for ingredient in ingredients
-        ],
-        recipe.servings,
-    )
-    changed = []
-    for field, value in nutrition.items():
-        if field in preserve_fields:
-            continue
-        if overwrite or getattr(recipe, field) is None:
-            setattr(recipe, field, value)
-            changed.append(field)
-    if save and changed:
-        recipe.save(update_fields=changed + ["updated_at"])
-
-
-def _nutrition_has_estimated_values(recipe, manual_fields: set[str]) -> bool:
-    return any(
-        field not in manual_fields and getattr(recipe, field) is not None
-        for field in NUTRITION_FIELDS
-    )
-
-
 def _recipe_form_context(request, instance=None):
     recipe = instance or Recipe()
     form = RecipeForm(request.POST or None, request.FILES or None, instance=recipe)
+    nutrition_form = RecipeNutritionForm(
+        request.POST or None,
+        instance=recipe.nutrition_or_none if recipe.pk else None,
+        prefix="nutrition",
+    )
     ingredient_formset = IngredientFormSet(
         request.POST or None,
         request.FILES or None,
@@ -640,7 +584,7 @@ def _recipe_form_context(request, instance=None):
         instance=recipe,
         prefix="steps",
     )
-    return recipe, form, ingredient_formset, step_formset
+    return recipe, form, nutrition_form, ingredient_formset, step_formset
 
 
 def _recipe_refinement_context(recipe):
@@ -694,8 +638,16 @@ def _can_refine_recipe(user, recipe):
 @login_required
 @require_http_methods(["GET", "POST"])
 def recipe_create(request):
-    recipe, form, ingredient_formset, step_formset = _recipe_form_context(request)
-    if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
+    recipe, form, nutrition_form, ingredient_formset, step_formset = _recipe_form_context(
+        request
+    )
+    if (
+        request.method == "POST"
+        and form.is_valid()
+        and nutrition_form.is_valid()
+        and ingredient_formset.is_valid()
+        and step_formset.is_valid()
+    ):
         with transaction.atomic():
             recipe = form.save(commit=False)
             recipe.created_by = request.user
@@ -705,24 +657,12 @@ def recipe_create(request):
             ingredient_formset.save()
             step_formset.instance = recipe
             step_formset.save()
-            manual_fields = {
-                field
-                for field in NUTRITION_FIELDS
-                if form.cleaned_data[field] is not None
-            }
-            _fill_missing_recipe_calories(
-                recipe, save=True, preserve_fields=manual_fields
-            )
-            recipe.nutrition_manual_fields = sorted(manual_fields)
-            recipe.calories_estimated = _nutrition_has_estimated_values(
-                recipe, manual_fields
-            )
-            recipe.save(
-                update_fields=[
-                    "nutrition_manual_fields",
-                    "calories_estimated",
-                    "updated_at",
-                ]
+            save_form_nutrition(
+                recipe,
+                nutrition_form.submitted_values(),
+                changed_fields=nutrition_form.changed_nutrition_fields(),
+                notes=nutrition_form.cleaned_data.get("notes") or None,
+                recalculate=True,
             )
         messages.success(request, "Рецепт добавлен.")
         return redirect(recipe)
@@ -733,6 +673,7 @@ def recipe_create(request):
         {
             "recipe": recipe,
             "form": form,
+            "nutrition_form": nutrition_form,
             "ingredient_formset": ingredient_formset,
             "step_formset": step_formset,
             "is_create": True,
@@ -746,45 +687,37 @@ def recipe_update(request, slug):
     instance, used_alias = _resolve_recipe_slug(slug)
     if used_alias and request.method in {"GET", "HEAD"}:
         return _canonical_recipe_redirect(request, instance, "recipe-update")
-    manual_fields = set(instance.nutrition_manual_fields or [])
-    recipe, form, ingredient_formset, step_formset = _recipe_form_context(request, instance)
-    if request.method == "POST" and form.is_valid() and ingredient_formset.is_valid() and step_formset.is_valid():
+    ensure_nutrition(instance)
+    recipe, form, nutrition_form, ingredient_formset, step_formset = _recipe_form_context(
+        request, instance
+    )
+    if (
+        request.method == "POST"
+        and form.is_valid()
+        and nutrition_form.is_valid()
+        and ingredient_formset.is_valid()
+        and step_formset.is_valid()
+    ):
         with transaction.atomic():
             recipe = form.save()
             ingredient_formset.save()
             step_formset.save()
-            calorie_fields = set(NUTRITION_FIELDS)
-            manual_calorie_change = bool(calorie_fields.intersection(form.changed_data))
             ingredient_energy_fields = {"name", "quantity", "unit", "DELETE"}
             ingredients_changed = any(
                 ingredient_energy_fields.intersection(ingredient_form.changed_data)
                 for ingredient_form in ingredient_formset.forms
             )
-            recalculate = "servings" in form.changed_data or ingredients_changed
-            if manual_calorie_change:
-                for field in calorie_fields.intersection(form.changed_data):
-                    if form.cleaned_data[field] is None:
-                        manual_fields.discard(field)
-                    else:
-                        manual_fields.add(field)
-            if manual_calorie_change or recalculate:
-                _fill_missing_recipe_calories(
-                    recipe,
-                    save=True,
-                    overwrite=True,
-                    preserve_fields=manual_fields,
-                )
-                recipe.nutrition_manual_fields = sorted(manual_fields)
-                recipe.calories_estimated = _nutrition_has_estimated_values(
-                    recipe, manual_fields
-                )
-                recipe.save(
-                    update_fields=[
-                        "nutrition_manual_fields",
-                        "calories_estimated",
-                        "updated_at",
-                    ]
-                )
+            save_form_nutrition(
+                recipe,
+                nutrition_form.submitted_values(),
+                changed_fields=nutrition_form.changed_nutrition_fields(),
+                notes=(
+                    nutrition_form.cleaned_data.get("notes", "")
+                    if "notes" in nutrition_form.changed_data
+                    else None
+                ),
+                recalculate="servings" in form.changed_data or ingredients_changed,
+            )
         messages.success(request, "Изменения сохранены.")
         return redirect(recipe)
 
@@ -794,6 +727,7 @@ def recipe_update(request, slug):
         {
             "recipe": recipe,
             "form": form,
+            "nutrition_form": nutrition_form,
             "ingredient_formset": ingredient_formset,
             "step_formset": step_formset,
             "is_create": False,

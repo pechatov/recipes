@@ -117,52 +117,6 @@ class Recipe(models.Model):
     servings = models.PositiveSmallIntegerField("порций", default=2)
     prep_minutes = models.PositiveSmallIntegerField("подготовка, минут", default=0)
     cook_minutes = models.PositiveSmallIntegerField("приготовление, минут", default=0)
-    calories_per_serving = models.DecimalField(
-        "ккал на порцию",
-        max_digits=8,
-        decimal_places=1,
-        null=True,
-        blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    calories_per_100g = models.DecimalField(
-        "ккал на 100 г",
-        max_digits=8,
-        decimal_places=1,
-        null=True,
-        blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    proteins_per_serving = models.DecimalField(
-        "белки на порцию, г", max_digits=8, decimal_places=1, null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    fats_per_serving = models.DecimalField(
-        "жиры на порцию, г", max_digits=8, decimal_places=1, null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    carbohydrates_per_serving = models.DecimalField(
-        "углеводы на порцию, г", max_digits=8, decimal_places=1, null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    proteins_per_100g = models.DecimalField(
-        "белки на 100 г", max_digits=8, decimal_places=1, null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    fats_per_100g = models.DecimalField(
-        "жиры на 100 г", max_digits=8, decimal_places=1, null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    carbohydrates_per_100g = models.DecimalField(
-        "углеводы на 100 г", max_digits=8, decimal_places=1, null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    calories_estimated = models.BooleanField(
-        "калорийность рассчитана автоматически",
-        default=False,
-        editable=False,
-    )
-    nutrition_manual_fields = models.JSONField(default=list, editable=False)
     cover = models.ImageField(
         "фотография блюда",
         upload_to="recipes/covers/%Y/%m/",
@@ -237,6 +191,85 @@ class Recipe(models.Model):
     @property
     def is_draft(self):
         return self.status == self.Status.DRAFT
+
+    @property
+    def nutrition_or_none(self):
+        try:
+            return self.nutrition
+        except RecipeNutrition.DoesNotExist:
+            return None
+
+
+NUTRITION_FIELDS = (
+    "calories_per_serving",
+    "proteins_per_serving",
+    "fats_per_serving",
+    "carbohydrates_per_serving",
+    "calories_per_100g",
+    "proteins_per_100g",
+    "fats_per_100g",
+    "carbohydrates_per_100g",
+)
+
+
+def _nutrition_field(label: str) -> models.DecimalField:
+    return models.DecimalField(
+        label,
+        max_digits=8,
+        decimal_places=1,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+
+
+class RecipeNutrition(models.Model):
+    """Полное КБЖУ готового блюда — обязательная часть каждого рецепта."""
+
+    class Source(models.TextChoices):
+        AI = "ai", "рассчитано Гермесом"
+        ESTIMATED = "estimated", "оценено по ингредиентам"
+        MANUAL = "manual", "указано вручную"
+
+    recipe = models.OneToOneField(
+        Recipe, on_delete=models.CASCADE, related_name="nutrition"
+    )
+    calories_per_serving = _nutrition_field("ккал на порцию")
+    proteins_per_serving = _nutrition_field("белки на порцию, г")
+    fats_per_serving = _nutrition_field("жиры на порцию, г")
+    carbohydrates_per_serving = _nutrition_field("углеводы на порцию, г")
+    calories_per_100g = _nutrition_field("ккал на 100 г")
+    proteins_per_100g = _nutrition_field("белки на 100 г")
+    fats_per_100g = _nutrition_field("жиры на 100 г")
+    carbohydrates_per_100g = _nutrition_field("углеводы на 100 г")
+    source = models.CharField(
+        "источник расчёта",
+        max_length=16,
+        choices=Source.choices,
+        default=Source.ESTIMATED,
+    )
+    notes = models.TextField(
+        "как считали",
+        blank=True,
+        help_text="Допущения расчёта: слитое масло, удалённые кости, уварка и т. п.",
+    )
+    manual_fields = models.JSONField(default=list, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "КБЖУ"
+        verbose_name_plural = "КБЖУ"
+
+    def __str__(self):
+        return f"КБЖУ: {self.recipe}"
+
+    @property
+    def is_estimated(self) -> bool:
+        """Хотя бы одно значение не введено человеком."""
+        manual = set(self.manual_fields or [])
+        return any(field not in manual for field in NUTRITION_FIELDS)
+
+    def as_dict(self) -> dict[str, Decimal]:
+        return {field: getattr(self, field) for field in NUTRITION_FIELDS}
 
 
 class RecipeSlugAlias(models.Model):
