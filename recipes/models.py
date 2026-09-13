@@ -8,6 +8,8 @@ from django.contrib.postgres.indexes import GinIndex
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.urls import reverse
+
+from .categories import MAIN_PROTEIN_TAXONOMY
 from django.utils.text import slugify
 
 from .validators import validate_recipe_image
@@ -111,6 +113,12 @@ class Recipe(models.Model):
         DRAFT = "draft", "Черновик"
         PUBLISHED = "published", "Опубликован"
 
+    class MainProtein(models.TextChoices):
+        CHICKEN = MAIN_PROTEIN_TAXONOMY[0]
+        BEEF = MAIN_PROTEIN_TAXONOMY[1]
+        PORK = MAIN_PROTEIN_TAXONOMY[2]
+        FISH = MAIN_PROTEIN_TAXONOMY[3]
+
     title = models.CharField("название", max_length=180)
     slug = models.SlugField(max_length=220, unique=True, blank=True)
     description = models.TextField("описание", blank=True)
@@ -130,6 +138,13 @@ class Recipe(models.Model):
         choices=Status.choices,
         default=Status.PUBLISHED,
         db_index=True,
+    )
+    main_protein = models.CharField(
+        "из чего блюдо",
+        max_length=16,
+        choices=MainProtein.choices,
+        blank=True,
+        help_text="Бейдж для вторых блюд: курица, говядина, свинина или рыба.",
     )
     source_url = models.URLField("источник", max_length=2048, blank=True)
     text_source_url = models.URLField("ссылка на исходный текст", max_length=2048, blank=True)

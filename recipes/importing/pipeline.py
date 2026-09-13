@@ -449,6 +449,7 @@ def _recipe_content_values(data: dict) -> dict:
         "servings": data["servings"],
         "prep_minutes": data["prep_minutes"],
         "cook_minutes": data["cook_minutes"],
+        "main_protein": data.get("main_protein", ""),
     }
 
 
@@ -820,6 +821,7 @@ def _recipe_refinement_payload(recipe: Recipe) -> dict[str, Any]:
         "cook_minutes": recipe.cook_minutes,
         "nutrition": _nutrition_payload(recipe),
         "categories": list(recipe.categories.values_list("slug", flat=True)),
+        "main_protein": recipe.main_protein,
         "cover_image_url": "",
         "cover_image_search_query": "",
         "ingredients": [

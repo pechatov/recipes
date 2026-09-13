@@ -36,7 +36,7 @@
   {% if recipes %}
     <div class="recipe-grid" data-recipe-grid>
       {% for recipe in recipes %}
-        <article class="recipe-card" data-recipe-card data-search-text="{{ recipe.title }} {{ recipe.description }} {% firstof recipe.created_by.get_full_name recipe.created_by.username %} {% for category in recipe.categories.all %}{{ category.name }} {% endfor %}{% for ingredient in recipe.ingredients.all %}{{ ingredient.name }} {% endfor %}">
+        <article class="recipe-card" data-recipe-card data-search-text="{{ recipe.title }} {{ recipe.description }} {% firstof recipe.created_by.get_full_name recipe.created_by.username %} {% for category in recipe.categories.all %}{{ category.name }} {% endfor %}{{ recipe.get_main_protein_display }} {% for ingredient in recipe.ingredients.all %}{{ ingredient.name }} {% endfor %}">
           <a href="{{ recipe.get_absolute_url }}" class="recipe-card-link" aria-label="Открыть рецепт «{{ recipe.title }}»"></a>
           <div class="recipe-card-image">
             {% if recipe.cover %}
@@ -46,8 +46,8 @@
             {% endif %}
           </div>
           <div class="recipe-card-body">
-            {% if recipe.categories.all %}
-              <div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}</div>
+            {% if recipe.categories.all or recipe.main_protein %}
+              <div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}{% if recipe.main_protein %}<span class="protein-tag protein-{{ recipe.main_protein }}">{{ recipe.get_main_protein_display }}</span>{% endif %}</div>
             {% endif %}
             <p class="recipe-meta">{{ recipe.servings }} порц. · {{ recipe.total_minutes }} мин.</p>
             <h2>{{ recipe.title }}</h2>

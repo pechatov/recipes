@@ -39,6 +39,7 @@ class RecipeForm(forms.ModelForm):
             "title",
             "description",
             "categories",
+            "main_protein",
             "servings",
             "prep_minutes",
             "cook_minutes",
@@ -47,6 +48,7 @@ class RecipeForm(forms.ModelForm):
             "video_url",
         )
         help_texts = {
+            "main_protein": "Для вторых блюд: из чего готовится. Для остальных можно не указывать.",
             "text_source_url": "Страница с рецептом или текстовый файл. Можно указать вместе с видео.",
             "video_url": "YouTube можно смотреть прямо в рецепте; другие видео откроются в новой вкладке.",
         }

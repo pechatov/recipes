@@ -719,6 +719,42 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("shopping-list", args=[self.recipe.slug]), {"servings": "oops"})
         self.assertEqual(response.context["servings"], 2)
 
+    def test_main_protein_badge_is_saved_from_form_and_rendered(self):
+        self.client.force_login(self.user)
+        response = self.client.post(
+            reverse("recipe-create"),
+            {
+                "title": "Рыба в духовке",
+                "main_protein": "fish",
+                "servings": 2,
+                "prep_minutes": 5,
+                "cook_minutes": 20,
+                "ingredients-TOTAL_FORMS": 1,
+                "ingredients-INITIAL_FORMS": 0,
+                "ingredients-MIN_NUM_FORMS": 1,
+                "ingredients-MAX_NUM_FORMS": 1000,
+                "ingredients-0-name": "Филе трески",
+                "ingredients-0-quantity": 500,
+                "ingredients-0-unit": "г",
+                "steps-TOTAL_FORMS": 1,
+                "steps-INITIAL_FORMS": 0,
+                "steps-MIN_NUM_FORMS": 1,
+                "steps-MAX_NUM_FORMS": 1000,
+                "steps-0-title": "",
+                "steps-0-instruction": "Запечь.",
+            },
+        )
+
+        created = Recipe.objects.get(title="Рыба в духовке")
+        self.assertRedirects(response, created.get_absolute_url())
+        self.assertEqual(created.main_protein, Recipe.MainProtein.FISH)
+        detail = self.client.get(created.get_absolute_url())
+        self.assertContains(detail, 'class="protein-tag protein-fish"')
+        self.assertContains(detail, "Рыба")
+        listing = self.client.get(reverse("recipe-list"))
+        self.assertContains(listing, 'class="protein-tag protein-fish"')
+        self.assertNotContains(listing, 'class="protein-tag protein-chicken"')
+
     def test_detail_groups_pantry_items_under_their_section(self):
         self.recipe.ingredients.all().delete()
         RecipeIngredient.objects.create(

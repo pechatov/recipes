@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 from typing import Any
 
-from recipes.categories import CATEGORY_SLUGS
+from recipes.categories import CATEGORY_SLUGS, MAIN_PROTEIN_SLUGS, infer_main_protein
 from recipes.models import is_water_ingredient_name
 
 from .exceptions import AIResponseError
@@ -380,8 +380,16 @@ def normalize_recipe(
     if require_categories and not categories:
         raise AIResponseError("Модель не выбрала ни одной допустимой категории рецепта.")
     servings = max(1, _integer(value.get("servings"), 2, 100))
+    main_protein = _text(value.get("main_protein"), 16).lower()
+    if main_protein not in MAIN_PROTEIN_SLUGS:
+        main_protein = ""
+    if not main_protein and "main-course" in categories:
+        main_protein = infer_main_protein(
+            item["name"] for item in ingredients if not item["is_pantry"]
+        )
     return {
         "title": title,
+        "main_protein": main_protein,
         "description": _text(value.get("description"), 2000),
         "servings": servings,
         "prep_minutes": _integer(value.get("prep_minutes"), 0, 1440),

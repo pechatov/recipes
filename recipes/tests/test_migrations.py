@@ -117,3 +117,49 @@ class RecipeSourceLinksMigrationTests(TransactionTestCase):
             "recipes", "Recipe"
         )
         self.assertCountEqual(Recipe.objects.values_list("source_url", flat=True), [url for url, _ in sources])
+
+
+class MainProteinMigrationTests(TransactionTestCase):
+    migrate_from = ("recipes", "0021_recipenutrition")
+    migrate_to = ("recipes", "0022_recipe_main_protein")
+
+    def setUp(self):
+        super().setUp()
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate([self.migrate_from])
+        old_apps = self.executor.loader.project_state([self.migrate_from]).apps
+        Category = old_apps.get_model("recipes", "Category")
+        Recipe = old_apps.get_model("recipes", "Recipe")
+        RecipeIngredient = old_apps.get_model("recipes", "RecipeIngredient")
+        main_course, _ = Category.objects.get_or_create(
+            slug="main-course", defaults={"name": "Второе блюдо"}
+        )
+        soup, _ = Category.objects.get_or_create(slug="soup", defaults={"name": "Суп"})
+        pie = Recipe.objects.create(title="Коттедж-пай", slug="cottage-pie")
+        pie.categories.add(main_course)
+        RecipeIngredient.objects.create(recipe=pie, name="Говяжий бульон", order=0)
+        RecipeIngredient.objects.create(recipe=pie, name="Говяжий фарш", order=1)
+        chicken_soup = Recipe.objects.create(title="Куриный суп", slug="chicken-soup")
+        chicken_soup.categories.add(soup)
+        RecipeIngredient.objects.create(recipe=chicken_soup, name="Курица", order=0)
+        veggie = Recipe.objects.create(title="Рагу", slug="ragu")
+        veggie.categories.add(main_course)
+        RecipeIngredient.objects.create(recipe=veggie, name="Кабачок", order=0)
+        self.ids = (pie.pk, chicken_soup.pk, veggie.pk)
+
+    def tearDown(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_forward_fills_badges_only_for_main_courses_with_known_protein(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate([self.migrate_to])
+        new_apps = self.executor.loader.project_state([self.migrate_to]).apps
+        Recipe = new_apps.get_model("recipes", "Recipe")
+
+        pie, chicken_soup, veggie = (Recipe.objects.get(pk=pk) for pk in self.ids)
+
+        self.assertEqual(pie.main_protein, "beef")
+        self.assertEqual(chicken_soup.main_protein, "")
+        self.assertEqual(veggie.main_protein, "")

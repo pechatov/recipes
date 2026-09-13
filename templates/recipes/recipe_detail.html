@@ -7,8 +7,8 @@
       <div class="recipe-hero-copy">
         <a class="back-link" href="{% url 'recipe-list' %}">← Все рецепты</a>
         {% if recipe.is_draft %}<p class="status-badge">Черновик — проверьте перед публикацией</p>{% endif %}
-        {% if recipe.categories.all %}
-          <div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}</div>
+        {% if recipe.categories.all or recipe.main_protein %}
+          <div class="category-tags">{% for category in recipe.categories.all %}<span>{{ category.name }}</span>{% endfor %}{% if recipe.main_protein %}<span class="protein-tag protein-{{ recipe.main_protein }}">{{ recipe.get_main_protein_display }}</span>{% endif %}</div>
         {% endif %}
         <h1>{{ recipe.title }}</h1>
         <p class="recipe-byline">Добавил: <strong>{% firstof recipe.created_by.get_full_name recipe.created_by.username "неизвестный автор" %}</strong></p>

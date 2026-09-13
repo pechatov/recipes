@@ -9,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from youtube_transcript_api._errors import YouTubeTranscriptApiException
 
+from recipes.categories import infer_main_protein
 from recipes.importing.exceptions import (
     AIResponseError,
     ImportPipelineError,
@@ -591,6 +592,46 @@ class AIPayloadTests(TestCase):
 
 
 class NormalizerTests(TestCase):
+    def test_main_protein_uses_model_value_or_infers_it_for_main_courses(self):
+        base = {
+            "title": "Ужин",
+            "ingredients": [
+                {"name": "Куриный бульон", "quantity": 500, "unit": "мл"},
+                {"name": "Говяжий фарш", "quantity": 400, "unit": "г"},
+                {"name": "Куркума", "quantity": 5, "unit": "г", "is_pantry": True},
+            ],
+            "steps": ["Потушить."],
+        }
+
+        self.assertEqual(
+            normalize_recipe({**base, "categories": ["main-course"]})["main_protein"],
+            "beef",
+        )
+        self.assertEqual(
+            normalize_recipe(
+                {**base, "categories": ["main-course"], "main_protein": "FISH"}
+            )["main_protein"],
+            "fish",
+        )
+        self.assertEqual(
+            normalize_recipe(
+                {**base, "categories": ["main-course"], "main_protein": "lamb"}
+            )["main_protein"],
+            "beef",
+        )
+        self.assertEqual(
+            normalize_recipe({**base, "categories": ["soup"]})["main_protein"], ""
+        )
+
+    def test_main_protein_inference_ignores_broth_eggs_and_spices(self):
+        self.assertEqual(
+            infer_main_protein(["Яйца куриные", "Куркума", "Курага", "Филе белой рыбы"]),
+            "fish",
+        )
+        self.assertEqual(infer_main_protein(["Чеснок", "Куриная грудка", "Ветчина"]), "chicken")
+        self.assertEqual(infer_main_protein(["Купаты свиные", "Рикотта"]), "pork")
+        self.assertEqual(infer_main_protein(["Шампиньоны", "Сливки"]), "")
+
     def test_text_source_url_accepts_only_http_urls(self):
         base = {
             "title": "Паста",
