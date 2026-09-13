@@ -995,6 +995,42 @@ class RecipeViewTests(TestCase):
         self.assertNotContains(response, "К  ккал")
         self.assertNotContains(response, "Ж  г")
 
+    def test_detail_groups_pantry_items_under_their_section(self):
+        self.recipe.ingredients.all().delete()
+        RecipeIngredient.objects.create(
+            recipe=self.recipe, section="Курица", name="Куриное филе", order=0
+        )
+        RecipeIngredient.objects.create(
+            recipe=self.recipe, section="Курица", name="Паприка", is_pantry=True, order=1
+        )
+        RecipeIngredient.objects.create(
+            recipe=self.recipe, section="Соус", name="Сметана", order=2
+        )
+        RecipeIngredient.objects.create(
+            recipe=self.recipe, section="Соус", name="Чеснок сушёный", is_pantry=True, order=3
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.get(self.recipe.get_absolute_url())
+
+        sections = response.context["ingredient_sections"]
+        self.assertEqual([section["title"] for section in sections], ["Курица", "Соус"])
+        self.assertEqual(
+            [[item.name for item in section["main"]] for section in sections],
+            [["Куриное филе"], ["Сметана"]],
+        )
+        self.assertEqual(
+            [[item.name for item in section["pantry"]] for section in sections],
+            [["Паприка"], ["Чеснок сушёный"]],
+        )
+        content = response.content.decode()
+        self.assertLess(content.index("Куриное филе"), content.index("Паприка"))
+        self.assertLess(content.index("Паприка"), content.index("Сметана"))
+        self.assertLess(content.index("Сметана"), content.index("Чеснок сушёный"))
+        self.assertEqual(content.count('<details class="pantry-details">'), 2)
+        self.assertNotContains(response, '<details class="pantry-details" open')
+        self.assertNotContains(response, "Основные ингредиенты")
+
     def test_draft_is_hidden_until_published(self):
         draft = Recipe.objects.create(
             title="Черновой пирог",
