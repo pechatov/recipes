@@ -553,14 +553,27 @@ def recipe_detail(request, slug):
         "recipes/recipe_detail.html",
         {
             "recipe": recipe,
-            "main_ingredients": [item for item in ingredients if not item.is_pantry],
-            "pantry_ingredients": [item for item in ingredients if item.is_pantry],
+            "ingredient_sections": _group_ingredient_sections(ingredients),
             "source_import_job": import_job,
             "youtube_video_id": video_id,
             "video_timestamps_match_source": bool(video_id)
             and video_id == youtube_video_id(recipe.source_url),
         },
     )
+
+
+def _group_ingredient_sections(ingredients):
+    """Group ingredients by section, keeping main items and pantry items apart.
+
+    Sections keep the order of their first ingredient, so a recipe with «Курица»
+    and «Соус» renders one block per component with its own spices underneath.
+    """
+    sections = {}
+    for ingredient in ingredients:
+        title = ingredient.section.strip()
+        section = sections.setdefault(title, {"title": title, "main": [], "pantry": []})
+        section["pantry" if ingredient.is_pantry else "main"].append(ingredient)
+    return list(sections.values())
 
 
 def _fill_missing_recipe_calories(

@@ -89,37 +89,38 @@
       <aside class="ingredients-panel">
         <p class="eyebrow">Ингредиенты</p>
         <h2>На {{ recipe.servings }} порций</h2>
-        {% if main_ingredients %}
-          <h3 class="ingredient-kind-title">Основные ингредиенты</h3>
-          <ul class="ingredient-list">
-          {% regroup main_ingredients by section as ingredient_sections %}
-          {% for section in ingredient_sections %}
-            {% if section.grouper %}<li class="ingredient-section-title">{{ section.grouper }}</li>{% endif %}
-            {% for ingredient in section.list %}
-                <li>
-                  <span class="ingredient-amount">{% if ingredient.estimated %}≈{% endif %}{% if ingredient.quantity != None %}{{ ingredient.quantity|floatformat:"-2" }}{% endif %} {{ ingredient.unit }}</span>
-                  <span>{{ ingredient.name }}{% if ingredient.optional %}<em>по желанию</em>{% endif %}</span>
-                </li>
-            {% endfor %}
-          {% endfor %}
-          </ul>
-        {% endif %}
-        {% if pantry_ingredients %}
-          <h3 class="ingredient-kind-title pantry-title">Приправы, специи и прочее</h3>
-          <p class="ingredient-kind-note">Обычно это уже есть дома и не требует отдельной покупки.</p>
-          <ul class="ingredient-list pantry-list">
-          {% regroup pantry_ingredients by section as ingredient_sections %}
-          {% for section in ingredient_sections %}
-            {% if section.grouper %}<li class="ingredient-section-title">{{ section.grouper }}</li>{% endif %}
-            {% for ingredient in section.list %}
-              <li>
-                <span class="ingredient-amount">{% if ingredient.estimated %}≈{% endif %}{% if ingredient.quantity != None %}{{ ingredient.quantity|floatformat:"-2" }}{% endif %} {{ ingredient.unit }}</span>
-                <span>{{ ingredient.name }}{% if ingredient.optional %}<em>по желанию</em>{% endif %}</span>
-              </li>
-            {% endfor %}
-          {% endfor %}
-          </ul>
-        {% endif %}
+        {% for section in ingredient_sections %}
+          <div class="ingredient-section">
+            {% if section.title %}<h3 class="ingredient-section-title">{{ section.title }}</h3>{% endif %}
+            {% if section.main %}
+              <ul class="ingredient-list">
+                {% for ingredient in section.main %}
+                  <li>
+                    <span class="ingredient-amount">{% if ingredient.estimated %}≈{% endif %}{% if ingredient.quantity != None %}{{ ingredient.quantity|floatformat:"-2" }}{% endif %} {{ ingredient.unit }}</span>
+                    <span>{{ ingredient.name }}{% if ingredient.optional %}<em>по желанию</em>{% endif %}</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% endif %}
+            {% if section.pantry %}
+              <details class="pantry-details">
+                <summary class="pantry-summary" title="Обычно это уже есть дома и не требует отдельной покупки.">
+                  <span class="pantry-summary-label">Приправы и специи</span>
+                  <span class="pantry-summary-count">{{ section.pantry|length }}</span>
+                  <span class="pantry-summary-chevron" aria-hidden="true"></span>
+                </summary>
+                <ul class="ingredient-list pantry-list">
+                  {% for ingredient in section.pantry %}
+                    <li>
+                      <span class="ingredient-amount">{% if ingredient.estimated %}≈{% endif %}{% if ingredient.quantity != None %}{{ ingredient.quantity|floatformat:"-2" }}{% endif %} {{ ingredient.unit }}</span>
+                      <span>{{ ingredient.name }}{% if ingredient.optional %}<em>по желанию</em>{% endif %}</span>
+                    </li>
+                  {% endfor %}
+                </ul>
+              </details>
+            {% endif %}
+          </div>
+        {% endfor %}
         <a class="button button-wide" href="{% url 'shopping-list' recipe.slug %}">Открыть список покупок</a>
       </aside>
 
