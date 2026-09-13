@@ -434,6 +434,8 @@ class ExtractorTests(TestCase):
             """<html><body><h1>Суп</h1>
             <p>Достаточно длинный текст рецепта супа с подробным описанием приготовления.</p>
             <a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ">Наш канал</a>
+            <p>Смотрите также https://youtu.be/AAAAAAAAAAA</p>
+            <script>var related = "https://youtu.be/BBBBBBBBBBB";</script>
             </body></html>""",
             "https://example.com/soup",
         )

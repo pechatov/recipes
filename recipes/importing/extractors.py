@@ -41,8 +41,10 @@ MAX_SOURCE_LINKS = 20
 MAX_SOURCE_LINK_CONTEXT_CHARS = 200
 MAX_YOUTUBE_COMMENTS = 20
 YOUTUBE_METADATA_TIMEOUT_SECONDS = 20
+# Only embed URLs: plain youtu.be or watch links in a page usually point to a
+# channel or another video, so they must not become the article video.
 YOUTUBE_EMBED_PATTERN = re.compile(
-    r"(?:youtube(?:-nocookie)?\.com/(?:embed|v)/|youtu\.be/)([A-Za-z0-9_-]{11})"
+    r"youtube(?:-nocookie)?\.com/(?:embed|v)/([A-Za-z0-9_-]{11})"
 )
 SOURCE_LINK_PATTERN = re.compile(r"https?://[^\s<>\"'()\[\]]+")
 HOSTNAME_PATTERN = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
