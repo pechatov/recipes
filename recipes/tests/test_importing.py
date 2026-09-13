@@ -7,6 +7,7 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
+from youtube_transcript_api._errors import YouTubeTranscriptApiException
 
 from recipes.importing.exceptions import (
     AIResponseError,
@@ -27,9 +28,10 @@ from recipes.importing.extractors import (
     _resolve_with_public_dns,
     extract_website,
     extract_youtube,
+    source_links_from_text,
     youtube_video_id,
 )
-from recipes.importing.llm import _parse_json
+from recipes.importing.llm import _parse_json, adapt_with_ai
 from recipes.importing.normalizer import (
     _calories,
     _nutrient,
@@ -377,7 +379,237 @@ class ExtractorTests(TestCase):
         self.assertEqual(document.step_image_urls, ("https://example.com/step.jpg",))
 
 
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    @patch("recipes.importing.extractors._download_html")
+    def test_website_links_recipe_video_and_fetches_its_transcript(self, download, fetch):
+        download.return_value = (
+            """<html><head>
+            <script type="application/ld+json">{
+              "@type": "Recipe", "name": "Курица", "recipeIngredient": ["500 г курица"],
+              "recipeInstructions": [{"@type": "HowToStep", "text": "Запечь."}],
+              "video": {"@type": "VideoObject",
+                        "embedUrl": "https://www.youtube.com/embed/dQw4w9WgXcQ"}
+            }</script></head><body><h1>Курица в духовке</h1>
+            <p>Подробное описание приготовления запечённой курицы с чесноком и травами.</p>
+            <a href="https://www.youtube.com/watch?v=AAAAAAAAAAA">Другой рецепт</a>
+            </body></html>""",
+            "https://example.com/chicken",
+        )
+        fetch.return_value = [Mock(text="Натираем курицу и ставим в духовку.", start=12.6)]
+
+        document = extract_website("https://example.com/chicken")
+
+        self.assertEqual(document.source_type, "website")
+        self.assertEqual(document.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(
+            document.transcript_segments,
+            ({"start_seconds": 12, "text": "Натираем курицу и ставим в духовку."},),
+        )
+        self.assertIn("Курица в духовке", document.text)
+        fetch.assert_called_once_with("dQw4w9WgXcQ", languages=["ru", "uk", "en"])
+
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    @patch("recipes.importing.extractors._download_html")
+    def test_website_keeps_embedded_video_without_subtitles(self, download, fetch):
+        download.return_value = (
+            """<html><body><h1>Паста</h1>
+            <p>Достаточно длинный текст рецепта пасты с подробным описанием приготовления.</p>
+            <iframe data-src="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?rel=0"></iframe>
+            </body></html>""",
+            "https://example.com/pasta",
+        )
+        fetch.side_effect = YouTubeTranscriptApiException("dQw4w9WgXcQ")
+
+        document = extract_website("https://example.com/pasta")
+
+        self.assertEqual(document.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(document.transcript_segments, ())
+
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    @patch("recipes.importing.extractors._download_html")
+    def test_website_ignores_plain_youtube_links(self, download, fetch):
+        download.return_value = (
+            """<html><body><h1>Суп</h1>
+            <p>Достаточно длинный текст рецепта супа с подробным описанием приготовления.</p>
+            <a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ">Наш канал</a>
+            </body></html>""",
+            "https://example.com/soup",
+        )
+
+        document = extract_website("https://example.com/soup")
+
+        self.assertEqual(document.video_url, "")
+        fetch.assert_not_called()
+
+    def test_source_links_keep_context_and_drop_social_and_broken_links(self):
+        links = source_links_from_text(
+            "Полный рецепт: https://www.andy-cooks.com/blogs/recipes/smash-burger.\n"
+            "Инстаграм https://www.instagram.com/andy и https://t.me/andy\n"
+            "Мой мерч - https://.ru/\n"
+            "Ещё видео https://youtu.be/dQw4w9WgXcQ и сайт https://www.andy-cooks.com/",
+            "description",
+        )
+
+        self.assertEqual(
+            links,
+            [
+                {
+                    "url": "https://www.andy-cooks.com/blogs/recipes/smash-burger",
+                    "context": "Полный рецепт:",
+                    "origin": "description",
+                },
+                {
+                    "url": "https://www.andy-cooks.com/",
+                    "context": "Ещё видео и сайт",
+                    "origin": "description",
+                },
+            ],
+        )
+
+    @patch("recipes.importing.extractors._fetch_youtube_metadata")
+    @patch("recipes.importing.extractors._fetch_youtube_title", return_value="Бургер")
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_collects_text_links_from_description_and_pinned_comment(
+        self, fetch, fetch_title, metadata
+    ):
+        fetch.return_value = [
+            Mock(text="Ингредиенты и подробное приготовление бургера " * 3, start=1)
+        ]
+        metadata.return_value = {
+            "description": "Рецепт тут https://www.andy-cooks.com/blogs/recipes/smash-burger",
+            "uploader_comments": [
+                "Check out the recipe: https://www.allrecipes.com/recipe/1/burger/",
+                "Рецепт тут https://www.andy-cooks.com/blogs/recipes/smash-burger",
+            ],
+        }
+
+        document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+
+        self.assertEqual(document.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(
+            [(link["url"], link["origin"]) for link in document.source_links],
+            [
+                ("https://www.andy-cooks.com/blogs/recipes/smash-burger", "description"),
+                ("https://www.allrecipes.com/recipe/1/burger/", "pinned_comment"),
+            ],
+        )
+        metadata.assert_called_once_with("dQw4w9WgXcQ")
+
+    @patch("recipes.importing.extractors.yt_dlp.YoutubeDL")
+    @patch("recipes.importing.extractors._fetch_youtube_title", return_value="Бургер")
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_metadata_failure_does_not_block_import(
+        self, fetch, fetch_title, downloader
+    ):
+        fetch.return_value = [
+            Mock(text="Ингредиенты и подробное приготовление бургера " * 3, start=1)
+        ]
+        downloader.return_value.__enter__.return_value.extract_info.side_effect = (
+            RuntimeError("Sign in to confirm you are not a bot")
+        )
+
+        document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+
+        self.assertEqual(document.source_links, ())
+        self.assertTrue(document.transcript_segments)
+
+    @patch("recipes.importing.extractors.yt_dlp.YoutubeDL")
+    @patch("recipes.importing.extractors._fetch_youtube_title", return_value="Бургер")
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    def test_youtube_metadata_uses_only_pinned_and_uploader_comments(
+        self, fetch, fetch_title, downloader
+    ):
+        fetch.return_value = [
+            Mock(text="Ингредиенты и подробное приготовление бургера " * 3, start=1)
+        ]
+        downloader.return_value.__enter__.return_value.extract_info.return_value = {
+            "description": "Сайт https://www.andy-cooks.com/",
+            "comments": [
+                {"text": "Спам https://spam.example/", "is_pinned": False,
+                 "author_is_uploader": False},
+                {"text": "Рецепт https://www.andy-cooks.com/blogs/recipes/smash-burger",
+                 "is_pinned": True, "author_is_uploader": True},
+            ],
+        }
+
+        document = extract_youtube("https://youtu.be/dQw4w9WgXcQ")
+
+        self.assertEqual(
+            [link["url"] for link in document.source_links],
+            [
+                "https://www.andy-cooks.com/",
+                "https://www.andy-cooks.com/blogs/recipes/smash-burger",
+            ],
+        )
+        options = downloader.call_args.args[0]
+        self.assertTrue(options["getcomments"])
+        self.assertTrue(options["skip_download"])
+
+
+class AIPayloadTests(TestCase):
+    @patch("recipes.importing.llm._request_ai", return_value=[])
+    def test_article_payload_keeps_text_next_to_video_transcript_and_links(self, request):
+        document = SourceDocument(
+            "website",
+            "Курица",
+            "Текст статьи о запечённой курице.",
+            transcript_segments=({"start_seconds": 12, "text": "Ставим в духовку."},),
+            video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+
+        adapt_with_ai(document)
+
+        payload = json.loads(request.call_args.args[0][1]["content"].split("\n", 1)[1])
+        self.assertEqual(payload["source_text"], "Текст статьи о запечённой курице.")
+        self.assertEqual(payload["related_video_url"], document.video_url)
+        self.assertEqual(payload["youtube_transcript"], list(document.transcript_segments))
+        self.assertEqual(payload["source_links"], [])
+
+    @patch("recipes.importing.llm._request_ai", return_value=[])
+    def test_youtube_payload_sends_candidate_text_links_instead_of_text(self, request):
+        document = SourceDocument(
+            "youtube",
+            "Бургер",
+            "Слова из субтитров.",
+            transcript_segments=({"start_seconds": 1, "text": "Слова из субтитров."},),
+            video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            source_links=(
+                {"url": "https://blog.example/burger", "context": "Рецепт", "origin": "description"},
+            ),
+        )
+
+        adapt_with_ai(document)
+
+        payload = json.loads(request.call_args.args[0][1]["content"].split("\n", 1)[1])
+        self.assertEqual(payload["source_text"], "")
+        self.assertEqual(
+            payload["source_links"],
+            [{"url": "https://blog.example/burger", "context": "Рецепт", "origin": "description"}],
+        )
+        self.assertIn("source_links", request.call_args.args[0][0]["content"])
+
+
 class NormalizerTests(TestCase):
+    def test_text_source_url_accepts_only_http_urls(self):
+        base = {
+            "title": "Паста",
+            "ingredients": [{"name": "Макароны", "quantity": 200, "unit": "г"}],
+            "steps": ["Отварить."],
+        }
+        self.assertEqual(
+            normalize_recipe({**base, "text_source_url": "https://blog.example/pasta"})[
+                "text_source_url"
+            ],
+            "https://blog.example/pasta",
+        )
+        self.assertEqual(
+            normalize_recipe({**base, "text_source_url": "javascript:alert(1)"})[
+                "text_source_url"
+            ],
+            "",
+        )
+        self.assertEqual(normalize_recipe(base)["text_source_url"], "")
+
     def test_structured_nutrition_converts_kilojoules_and_rejects_unknown_units(self):
         self.assertEqual(_nutrition_calories({"calories": "1880 kJ"}), "449.3")
         self.assertEqual(_nutrition_calories({"calories": "450 kcal"}), "450.0")
@@ -1227,6 +1459,133 @@ class PipelineTests(TestCase):
             process_import_job(job)
 
         adapt_with_ai.assert_not_called()
+
+    @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
+    @patch("recipes.importing.pipeline.adapt_with_ai")
+    @patch("recipes.importing.pipeline.extract_source")
+    def test_article_import_links_found_video_and_keeps_its_step_timestamps(
+        self, extract_source, adapt_with_ai
+    ):
+        extract_source.return_value = SourceDocument(
+            "website",
+            "Курица в духовке",
+            "Ингредиенты: 500 г картофеля и соль. Нарезать картофель, затем обжарить.",
+            transcript_segments=({"start_seconds": 12, "text": "Ставим в духовку."},),
+            video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+        adapt_with_ai.return_value = [
+            {
+                **self.recipe_data("Курица"),
+                "categories": ["main-course"],
+                "text_source_url": "https://blog.example/should-be-ignored",
+                "steps": [
+                    {"instruction": "Натереть.", "video_timestamp_seconds": 12},
+                    {"instruction": "Запечь.", "video_timestamp_seconds": 40},
+                ],
+            }
+        ]
+        user = get_user_model().objects.create_user("article-importer")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/chicken",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+
+        recipe = process_import_job(job)[0]
+
+        self.assertEqual(recipe.text_source_url, "https://example.com/chicken")
+        self.assertEqual(recipe.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(
+            list(recipe.steps.values_list("video_timestamp_seconds", flat=True)),
+            [12, None],
+        )
+
+    @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
+    @patch("recipes.importing.pipeline.adapt_with_ai")
+    @patch("recipes.importing.pipeline.extract_source")
+    def test_youtube_import_accepts_text_link_only_from_source_links(
+        self, extract_source, adapt_with_ai
+    ):
+        extract_source.return_value = SourceDocument(
+            "youtube",
+            "Два бургера",
+            "Ингредиенты: 500 г картофеля и соль. Нарезать картофель, затем обжарить.",
+            transcript_segments=({"start_seconds": 5, "text": "Жарим котлеты."},),
+            video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            source_links=(
+                {
+                    "url": "https://www.andy-cooks.com/blogs/recipes/smash-burger",
+                    "context": "Full recipe",
+                    "origin": "description",
+                },
+            ),
+        )
+        adapt_with_ai.return_value = [
+            {
+                **self.recipe_data("Смэш-бургер"),
+                "categories": ["main-course"],
+                "text_source_url": "https://www.andy-cooks.com/blogs/recipes/smash-burger",
+            },
+            {
+                **self.recipe_data("Соус"),
+                "categories": ["sauce"],
+                "text_source_url": "https://invented.example/sauce",
+            },
+        ]
+        user = get_user_model().objects.create_user("video-importer")
+        job = ImportJob.objects.create(
+            source_url="https://youtu.be/dQw4w9WgXcQ",
+            source_type=ImportJob.SourceType.YOUTUBE,
+            requested_by=user,
+        )
+
+        burger, sauce = process_import_job(job)
+
+        self.assertEqual(burger.video_url, job.source_url)
+        self.assertEqual(
+            burger.text_source_url,
+            "https://www.andy-cooks.com/blogs/recipes/smash-burger",
+        )
+        self.assertEqual(sauce.video_url, job.source_url)
+        self.assertEqual(sauce.text_source_url, "")
+
+    def test_reimport_fills_only_empty_source_links(self):
+        user = get_user_model().objects.create_user("link-keeper")
+        job = ImportJob.objects.create(
+            source_url="https://example.com/menu",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        first, second = save_draft(
+            job, [self.recipe_data("Первый"), self.recipe_data("Второй")]
+        )
+        self.assertEqual(first.video_url, "")
+        Recipe.objects.filter(pk=first.pk).update(
+            video_url="https://www.youtube.com/watch?v=MANUALvideo"
+        )
+        document = SourceDocument(
+            "website",
+            "Меню",
+            "Длинный текст меню с описанием приготовления двух блюд.",
+            transcript_segments=({"start_seconds": 3, "text": "Начало."},),
+            video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+        steps = [{"instruction": "Готовить.", "video_timestamp_seconds": 3}]
+
+        first, second = save_draft(
+            job,
+            [
+                {**self.recipe_data("Первый"), "steps": steps},
+                {**self.recipe_data("Второй"), "steps": steps},
+            ],
+            document=document,
+        )
+
+        self.assertEqual(first.video_url, "https://www.youtube.com/watch?v=MANUALvideo")
+        self.assertIsNone(first.steps.get().video_timestamp_seconds)
+        self.assertEqual(second.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(second.steps.get().video_timestamp_seconds, 3)
+        self.assertEqual(second.text_source_url, "https://example.com/menu")
 
     def test_reprocessing_reuses_linked_drafts_and_detaches_extra_drafts(self):
         user = get_user_model().objects.create_user("re-importer")

@@ -116,6 +116,8 @@ def _source_text(document: SourceDocument) -> str:
             document.text,
             _json_text(document.all_structured_recipes),
             *image_urls,
+            document.video_url,
+            _json_text(document.source_links),
         )
     )
 

@@ -35,8 +35,10 @@ SYSTEM_PROMPT = """Ты редактор семейной книги рецеп�
 - soup и main-course взаимоисключающие: для любого супа выбирай soup и не добавляй main-course, даже если суп сытный или подаётся с гренками;
 - небольшой сопутствующий компонент вроде соуса, гренок или заправки не создаёт отдельную категорию для всего рецепта;
 - steps должны быть подробными и идти в правильном порядке;
-- для YouTube-источника у каждого шага укажи video_timestamp_seconds — целое значение start_seconds того фрагмента youtube_transcript, где автор начинает рассказывать именно об этом действии; не придумывай промежуточный тайм-код;
+- если во входных данных есть youtube_transcript (это и YouTube-источник, и статья, в которой найдено видео рецепта — related_video_url), у каждого шага укажи video_timestamp_seconds — целое значение start_seconds того фрагмента youtube_transcript, где автор начинает показывать именно это действие; не придумывай промежуточный тайм-код;
 - для источника без youtube_transcript укажи video_timestamp_seconds=null;
+- если статья содержит и текст, и youtube_transcript, рецепт составляй по тексту статьи, а транскрипт используй только для тайм-кодов шагов;
+- source_links — ссылки из описания видео и закреплённого комментария автора вместе с контекстом; выбери среди них text_source_url — страницу с текстовой версией именно этого рецепта (рецепт на сайте или в блоге автора, статья, документ); ссылки на главные страницы сайтов, каналы, соцсети, магазины, рекламу, курсы и другие рецепты не подходят; если подходящей ссылки нет или source_links пуст, оставь пустую строку; не придумывай ссылки и не изменяй их;
 - search_query — короткий запрос товара для магазина без количества и единицы измерения;
 - is_pantry=true только для небольшого количества специй, приправ, соли, сахара, растительного масла, уксуса, разрыхлителя и других продуктов, которые обычно уже есть дома; если такого продукта нужно много (например, 500 г сахара), это основной продукт и is_pantry=false;
 - поля calories, proteins, fats и carbohydrates на порцию и на 100 г — реалистичное приблизительное полное КБЖУ готового блюда, вычисленное по указанным ингредиентам; белки, жиры и углеводы указывай в граммах;
@@ -63,6 +65,7 @@ SYSTEM_PROMPT = """Ты редактор семейной книги рецеп�
     "categories": ["soup"],
     "cover_image_url": "https://адрес-из-source_image_urls",
     "cover_image_search_query": "goulash beef gravy",
+    "text_source_url": "https://адрес-из-source_links или пустая строка",
     "ingredients": [
       {"section": "Для супа", "name": "строка", "quantity": 250, "unit": "г", "search_query": "строка", "optional": false, "estimated": false, "is_pantry": false}
     ],
@@ -173,8 +176,10 @@ def adapt_with_ai(document: SourceDocument, custom_prompt: str = "") -> list[dic
         "source_type": document.source_type,
         "source_title": document.title,
         "structured_recipe": structured_recipe,
-        "source_text": document.text if not document.transcript_segments else "",
+        "source_text": document.text if document.source_type != "youtube" else "",
+        "related_video_url": document.video_url,
         "youtube_transcript": list(document.transcript_segments),
+        "source_links": [dict(link) for link in document.source_links],
         "source_image_urls": {
             "cover": list(document.cover_image_urls),
             "steps": list(document.step_image_urls),

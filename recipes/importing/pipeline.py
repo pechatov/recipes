@@ -564,6 +564,16 @@ def save_draft(
         if isinstance(segment, dict)
         and isinstance(segment.get("start_seconds"), int)
     }
+    video_job = job.source_type == ImportJob.SourceType.YOUTUBE
+    if video_job:
+        # The transcript and its timestamps belong to the imported video.
+        discovered_video_url = job.source_url
+        discovered_text_urls: set[str] = {
+            link["url"] for link in (document.source_links if document else ())
+        }
+    else:
+        discovered_video_url = document.video_url if document else ""
+        discovered_text_urls = set()
     new_files: list[tuple[Any, str]] = []
     old_files: list[tuple[Any, str]] = []
     try:
@@ -621,10 +631,23 @@ def save_draft(
             saved_recipes: list[Recipe] = []
             for recipe_index, values in enumerate(recipe_data):
                 cover_image, step_images = prepared_images[recipe_index]
+                if video_job:
+                    text_source_url = (
+                        values.get("text_source_url", "")
+                        if values.get("text_source_url") in discovered_text_urls
+                        else ""
+                    )
+                else:
+                    text_source_url = locked_job.source_url
                 if recipe_index < len(existing_drafts):
                     recipe = existing_drafts[recipe_index]
                     for field, value in _recipe_values(locked_job, values).items():
                         setattr(recipe, field, value)
+                    # Manually edited links survive; only empty ones are filled.
+                    if not recipe.video_url:
+                        recipe.video_url = discovered_video_url
+                    if not recipe.text_source_url:
+                        recipe.text_source_url = text_source_url
                     if cover_image and (not recipe.cover or recipe.cover_imported):
                         if recipe.cover_imported:
                             old_cover = _stored_file(recipe.cover)
@@ -646,16 +669,8 @@ def save_draft(
                 else:
                     recipe = Recipe(
                         **_recipe_values(locked_job, values),
-                        video_url=(
-                            locked_job.source_url
-                            if locked_job.source_type == ImportJob.SourceType.YOUTUBE
-                            else ""
-                        ),
-                        text_source_url=(
-                            locked_job.source_url
-                            if locked_job.source_type != ImportJob.SourceType.YOUTUBE
-                            else ""
-                        ),
+                        video_url=discovered_video_url,
+                        text_source_url=text_source_url,
                         status=Recipe.Status.DRAFT,
                         created_by=locked_job.requested_by,
                     )
@@ -682,8 +697,11 @@ def save_draft(
                     step_values = {
                         key: value for key, value in step.items() if key != "image_url"
                     }
+                    # Timestamps are meaningful only for the video whose
+                    # transcript produced them.
                     if (
-                        locked_job.source_type != ImportJob.SourceType.YOUTUBE
+                        not discovered_video_url
+                        or recipe.video_url != discovered_video_url
                         or step_values.get("video_timestamp_seconds")
                         not in allowed_video_timestamps
                     ):

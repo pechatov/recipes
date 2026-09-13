@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 from typing import Any
 
 from recipes.categories import CATEGORY_SLUGS
@@ -34,6 +35,17 @@ def _optional_integer(value: Any, maximum: int) -> int | None:
     if number < 0 or number > maximum:
         return None
     return number
+
+
+def _http_url(value: Any) -> str:
+    url = _text(value, 2048)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    return url
 
 
 def _quantity(value: Any) -> str | None:
@@ -363,6 +375,7 @@ def normalize_recipe(
         "cover_image_search_query": _text(
             value.get("cover_image_search_query"), 200
         ),
+        "text_source_url": _http_url(value.get("text_source_url")),
         "ingredients": ingredients,
         "steps": steps,
     }
