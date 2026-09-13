@@ -429,6 +429,39 @@ class ExtractorTests(TestCase):
 
     @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
     @patch("recipes.importing.extractors._download_html")
+    def test_website_with_several_recipes_needs_one_agreed_video(self, download, fetch):
+        def page(first_video, second_video):
+            return (
+                """<html><head><script type="application/ld+json">{"@graph": [
+                  {"@type": "Recipe", "name": "Суп", "recipeIngredient": ["100 г картофель"],
+                   "recipeInstructions": [{"text": "Сварить."}],
+                   "video": {"@type": "VideoObject", "embedUrl": "%s"}},
+                  {"@type": "Recipe", "name": "Пирог", "recipeIngredient": ["100 г мука"],
+                   "recipeInstructions": [{"text": "Испечь."}],
+                   "video": {"@type": "VideoObject", "embedUrl": "%s"}}
+                ]}</script></head><body><h1>Обед</h1>
+                <p>Достаточно длинное описание двух блюд с подробностями приготовления и подачи.</p>
+                <iframe src="https://www.youtube.com/embed/CCCCCCCCCCC"></iframe>
+                </body></html>""" % (first_video, second_video),
+                "https://example.com/menu",
+            )
+
+        fetch.return_value = [Mock(text="Общее видео обеда с подробным рассказом.", start=3)]
+        download.return_value = page(
+            "https://www.youtube.com/embed/AAAAAAAAAAA", "https://www.youtube.com/embed/BBBBBBBBBBB"
+        )
+        self.assertEqual(extract_website("https://example.com/menu").video_url, "")
+
+        download.return_value = page(
+            "https://www.youtube.com/embed/AAAAAAAAAAA", "https://www.youtube.com/embed/AAAAAAAAAAA"
+        )
+        self.assertEqual(
+            extract_website("https://example.com/menu").video_url,
+            "https://www.youtube.com/watch?v=AAAAAAAAAAA",
+        )
+
+    @patch("recipes.importing.extractors.YouTubeTranscriptApi.fetch")
+    @patch("recipes.importing.extractors._download_html")
     def test_website_ignores_plain_youtube_links(self, download, fetch):
         download.return_value = (
             """<html><body><h1>Суп</h1>
@@ -1658,6 +1691,40 @@ class PipelineTests(TestCase):
     @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
     @patch("recipes.importing.pipeline.adapt_with_ai")
     @patch("recipes.importing.pipeline.extract_source")
+    def test_article_video_is_not_shared_between_several_drafts(
+        self, extract_source, adapt_with_ai
+    ):
+        extract_source.return_value = SourceDocument(
+            "website",
+            "Обед из двух блюд",
+            "Ингредиенты: 500 г картофеля и соль. Нарезать картофель, затем обжарить.",
+            transcript_segments=({"start_seconds": 12, "text": "Ставим в духовку."},),
+            video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+        adapt_with_ai.return_value = [
+            {
+                **self.recipe_data(title),
+                "categories": ["main-course"],
+                "steps": [{"instruction": "Готовить.", "video_timestamp_seconds": 12}],
+            }
+            for title in ("Суп", "Пирог")
+        ]
+        job = ImportJob.objects.create(
+            source_url="https://example.com/menu",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=get_user_model().objects.create_user("menu-importer"),
+        )
+
+        recipes = process_import_job(job)
+
+        self.assertEqual([recipe.video_url for recipe in recipes], ["", ""])
+        self.assertTrue(
+            all(recipe.steps.get().video_timestamp_seconds is None for recipe in recipes)
+        )
+
+    @override_settings(RECIPE_AI_BASE_URL="https://ai.example/v1", RECIPE_AI_MODEL="model")
+    @patch("recipes.importing.pipeline.adapt_with_ai")
+    @patch("recipes.importing.pipeline.extract_source")
     def test_blocks_prompt_injection_in_article_video_transcript(
         self, extract_source, adapt_with_ai
     ):
@@ -1735,41 +1802,43 @@ class PipelineTests(TestCase):
 
     def test_reimport_fills_only_empty_source_links(self):
         user = get_user_model().objects.create_user("link-keeper")
-        job = ImportJob.objects.create(
-            source_url="https://example.com/menu",
-            source_type=ImportJob.SourceType.WEBSITE,
-            requested_by=user,
-        )
-        first, second = save_draft(
-            job, [self.recipe_data("Первый"), self.recipe_data("Второй")]
-        )
-        self.assertEqual(first.video_url, "")
-        Recipe.objects.filter(pk=first.pk).update(
-            video_url="https://www.youtube.com/watch?v=MANUALvideo"
-        )
         document = SourceDocument(
             "website",
             "Меню",
-            "Длинный текст меню с описанием приготовления двух блюд.",
+            "Длинный текст меню с описанием приготовления блюда.",
             transcript_segments=({"start_seconds": 3, "text": "Начало."},),
             video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         )
         steps = [{"instruction": "Готовить.", "video_timestamp_seconds": 3}]
+        manual_job = ImportJob.objects.create(
+            source_url="https://example.com/manual",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        (manual,) = save_draft(manual_job, [self.recipe_data("Ручной")])
+        self.assertEqual(manual.video_url, "")
+        Recipe.objects.filter(pk=manual.pk).update(
+            video_url="https://www.youtube.com/watch?v=MANUALvideo"
+        )
+        empty_job = ImportJob.objects.create(
+            source_url="https://example.com/empty",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=user,
+        )
+        (empty,) = save_draft(empty_job, [self.recipe_data("Пустой")])
 
-        first, second = save_draft(
-            job,
-            [
-                {**self.recipe_data("Первый"), "steps": steps},
-                {**self.recipe_data("Второй"), "steps": steps},
-            ],
-            document=document,
+        (manual,) = save_draft(
+            manual_job, [{**self.recipe_data("Ручной"), "steps": steps}], document=document
+        )
+        (empty,) = save_draft(
+            empty_job, [{**self.recipe_data("Пустой"), "steps": steps}], document=document
         )
 
-        self.assertEqual(first.video_url, "https://www.youtube.com/watch?v=MANUALvideo")
-        self.assertIsNone(first.steps.get().video_timestamp_seconds)
-        self.assertEqual(second.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        self.assertEqual(second.steps.get().video_timestamp_seconds, 3)
-        self.assertEqual(second.text_source_url, "https://example.com/menu")
+        self.assertEqual(manual.video_url, "https://www.youtube.com/watch?v=MANUALvideo")
+        self.assertIsNone(manual.steps.get().video_timestamp_seconds)
+        self.assertEqual(empty.video_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(empty.steps.get().video_timestamp_seconds, 3)
+        self.assertEqual(empty.text_source_url, "https://example.com/empty")
 
     def test_reprocessing_reuses_linked_drafts_and_detaches_extra_drafts(self):
         user = get_user_model().objects.create_user("re-importer")

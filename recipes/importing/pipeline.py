@@ -565,7 +565,10 @@ def save_draft(
             link["url"] for link in (document.source_links if document else ())
         }
     else:
-        discovered_video_url = document.video_url if document else ""
+        # One article video cannot be attributed when the page yields several dishes.
+        discovered_video_url = (
+            document.video_url if document and len(recipe_data) == 1 else ""
+        )
         discovered_text_urls = set()
     new_files: list[tuple[Any, str]] = []
     old_files: list[tuple[Any, str]] = []

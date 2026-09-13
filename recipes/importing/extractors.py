@@ -781,10 +781,17 @@ def article_video_url(
     """Find the YouTube video embedded in an article, if there is one.
 
     Only recipe markup and embeds count: plain links to YouTube usually lead to
-    channels or unrelated videos.
+    channels or unrelated videos. A page with several recipes gets a video only
+    when their markup agrees on one; a shared embed cannot be attributed.
     """
-    for recipe in recipes:
-        for video_id in _schema_video_ids(recipe.get("video")):
+    recipe_video_ids = [
+        next(iter(_schema_video_ids(recipe.get("video"))), "") for recipe in recipes
+    ]
+    if len(recipes) > 1:
+        distinct = set(recipe_video_ids)
+        return youtube_watch_url(distinct.pop()) if len(distinct) == 1 and "" not in distinct else ""
+    for video_id in recipe_video_ids:
+        if video_id:
             return youtube_watch_url(video_id)
     for element in soup.select("iframe, lite-youtube, youtube-video, [data-youtube-id]"):
         for attribute in ("src", "data-src", "data-lazy-src", "videoid", "data-youtube-id"):

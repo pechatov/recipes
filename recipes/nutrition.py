@@ -11,6 +11,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Iterable
 
+from django.db import IntegrityError, transaction
+
 from .importing.normalizer import estimate_nutrition
 from .models import NUTRITION_FIELDS, Recipe, RecipeIngredient, RecipeNutrition
 
@@ -78,7 +80,12 @@ def ensure_nutrition(
         return nutrition
     nutrition = RecipeNutrition(recipe=recipe)
     _fill_estimates(nutrition, recipe, ingredients, list(NUTRITION_FIELDS))
-    nutrition.save()
+    try:
+        with transaction.atomic():
+            nutrition.save()
+    except IntegrityError:
+        # A concurrent request created the record first; use that one.
+        nutrition = RecipeNutrition.objects.get(recipe=recipe)
     recipe.nutrition = nutrition
     return nutrition
 
