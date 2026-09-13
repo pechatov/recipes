@@ -118,6 +118,11 @@ def _source_text(document: SourceDocument) -> str:
             *image_urls,
             document.video_url,
             _json_text(document.source_links),
+            " ".join(
+                str(segment.get("text") or "")
+                for segment in document.transcript_segments
+                if isinstance(segment, dict)
+            ),
         )
     )
 

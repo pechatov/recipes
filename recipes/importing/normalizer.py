@@ -277,7 +277,10 @@ def normalize_nutrition(
         return {**parsed, "notes": notes, "source": "ai"}
     estimated = estimate_nutrition(ingredients, servings)
     return {
-        **{field: parsed[field] or estimated[field] for field in NUTRITION_FIELDS},
+        **{
+            field: parsed[field] if parsed[field] is not None else estimated[field]
+            for field in NUTRITION_FIELDS
+        },
         "notes": notes,
         "source": "estimated",
     }
@@ -381,9 +384,10 @@ def normalize_recipe(
         raise AIResponseError("Модель не выбрала ни одной допустимой категории рецепта.")
     servings = max(1, _integer(value.get("servings"), 2, 100))
     main_protein = _text(value.get("main_protein"), 16).lower()
-    if main_protein not in MAIN_PROTEIN_SLUGS:
+    if "main-course" not in categories:
+        # The badge belongs to main courses only, whatever the model says.
         main_protein = ""
-    if not main_protein and "main-course" in categories:
+    elif main_protein not in MAIN_PROTEIN_SLUGS:
         main_protein = infer_main_protein(
             item["name"] for item in ingredients if not item["is_pantry"]
         )

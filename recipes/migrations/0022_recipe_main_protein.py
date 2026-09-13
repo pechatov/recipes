@@ -1,6 +1,36 @@
+import re
+
 from django.db import migrations, models
 
-from recipes.categories import infer_main_protein
+
+# Frozen copy of recipes.categories at the time of this migration so the
+# backfill never depends on later changes to the app code.
+_MAIN_PROTEIN_RULES = (
+    ("chicken", re.compile(r"\b(?:кур(?:иц|ин|оч)|цыпл)")),
+    ("beef", re.compile(r"\b(?:говя|телят)")),
+    ("pork", re.compile(r"\b(?:свин|бекон|ветчин|купат|сало\b|шпик|окорок|грудинк)")),
+    (
+        "fish",
+        re.compile(
+            r"\b(?:рыб|лосос|сёмг|семг|форел|треск|тун(?:ец|ц)|минта|скумбр|судак|окун"
+            r"|горбуш|кет[аы]\b|палтус|дорад|сибас|хек\b|камбал|зубатк|щук|карп(?!ач)|сельд(?!ер)"
+            r"|сардин|пикш|тилапи|пангас|нерк|кижуч|анчоус)"
+        ),
+    ),
+)
+_MAIN_PROTEIN_SKIP = re.compile(r"бульон|яйц|яиц|соус|приправ|специ")
+
+
+def infer_main_protein(ingredient_names) -> str:
+    """Guess the main protein of a dish from ingredient names in recipe order."""
+    for name in ingredient_names:
+        value = str(name or "").lower()
+        if not value or _MAIN_PROTEIN_SKIP.search(value):
+            continue
+        for slug, pattern in _MAIN_PROTEIN_RULES:
+            if pattern.search(value):
+                return slug
+    return ""
 
 
 def fill_main_protein(apps, schema_editor):
