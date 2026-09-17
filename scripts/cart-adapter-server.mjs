@@ -717,11 +717,40 @@ const pageStateExpression = `(() => {
       text: clean(anchor.innerText || anchor.getAttribute('aria-label') || anchor.title || anchor.querySelector('img')?.alt),
       href: anchor.href,
     }))
-    .filter((link) => link.text && link.href.includes('/retail/') && link.href.includes('placeSlug='))
+    .filter((link) => {
+      // Store cards link to /retail/<brand>, with or without ?placeSlug=.
+      if (!link.text) return false;
+      try {
+        const url = new URL(link.href);
+        const parts = url.pathname.split('/').filter(Boolean);
+        return url.hostname === 'eda.yandex.ru' && parts.length === 2 && parts[0] === 'retail';
+      } catch {
+        return false;
+      }
+    })
     .slice(0, 250);
   let latitude = null;
   let longitude = null;
   const resources = performance.getEntriesByType('resource').map((entry) => entry.name).reverse();
+  // The storefront no longer keeps ?placeSlug= in its URL, so the place the
+  // page is showing is read from the latest catalog request it made itself.
+  let catalogPlaceSlug = '';
+  for (const name of resources) {
+    try {
+      const url = new URL(name);
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (
+        url.hostname === 'eda.yandex.ru'
+        && parts.length === 4
+        && parts[0] === 'api'
+        && parts[1] === 'v2'
+        && parts[2] === 'catalog'
+      ) {
+        catalogPlaceSlug = decodeURIComponent(parts[3]);
+        break;
+      }
+    } catch {}
+  }
   for (const name of resources) {
     try {
       const url = new URL(name);
@@ -746,6 +775,7 @@ const pageStateExpression = `(() => {
     links,
     latitude,
     longitude,
+    catalogPlaceSlug,
     loginRequired: controls.some((label) => ['войти', 'log in', 'sign in'].includes(label)),
     addressRequired: controls.some((label) => [
       'укажите адрес',
@@ -785,19 +815,38 @@ function selectStoreLink(store, links) {
       const url = new URL(link.href);
       const placeSlug = url.searchParams.get("placeSlug") || "";
       const pathGroupSlug = url.pathname.split("/").filter(Boolean)[1] || "";
-      if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru" || !url.pathname.startsWith("/retail/") || !slugPattern.test(placeSlug) || url.pathname.includes("/product/") || !policy.groupSlugs.includes(pathGroupSlug)) continue;
+      // Store cards may link to the bare /retail/<brand> URL; the place is then
+      // resolved by opening the storefront.
+      if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru" || !url.pathname.startsWith("/retail/") || (placeSlug && !slugPattern.test(placeSlug)) || url.pathname.includes("/product/") || !policy.groupSlugs.includes(pathGroupSlug)) continue;
       return { url: url.href, placeSlug, pathGroupSlug };
     } catch {}
   }
   throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
 }
 
+// The place a storefront page is showing: the explicit ?placeSlug= deep-link
+// parameter while Yandex Food still keeps it in the URL, otherwise the catalog
+// the page itself loaded.
+function currentPlaceSlug(state) {
+  let url;
+  try {
+    url = new URL(String(state?.url || ""));
+  } catch {
+    return "";
+  }
+  if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru") return "";
+  const placeSlug = url.searchParams.get("placeSlug") || String(state?.catalogPlaceSlug || "");
+  return slugPattern.test(placeSlug) ? placeSlug : "";
+}
+
 // Yandex Food resolves https://eda.yandex.ru/retail/<brand> to the nearest
-// storefront of that brand for the saved address by appending placeSlug, and
-// bounces unknown or unavailable brands back to the landing page. Classify the
-// current URL as a confirmed storefront (object), an explicit brand miss
-// (null) or an intermediate redirect state (undefined).
-function classifyStorefrontUrl(store, value) {
+// storefront of that brand for the saved address and bounces unknown or
+// unavailable brands back to the landing page. It used to append placeSlug to
+// the URL; it now keeps the bare brand URL (and strips a placeSlug deep-link
+// parameter once loaded), so the place may come from the catalog request the
+// page made. Classify the current page as a confirmed storefront (object), an
+// explicit brand miss (null) or an intermediate redirect state (undefined).
+function classifyStorefrontUrl(store, value, catalogPlaceSlug = "") {
   const policy = stores[store];
   let url;
   try {
@@ -812,28 +861,30 @@ function classifyStorefrontUrl(store, value) {
     return url.searchParams.get("redirectFrom") === "not_found_place" ? null : undefined;
   }
   const pathGroupSlug = parts[1] || "";
-  const placeSlug = url.searchParams.get("placeSlug") || "";
+  const placeSlug = currentPlaceSlug({ url: url.href, catalogPlaceSlug });
   if (
     parts.length !== 2
     || !policy.groupSlugs.includes(pathGroupSlug)
-    || !slugPattern.test(placeSlug)
+    || !placeSlug
   ) {
     return undefined;
   }
+  // The placeSlug deep link still opens exactly this place, so it stays the
+  // canonical store URL even though the address bar drops the parameter.
   url.search = "";
   url.searchParams.set("placeSlug", placeSlug);
   return { url: url.href, placeSlug, pathGroupSlug };
 }
 
-async function openBrandStorefront(browser, store, groupSlug) {
-  await navigate(browser, `https://eda.yandex.ru/retail/${encodeURIComponent(groupSlug)}`);
+async function openBrandStorefront(browser, store, storefrontUrl) {
+  await navigate(browser, storefrontUrl);
   let state = null;
   for (let attempt = 0; attempt < 30; attempt += 1) {
     state = await evaluate(browser, pageStateExpression);
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    const selected = classifyStorefrontUrl(store, state?.url);
+    const selected = classifyStorefrontUrl(store, state?.url, state?.catalogPlaceSlug);
     if (selected === null) return null;
     if (selected) {
       // Keep the coordinates already observed while the storefront redirect
@@ -921,7 +972,11 @@ async function resolveStore(browser, store) {
   let selected = null;
   let fallbackLocation = null;
   for (const groupSlug of stores[store].groupSlugs) {
-    selected = await openBrandStorefront(browser, store, groupSlug);
+    selected = await openBrandStorefront(
+      browser,
+      store,
+      `https://eda.yandex.ru/retail/${encodeURIComponent(groupSlug)}`,
+    );
     if (selected) {
       fallbackLocation = selected.location;
       break;
@@ -931,8 +986,12 @@ async function resolveStore(browser, store) {
     await navigate(browser, "https://eda.yandex.ru/retail");
     const listingState = await collectLandingLinks(browser);
     fallbackLocation = { latitude: listingState.latitude, longitude: listingState.longitude };
-    selected = selectStoreLink(store, listingState.links);
-    await navigate(browser, selected.url);
+    const link = selectStoreLink(store, listingState.links);
+    selected = await openBrandStorefront(browser, store, link.url);
+    if (!selected) {
+      throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
+    }
+    fallbackLocation = selected.location || fallbackLocation;
   }
   const state = await waitForPageState(browser);
   const location = {
@@ -1496,18 +1555,14 @@ async function validateSignedStore(browser, context) {
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    try {
-      const current = new URL(state?.url || "");
-      if (
-        current.hostname === "eda.yandex.ru"
-        && current.searchParams.get("placeSlug") === context.place_slug
-        && Number.isFinite(state?.latitude)
-        && Number.isFinite(state?.longitude)
-      ) {
-        ready = true;
-        break;
-      }
-    } catch {}
+    if (
+      currentPlaceSlug(state) === context.place_slug
+      && Number.isFinite(state?.latitude)
+      && Number.isFinite(state?.longitude)
+    ) {
+      ready = true;
+      break;
+    }
     await sleep(300);
   }
   if (!ready) throw new OperationError("store_unavailable", "Витрина магазина не загрузилась.");
@@ -2421,6 +2476,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   chooseLavkaAddress,
   classifyStorefrontUrl,
+  currentPlaceSlug,
   removeOperationRecord,
   searchQueries,
   storeSite,

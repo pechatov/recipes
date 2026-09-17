@@ -31,6 +31,7 @@ const {
   sameLocation,
   selectStoreLink,
   classifyStorefrontUrl,
+  currentPlaceSlug,
   searchQueries,
   scopeRecoveryAt,
   storeOperationRecord,
@@ -235,6 +236,84 @@ for (const intermediate of [
 ]) {
   assert.equal(classifyStorefrontUrl("perekrestok", intermediate), undefined, intermediate);
 }
+
+// Yandex Food stopped appending placeSlug to the storefront URL: the bare
+// brand URL is confirmed by the catalog the page itself loaded.
+assert.deepEqual(
+  classifyStorefrontUrl(
+    "perekrestok",
+    "https://eda.yandex.ru/retail/perekrestok",
+    "perekrestok_iatmv",
+  ),
+  {
+    url: "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekrestok_iatmv",
+    placeSlug: "perekrestok_iatmv",
+    pathGroupSlug: "perekrestok",
+  },
+);
+assert.equal(
+  classifyStorefrontUrl(
+    "perekrestok",
+    "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg",
+    "perekrestok_iatmv",
+  ).placeSlug,
+  "perekryostok_nr5vg",
+  "an explicit deep-link parameter wins over the loaded catalog",
+);
+for (const [url, catalogPlaceSlug] of [
+  ["https://eda.yandex.ru/retail", "perekrestok_iatmv"],
+  ["https://eda.yandex.ru/retail/perekrestok_kafe", "perekryostok_kafe_select_lxg5z"],
+  ["https://eda.yandex.ru/retail/perekrestok/cat/moloko/1", "perekrestok_iatmv"],
+  ["https://eda.yandex.ru/retail/perekrestok", "not a slug"],
+  ["http://eda.yandex.ru/retail/perekrestok", "perekrestok_iatmv"],
+]) {
+  assert.equal(classifyStorefrontUrl("perekrestok", url, catalogPlaceSlug), undefined, url);
+}
+assert.equal(
+  classifyStorefrontUrl(
+    "perekrestok",
+    "https://eda.yandex.ru/retail?redirectFrom=not_found_place",
+    "perekrestok_iatmv",
+  ),
+  null,
+);
+
+assert.equal(
+  currentPlaceSlug({
+    url: "https://eda.yandex.ru/retail/perekrestok",
+    catalogPlaceSlug: "perekrestok_iatmv",
+  }),
+  "perekrestok_iatmv",
+);
+assert.equal(
+  currentPlaceSlug({
+    url: "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg",
+    catalogPlaceSlug: "",
+  }),
+  "perekryostok_nr5vg",
+);
+for (const state of [
+  { url: "https://eda.yandex.ru/retail/perekrestok", catalogPlaceSlug: "" },
+  { url: "https://eda.yandex.ru/retail/perekrestok" },
+  { url: "https://evil.example/retail/perekrestok", catalogPlaceSlug: "perekrestok_iatmv" },
+  { url: "", catalogPlaceSlug: "perekrestok_iatmv" },
+  null,
+]) {
+  assert.equal(currentPlaceSlug(state), "", JSON.stringify(state));
+}
+
+assert.deepEqual(
+  selectStoreLink("perekrestok", [
+    { text: "Перекрёсток Кафе 20 – 30 мин", href: "https://eda.yandex.ru/retail/perekrestok_kafe" },
+    { text: "Перекрёсток 25 – 35 мин", href: "https://eda.yandex.ru/retail/perekrestok" },
+  ]),
+  {
+    url: "https://eda.yandex.ru/retail/perekrestok",
+    placeSlug: "",
+    pathGroupSlug: "perekrestok",
+  },
+  "bare store cards are accepted; the place is resolved on the storefront",
+);
 
 assert.deepEqual(
   searchQueries("целая курица", "Курица"),
