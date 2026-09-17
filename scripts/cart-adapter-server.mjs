@@ -731,13 +731,18 @@ const pageStateExpression = `(() => {
     .slice(0, 250);
   let latitude = null;
   let longitude = null;
-  const resources = performance.getEntriesByType('resource').map((entry) => entry.name).reverse();
+  const entries = performance.getEntriesByType('resource').reverse();
+  const resources = entries.map((entry) => entry.name);
   // The storefront no longer keeps ?placeSlug= in its URL, so the place the
-  // page is showing is read from the latest catalog request it made itself.
+  // page is showing is read from the latest catalog request the page itself
+  // completed successfully. A failed request proves nothing: for a place that
+  // is gone the page gets a 404 and silently opens another place of the brand.
   let catalogPlaceSlug = '';
-  for (const name of resources) {
+  for (const entry of entries) {
     try {
-      const url = new URL(name);
+      const status = Number(entry.responseStatus);
+      if (!((status >= 200 && status < 300) || status === 304)) continue;
+      const url = new URL(entry.name);
       const parts = url.pathname.split('/').filter(Boolean);
       if (
         url.hostname === 'eda.yandex.ru'
@@ -824,19 +829,25 @@ function selectStoreLink(store, links) {
   throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
 }
 
-// The place a storefront page is showing: the explicit ?placeSlug= deep-link
-// parameter while Yandex Food still keeps it in the URL, otherwise the catalog
-// the page itself loaded.
-function currentPlaceSlug(state) {
+// The storefront a page is showing right now. The brand comes from the
+// /retail/<brand> path, so a page that bounced to the landing, a category or a
+// product is never a storefront even if its document requested a catalog
+// earlier. The place is the catalog the page itself loaded successfully; the
+// ?placeSlug= deep-link parameter only stands in until that load completes,
+// because the page replaces a place that is gone with another one.
+function currentStorefront(state) {
   let url;
   try {
     url = new URL(String(state?.url || ""));
   } catch {
-    return "";
+    return null;
   }
-  if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru") return "";
-  const placeSlug = url.searchParams.get("placeSlug") || String(state?.catalogPlaceSlug || "");
-  return slugPattern.test(placeSlug) ? placeSlug : "";
+  if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru") return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length !== 2 || parts[0] !== "retail") return null;
+  const placeSlug = String(state?.catalogPlaceSlug || "") || url.searchParams.get("placeSlug") || "";
+  if (!slugPattern.test(parts[1]) || !slugPattern.test(placeSlug)) return null;
+  return { groupSlug: parts[1], placeSlug };
 }
 
 // Yandex Food resolves https://eda.yandex.ru/retail/<brand> to the nearest
@@ -860,20 +871,15 @@ function classifyStorefrontUrl(store, value, catalogPlaceSlug = "") {
   if (parts.length === 1) {
     return url.searchParams.get("redirectFrom") === "not_found_place" ? null : undefined;
   }
-  const pathGroupSlug = parts[1] || "";
-  const placeSlug = currentPlaceSlug({ url: url.href, catalogPlaceSlug });
-  if (
-    parts.length !== 2
-    || !policy.groupSlugs.includes(pathGroupSlug)
-    || !placeSlug
-  ) {
+  const storefront = currentStorefront({ url: url.href, catalogPlaceSlug });
+  if (!storefront || !policy.groupSlugs.includes(storefront.groupSlug)) {
     return undefined;
   }
   // The placeSlug deep link still opens exactly this place, so it stays the
   // canonical store URL even though the address bar drops the parameter.
   url.search = "";
-  url.searchParams.set("placeSlug", placeSlug);
-  return { url: url.href, placeSlug, pathGroupSlug };
+  url.searchParams.set("placeSlug", storefront.placeSlug);
+  return { url: url.href, placeSlug: storefront.placeSlug, pathGroupSlug: storefront.groupSlug };
 }
 
 async function openBrandStorefront(browser, store, storefrontUrl) {
@@ -1547,6 +1553,29 @@ async function applyLavkaSelection({
   }, mutationState, lavkaStoreUrl);
 }
 
+// The page must still be on the signed storefront before the cart is touched:
+// the brand path of the signed store URL, a resolved delivery location and the
+// signed place. Only the catalog the page loaded successfully confirms the
+// place here; the deep-link parameter alone does not, because the page may
+// still replace a place that is gone. The catalog API check that follows
+// verifies the place once more.
+function isSignedStorefront(state, context) {
+  let signedGroupSlug = "";
+  try {
+    signedGroupSlug = new URL(context.store_url).pathname.split("/").filter(Boolean)[1] || "";
+  } catch {}
+  const storefront = currentStorefront(state);
+  return Boolean(
+    storefront
+    && signedGroupSlug
+    && storefront.groupSlug === signedGroupSlug
+    && state?.catalogPlaceSlug === context.place_slug
+    && storefront.placeSlug === context.place_slug
+    && Number.isFinite(state?.latitude)
+    && Number.isFinite(state?.longitude),
+  );
+}
+
 async function validateSignedStore(browser, context) {
   let state = null;
   let ready = false;
@@ -1555,11 +1584,7 @@ async function validateSignedStore(browser, context) {
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    if (
-      currentPlaceSlug(state) === context.place_slug
-      && Number.isFinite(state?.latitude)
-      && Number.isFinite(state?.longitude)
-    ) {
+    if (isSignedStorefront(state, context)) {
       ready = true;
       break;
     }
@@ -2476,7 +2501,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   chooseLavkaAddress,
   classifyStorefrontUrl,
-  currentPlaceSlug,
+  currentStorefront,
+  isSignedStorefront,
+  pageStateExpression,
   removeOperationRecord,
   searchQueries,
   storeSite,

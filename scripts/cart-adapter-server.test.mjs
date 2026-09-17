@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { stat, unlink } from "node:fs/promises";
 
 
@@ -31,7 +32,9 @@ const {
   sameLocation,
   selectStoreLink,
   classifyStorefrontUrl,
-  currentPlaceSlug,
+  currentStorefront,
+  isSignedStorefront,
+  pageStateExpression,
   searchQueries,
   scopeRecoveryAt,
   storeOperationRecord,
@@ -254,11 +257,11 @@ assert.deepEqual(
 assert.equal(
   classifyStorefrontUrl(
     "perekrestok",
-    "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg",
+    "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekrestok_zzzz9",
     "perekrestok_iatmv",
   ).placeSlug,
-  "perekryostok_nr5vg",
-  "an explicit deep-link parameter wins over the loaded catalog",
+  "perekrestok_iatmv",
+  "the catalog the page loaded wins: a dead deep link is replaced by another place",
 );
 for (const [url, catalogPlaceSlug] of [
   ["https://eda.yandex.ru/retail", "perekrestok_iatmv"],
@@ -278,29 +281,136 @@ assert.equal(
   null,
 );
 
-assert.equal(
-  currentPlaceSlug({
+assert.deepEqual(
+  currentStorefront({
     url: "https://eda.yandex.ru/retail/perekrestok",
     catalogPlaceSlug: "perekrestok_iatmv",
   }),
-  "perekrestok_iatmv",
+  { groupSlug: "perekrestok", placeSlug: "perekrestok_iatmv" },
 );
-assert.equal(
-  currentPlaceSlug({
+assert.deepEqual(
+  currentStorefront({
     url: "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekryostok_nr5vg",
     catalogPlaceSlug: "",
   }),
-  "perekryostok_nr5vg",
+  { groupSlug: "perekrestok", placeSlug: "perekryostok_nr5vg" },
+  "the deep-link parameter stands in until the page loads its catalog",
 );
 for (const state of [
   { url: "https://eda.yandex.ru/retail/perekrestok", catalogPlaceSlug: "" },
   { url: "https://eda.yandex.ru/retail/perekrestok" },
+  // A catalog requested earlier in the document proves nothing once the page
+  // has bounced away from the storefront.
+  { url: "https://eda.yandex.ru/retail", catalogPlaceSlug: "perekrestok_iatmv" },
+  { url: "https://eda.yandex.ru/retail?redirectFrom=not_found_place", catalogPlaceSlug: "perekrestok_iatmv" },
+  { url: "https://eda.yandex.ru/retail/perekrestok/cat/moloko/1", catalogPlaceSlug: "perekrestok_iatmv" },
+  { url: "https://eda.yandex.ru/retail/perekrestok/product/abc?placeSlug=perekrestok_iatmv" },
   { url: "https://evil.example/retail/perekrestok", catalogPlaceSlug: "perekrestok_iatmv" },
   { url: "", catalogPlaceSlug: "perekrestok_iatmv" },
   null,
 ]) {
-  assert.equal(currentPlaceSlug(state), "", JSON.stringify(state));
+  assert.equal(currentStorefront(state), null, JSON.stringify(state));
 }
+
+const signedStore = {
+  place_slug: "perekrestok_iatmv",
+  store_url: "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekrestok_iatmv",
+};
+const located = { latitude: 55.7558, longitude: 37.6173 };
+assert.equal(
+  isSignedStorefront(
+    { ...located, url: "https://eda.yandex.ru/retail/perekrestok", catalogPlaceSlug: "perekrestok_iatmv" },
+    signedStore,
+  ),
+  true,
+);
+assert.equal(
+  isSignedStorefront(
+    { ...located, url: signedStore.store_url, catalogPlaceSlug: "perekrestok_iatmv" },
+    signedStore,
+  ),
+  true,
+);
+assert.equal(
+  isSignedStorefront(
+    { ...located, url: signedStore.store_url, catalogPlaceSlug: "" },
+    signedStore,
+  ),
+  false,
+  "the deep-link parameter alone never confirms the place before a cart mutation",
+);
+for (const [label, state] of [
+  ["landing page after a bounce", { ...located, url: "https://eda.yandex.ru/retail", catalogPlaceSlug: "perekrestok_iatmv" }],
+  ["another brand", { ...located, url: "https://eda.yandex.ru/retail/paterocka", catalogPlaceSlug: "perekrestok_iatmv" }],
+  ["page fell back to another place", { ...located, url: signedStore.store_url, catalogPlaceSlug: "perekryostok_nr5vg" }],
+  ["category page", { ...located, url: "https://eda.yandex.ru/retail/perekrestok/cat/moloko/1", catalogPlaceSlug: "perekrestok_iatmv" }],
+  ["no delivery location", { url: "https://eda.yandex.ru/retail/perekrestok", catalogPlaceSlug: "perekrestok_iatmv" }],
+  ["catalog not loaded", { ...located, url: "https://eda.yandex.ru/retail/perekrestok", catalogPlaceSlug: "" }],
+]) {
+  assert.equal(isSignedStorefront(state, signedStore), false, label);
+}
+assert.equal(
+  isSignedStorefront(
+    { ...located, url: "https://eda.yandex.ru/retail/perekrestok", catalogPlaceSlug: "perekrestok_iatmv" },
+    { place_slug: "perekrestok_iatmv", store_url: "not a url" },
+  ),
+  false,
+);
+
+// The in-page expression only trusts a catalog request that succeeded: for a
+// place that is gone the page gets a 404 and opens another place of the brand.
+function evaluatePageState(href, resourceEntries) {
+  return vm.runInNewContext(pageStateExpression, {
+    URL,
+    location: { href },
+    document: { querySelectorAll: () => [], body: { innerText: "" } },
+    getComputedStyle: () => ({ visibility: "visible" }),
+    performance: { getEntriesByType: () => resourceEntries.map((entry) => ({ ...entry })) },
+  });
+}
+const catalogEntry = (slug, responseStatus) => ({
+  name: `https://eda.yandex.ru/api/v2/catalog/${slug}?latitude=55.7558&longitude=37.6173&shippingType=delivery`,
+  responseStatus,
+});
+assert.equal(
+  evaluatePageState("https://eda.yandex.ru/retail/perekrestok", [
+    catalogEntry("perekrestok_iatmv", 200),
+  ]).catalogPlaceSlug,
+  "perekrestok_iatmv",
+);
+assert.equal(
+  evaluatePageState("https://eda.yandex.ru/retail/perekrestok", [
+    catalogEntry("perekrestok_iatmv", 200),
+    catalogEntry("perekrestok_zzzz9", 404),
+  ]).catalogPlaceSlug,
+  "perekrestok_iatmv",
+  "a later failed catalog request is ignored",
+);
+for (const failedStatus of [404, 500, 0, undefined]) {
+  const failedState = evaluatePageState("https://eda.yandex.ru/retail/perekrestok", [
+    catalogEntry("perekrestok_zzzz9", failedStatus),
+  ]);
+  assert.equal(failedState.catalogPlaceSlug, "", `status ${failedStatus}`);
+  assert.equal(failedState.latitude, 55.7558);
+  const deadStore = {
+    place_slug: "perekrestok_zzzz9",
+    store_url: "https://eda.yandex.ru/retail/perekrestok?placeSlug=perekrestok_zzzz9",
+  };
+  for (const url of ["https://eda.yandex.ru/retail/perekrestok", deadStore.store_url]) {
+    assert.equal(
+      isSignedStorefront({ ...failedState, url }, deadStore),
+      false,
+      "a failed catalog request never confirms the signed storefront",
+    );
+  }
+}
+assert.equal(
+  evaluatePageState("https://eda.yandex.ru/retail/perekrestok", [
+    { name: "https://evil.example/api/v2/catalog/perekrestok_iatmv", responseStatus: 200 },
+    { name: "https://eda.yandex.ru/api/v2/catalog/perekrestok_iatmv/extra", responseStatus: 200 },
+  ]).catalogPlaceSlug,
+  "",
+);
 
 assert.deepEqual(
   selectStoreLink("perekrestok", [
