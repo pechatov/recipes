@@ -1012,10 +1012,11 @@ function classifyApiStatus(status, message) {
 // resolves the bare brand URL to a different one of them from minute to
 // minute. A cart the user already has at one of those places pins the
 // storefront: items are added to that cart, and adding to another place would
-// open a second cart. The cart is only read here.
-function cartPlaceExpression(location) {
-  const params = cartParams({ ...location, place_slug: "" });
-  delete params.placeSlug;
+// open a second cart. The cart is only read here. Yandex answers with the
+// brand's existing cart only when asked for a place of that brand; without a
+// place it returns an empty unscoped cart.
+function cartPlaceExpression(context) {
+  const params = cartParams(context);
   return `(async () => {
     const query = new URLSearchParams(${JSON.stringify(params)});
     const response = await fetch('/eats/v1/cart/v2/full-carts?' + query, {method: 'POST', headers: {'content-type': 'application/json'}, body: '{}'});
@@ -1035,7 +1036,7 @@ function cartPlaceExpression(location) {
 }
 
 async function pinStorefrontToCart(browser, store, selected, location) {
-  const cart = await evaluate(browser, cartPlaceExpression(location));
+  const cart = await evaluate(browser, cartPlaceExpression({ ...location, place_slug: selected.placeSlug }));
   classifyApiStatus(Number(cart?.status || 0), "Корзина Яндекс Еды недоступна.");
   const place = cart?.place;
   if (
@@ -1052,18 +1053,38 @@ async function pinStorefrontToCart(browser, store, selected, location) {
   await navigate(browser, pinnedUrl.href);
   // The deep link is honoured for a live place; a place that is gone makes
   // the page open another one of the brand. Wait for the page itself to say
-  // which place it loaded instead of trusting the parameter.
+  // which place it loaded instead of trusting the parameter. Right after the
+  // navigation the previous document may still answer, reporting the place
+  // the brand resolved to; that is not the new page's verdict.
+  let freshDocument = false;
+  let last = null;
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const state = await evaluate(browser, pageStateExpression);
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     const loaded = loadedPlaceSlug(state);
+    last = { url: String(state?.url || ""), loaded };
     if (loaded === place.place_slug) {
       return { navigated: true, selected: classifyStorefrontUrl(store, state?.url, loaded) || null };
+    }
+    let requestedPlace = "";
+    try {
+      requestedPlace = new URL(last.url).searchParams.get("placeSlug") || "";
+    } catch {}
+    freshDocument = freshDocument || !loaded || requestedPlace === place.place_slug;
+    if (!freshDocument && loaded === selected.placeSlug) {
+      await sleep(300);
+      continue;
     }
     if (loaded || classifyStorefrontUrl(store, state?.url, loaded) === null) break;
     await sleep(500);
   }
+  console.warn("Storefront of the user's cart did not load", {
+    store,
+    cart_place: place.place_slug,
+    resolved_place: selected.placeSlug,
+    ...last,
+  });
   return { navigated: true, selected: null };
 }
 

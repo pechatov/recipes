@@ -504,11 +504,12 @@ for (const [label, state] of [
 }
 
 // The brand may resolve to any of several places serving the address; the
-// user's existing cart pins the place. The cart is read without a place so
-// Yandex returns the cart the user actually has.
+// user's existing cart pins the place. The cart is read for the resolved
+// place: Yandex returns the brand's existing cart only when asked for a place
+// of that brand.
 async function evaluateCartPlace(payload, status = 200) {
   const requests = [];
-  const result = await vm.runInNewContext(cartPlaceExpression({ latitude: 55.7558, longitude: 37.6173 }), {
+  const result = await vm.runInNewContext(cartPlaceExpression({ latitude: 55.7558, longitude: 37.6173, place_slug: "ashan_w5r8t" }), {
     URLSearchParams,
     fetch: async (url, options) => {
       requests.push({ url, options });
@@ -532,7 +533,7 @@ async function evaluateCartPlace(payload, status = 200) {
   assert.equal(requests[0].options.method, "POST");
   const requested = new URL(requests[0].url, "https://eda.yandex.ru");
   assert.equal(requested.pathname, "/eats/v1/cart/v2/full-carts");
-  assert.equal(requested.searchParams.get("placeSlug"), null, "the cart is read without a place");
+  assert.equal(requested.searchParams.get("placeSlug"), "ashan_w5r8t", "the cart is read for the resolved place");
   assert.equal(requested.searchParams.get("latitude"), "55.7558");
   assert.deepEqual(result, {
     status: 200,
