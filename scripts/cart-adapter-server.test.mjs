@@ -11,6 +11,7 @@ process.env.CART_ADAPTER_QUARANTINE_FILE = `/tmp/recipes-cart-quarantine-${proce
 
 const {
   boundedOperationTimeout,
+  cartPinVerdict,
   cartPlaceExpression,
   chooseLavkaAddress,
   deferScopeRecovery,
@@ -547,6 +548,52 @@ assert.deepEqual(
 );
 assert.deepEqual((await evaluateCartPlace({}, 500)).result, { status: 500, place: null });
 assert.deepEqual((await evaluateCartPlace("not an object")).result, { status: 200, place: null });
+
+// After navigating to the cart's place, the previous document may still
+// answer, or the new document may show the deep-link URL before it has loaded
+// its place. Neither is the new page's verdict; only a reported place is.
+{
+  const cartPlace = "ashan_g4zvs";
+  const resolvedPlace = "ashan_w5r8t";
+  const brandUrl = "https://eda.yandex.ru/retail/asan_giper";
+  const deepLink = `${brandUrl}?placeSlug=${cartPlace}`;
+  const verdict = (state) => cartPinVerdict("auchan", state, cartPlace, resolvedPlace);
+  const sequence = [
+    ["previous document still answers", { url: brandUrl, storePlaceSlug: resolvedPlace, storeBrandSlug: "asan_giper" }, "wait"],
+    ["new URL, store data of the previous document", { url: deepLink, storePlaceSlug: resolvedPlace, storeBrandSlug: "asan_giper" }, "wait"],
+    ["new document without store data yet", { url: deepLink, storePlaceSlug: "", storeBrandSlug: "" }, "wait"],
+    ["URL stripped, place not loaded yet", { url: brandUrl, storePlaceSlug: "", storeBrandSlug: "asan_giper" }, "wait"],
+    ["the cart's place loaded", { url: brandUrl, storePlaceSlug: cartPlace, storeBrandSlug: "asan_giper" }, "pinned"],
+  ];
+  for (const [label, state, expected] of sequence) {
+    assert.equal(verdict(state), expected, label);
+  }
+  assert.equal(
+    verdict({ url: deepLink, storePlaceSlug: cartPlace, storeBrandSlug: "asan_giper" }),
+    "pinned",
+    "the reported place counts even while the URL still carries the parameter",
+  );
+  assert.equal(
+    verdict({ url: brandUrl, storePlaceSlug: "", catalogPlaceSlug: cartPlace }),
+    "pinned",
+    "a successful catalog request reports the place on older page builds",
+  );
+  assert.equal(
+    verdict({ url: brandUrl, storePlaceSlug: "ashan_9vwzc", storeBrandSlug: "asan_giper" }),
+    "lost",
+    "the page replaced the cart's place with a third one",
+  );
+  assert.equal(
+    verdict({ url: "https://eda.yandex.ru/retail?redirectFrom=not_found_place", storePlaceSlug: "" }),
+    "lost",
+    "a bounce to the landing page",
+  );
+  assert.equal(
+    verdict({ url: brandUrl, storePlaceSlug: resolvedPlace, storeBrandSlug: "asan_giper" }),
+    "wait",
+    "the resolved place alone never ends the wait: it may still be the previous document",
+  );
+}
 
 assert.deepEqual(
   selectStoreLink("perekrestok", [

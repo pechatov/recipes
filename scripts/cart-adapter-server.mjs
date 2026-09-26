@@ -1035,6 +1035,22 @@ function cartPlaceExpression(context) {
   })()`;
 }
 
+// What the page says after navigating to the cart's place. The deep link is
+// honoured for a live place; a place that is gone makes the page open another
+// one of the brand. Only the place the page itself reports counts, never the
+// parameter. Right after the navigation the previous document may still
+// answer, or the new one may not have loaded its place yet: as long as the
+// page reports nothing or still the place the brand resolved to, keep
+// waiting. The attempt cap bounds a new page that settled on that same place.
+function cartPinVerdict(store, state, cartPlaceSlug, resolvedPlaceSlug) {
+  const loaded = loadedPlaceSlug(state);
+  if (loaded === cartPlaceSlug) return "pinned";
+  if (!loaded || loaded === resolvedPlaceSlug) {
+    return classifyStorefrontUrl(store, state?.url, loaded) === null ? "lost" : "wait";
+  }
+  return "lost";
+}
+
 async function pinStorefrontToCart(browser, store, selected, location) {
   const cart = await evaluate(browser, cartPlaceExpression({ ...location, place_slug: selected.placeSlug }));
   classifyApiStatus(Number(cart?.status || 0), "Корзина Яндекс Еды недоступна.");
@@ -1051,33 +1067,18 @@ async function pinStorefrontToCart(browser, store, selected, location) {
   const pinnedUrl = new URL(`https://eda.yandex.ru/retail/${encodeURIComponent(place.brand_slug)}`);
   pinnedUrl.searchParams.set("placeSlug", place.place_slug);
   await navigate(browser, pinnedUrl.href);
-  // The deep link is honoured for a live place; a place that is gone makes
-  // the page open another one of the brand. Wait for the page itself to say
-  // which place it loaded instead of trusting the parameter. Right after the
-  // navigation the previous document may still answer, reporting the place
-  // the brand resolved to; that is not the new page's verdict.
-  let freshDocument = false;
   let last = null;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     const state = await evaluate(browser, pageStateExpression);
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
-    const loaded = loadedPlaceSlug(state);
-    last = { url: String(state?.url || ""), loaded };
-    if (loaded === place.place_slug) {
-      return { navigated: true, selected: classifyStorefrontUrl(store, state?.url, loaded) || null };
+    last = { url: String(state?.url || ""), loaded: loadedPlaceSlug(state) };
+    const verdict = cartPinVerdict(store, state, place.place_slug, selected.placeSlug);
+    if (verdict === "pinned") {
+      return { navigated: true, selected: classifyStorefrontUrl(store, state?.url, last.loaded) || null };
     }
-    let requestedPlace = "";
-    try {
-      requestedPlace = new URL(last.url).searchParams.get("placeSlug") || "";
-    } catch {}
-    freshDocument = freshDocument || !loaded || requestedPlace === place.place_slug;
-    if (!freshDocument && loaded === selected.placeSlug) {
-      await sleep(300);
-      continue;
-    }
-    if (loaded || classifyStorefrontUrl(store, state?.url, loaded) === null) break;
-    await sleep(500);
+    if (verdict === "lost") break;
+    await sleep(400);
   }
   console.warn("Storefront of the user's cart did not load", {
     store,
@@ -2625,6 +2626,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   chooseLavkaAddress,
   classifyStorefrontUrl,
+  cartPinVerdict,
   cartPlaceExpression,
   currentStorefront,
   loadedPlaceSlug,
