@@ -733,10 +733,19 @@ const pageStateExpression = `(() => {
   let longitude = null;
   const entries = performance.getEntriesByType('resource').reverse();
   const resources = entries.map((entry) => entry.name);
-  // The storefront no longer keeps ?placeSlug= in its URL, so the place the
-  // page is showing is read from the latest catalog request the page itself
-  // completed successfully. A failed request proves nothing: for a place that
-  // is gone the page gets a 404 and silently opens another place of the brand.
+  // The storefront no longer keeps ?placeSlug= in its URL. The place the page
+  // is showing lives in its own store data, which feeds every catalog and menu
+  // request the page makes; older builds instead exposed it through a
+  // /api/v2/catalog/<place> request. Only a successful catalog request counts:
+  // for a place that is gone the page gets a 404 and silently opens another
+  // place of the brand.
+  let storePlaceSlug = '';
+  let storeBrandSlug = '';
+  try {
+    const storeData = window.__EDA_SINGLETON_RETAIL_STORE_DATA__;
+    storePlaceSlug = String(storeData?.currentPlaceSlug || '');
+    storeBrandSlug = String(storeData?.relatedBrandSlug || '');
+  } catch {}
   let catalogPlaceSlug = '';
   for (const entry of entries) {
     try {
@@ -780,6 +789,8 @@ const pageStateExpression = `(() => {
     links,
     latitude,
     longitude,
+    storePlaceSlug,
+    storeBrandSlug,
     catalogPlaceSlug,
     loginRequired: controls.some((label) => ['войти', 'log in', 'sign in'].includes(label)),
     addressRequired: controls.some((label) => [
@@ -835,6 +846,24 @@ function selectStoreLink(store, links) {
 // earlier. The place is the catalog the page itself loaded successfully; the
 // ?placeSlug= deep-link parameter only stands in until that load completes,
 // because the page replaces a place that is gone with another one.
+//
+// The place the page has actually loaded: its live store data first (the
+// brand it names must be the brand in the URL, otherwise the data belongs to
+// another storefront), then the latest catalog request it completed. The
+// deep-link parameter is never evidence.
+function loadedPlaceSlug(state) {
+  const storePlaceSlug = String(state?.storePlaceSlug || "");
+  const storeBrandSlug = String(state?.storeBrandSlug || "");
+  let pathBrandSlug = "";
+  try {
+    pathBrandSlug = new URL(String(state?.url || "")).pathname.split("/").filter(Boolean)[1] || "";
+  } catch {}
+  if (storePlaceSlug && (!storeBrandSlug || storeBrandSlug === pathBrandSlug)) {
+    return storePlaceSlug;
+  }
+  return String(state?.catalogPlaceSlug || "");
+}
+
 function currentStorefront(state) {
   let url;
   try {
@@ -845,7 +874,7 @@ function currentStorefront(state) {
   if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru") return null;
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts.length !== 2 || parts[0] !== "retail") return null;
-  const placeSlug = String(state?.catalogPlaceSlug || "") || url.searchParams.get("placeSlug") || "";
+  const placeSlug = loadedPlaceSlug(state) || url.searchParams.get("placeSlug") || "";
   if (!slugPattern.test(parts[1]) || !slugPattern.test(placeSlug)) return null;
   return { groupSlug: parts[1], placeSlug };
 }
@@ -854,10 +883,11 @@ function currentStorefront(state) {
 // storefront of that brand for the saved address and bounces unknown or
 // unavailable brands back to the landing page. It used to append placeSlug to
 // the URL; it now keeps the bare brand URL (and strips a placeSlug deep-link
-// parameter once loaded), so the place may come from the catalog request the
-// page made. Classify the current page as a confirmed storefront (object), an
-// explicit brand miss (null) or an intermediate redirect state (undefined).
-function classifyStorefrontUrl(store, value, catalogPlaceSlug = "") {
+// parameter once loaded), so the place comes from what the page itself has
+// loaded (see loadedPlaceSlug). Classify the current page as a confirmed
+// storefront (object), an explicit brand miss (null) or an intermediate
+// redirect state (undefined).
+function classifyStorefrontUrl(store, value, placeSlug = "") {
   const policy = stores[store];
   let url;
   try {
@@ -871,7 +901,7 @@ function classifyStorefrontUrl(store, value, catalogPlaceSlug = "") {
   if (parts.length === 1) {
     return url.searchParams.get("redirectFrom") === "not_found_place" ? null : undefined;
   }
-  const storefront = currentStorefront({ url: url.href, catalogPlaceSlug });
+  const storefront = currentStorefront({ url: url.href, catalogPlaceSlug: placeSlug });
   if (!storefront || !policy.groupSlugs.includes(storefront.groupSlug)) {
     return undefined;
   }
@@ -890,7 +920,7 @@ async function openBrandStorefront(browser, store, storefrontUrl) {
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    const selected = classifyStorefrontUrl(store, state?.url, state?.catalogPlaceSlug);
+    const selected = classifyStorefrontUrl(store, state?.url, loadedPlaceSlug(state));
     if (selected === null) return null;
     if (selected) {
       // Keep the coordinates already observed while the storefront redirect
@@ -974,6 +1004,65 @@ function classifyApiStatus(status, message) {
   if (status < 200 || status >= 300) throw new OperationError("upstream_failed", message);
 }
 
+// Yandex Food may serve one address from several places of the same brand and
+// resolves the bare brand URL to a different one of them from minute to
+// minute. A cart the user already has at one of those places pins the
+// storefront: items are added to that cart, and adding to another place would
+// open a second cart. The cart is only read here.
+function cartPlaceExpression(location) {
+  const params = cartParams({ ...location, place_slug: "" });
+  delete params.placeSlug;
+  return `(async () => {
+    const query = new URLSearchParams(${JSON.stringify(params)});
+    const response = await fetch('/eats/v1/cart/v2/full-carts?' + query, {method: 'POST', headers: {'content-type': 'application/json'}, body: '{}'});
+    let data = {};
+    try { data = await response.json(); } catch {}
+    const cart = data?.cart && typeof data.cart === 'object' ? data.cart : null;
+    const place = cart?.place && typeof cart.place === 'object' ? cart.place : {};
+    return {
+      status: response.status,
+      place: cart ? {
+        place_slug: String(cart.place_slug ?? cart.placeSlug ?? place.slug ?? ''),
+        brand_slug: String(place.brand_slug ?? place.brandSlug ?? place.brand?.slug ?? ''),
+        items: Array.isArray(cart.items) ? cart.items.length : 0,
+      } : null,
+    };
+  })()`;
+}
+
+async function pinStorefrontToCart(browser, store, selected, location) {
+  const cart = await evaluate(browser, cartPlaceExpression(location));
+  classifyApiStatus(Number(cart?.status || 0), "Корзина Яндекс Еды недоступна.");
+  const place = cart?.place;
+  if (
+    !place
+    || !place.items
+    || !slugPattern.test(place.place_slug)
+    || place.place_slug === selected.placeSlug
+    || !stores[store].groupSlugs.includes(place.brand_slug)
+  ) {
+    return { navigated: false, selected: null };
+  }
+  const pinnedUrl = new URL(`https://eda.yandex.ru/retail/${encodeURIComponent(place.brand_slug)}`);
+  pinnedUrl.searchParams.set("placeSlug", place.place_slug);
+  await navigate(browser, pinnedUrl.href);
+  // The deep link is honoured for a live place; a place that is gone makes
+  // the page open another one of the brand. Wait for the page itself to say
+  // which place it loaded instead of trusting the parameter.
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const state = await evaluate(browser, pageStateExpression);
+    if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
+    if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
+    const loaded = loadedPlaceSlug(state);
+    if (loaded === place.place_slug) {
+      return { navigated: true, selected: classifyStorefrontUrl(store, state?.url, loaded) || null };
+    }
+    if (loaded || classifyStorefrontUrl(store, state?.url, loaded) === null) break;
+    await sleep(500);
+  }
+  return { navigated: true, selected: null };
+}
+
 async function resolveStore(browser, store) {
   let selected = null;
   let fallbackLocation = null;
@@ -999,11 +1088,21 @@ async function resolveStore(browser, store) {
     }
     fallbackLocation = selected.location || fallbackLocation;
   }
-  const state = await waitForPageState(browser);
+  let state = await waitForPageState(browser);
   const location = {
     latitude: state.latitude ?? fallbackLocation?.latitude,
     longitude: state.longitude ?? fallbackLocation?.longitude,
   };
+  const pinned = await pinStorefrontToCart(browser, store, selected, location);
+  if (pinned.selected) {
+    selected = pinned.selected;
+    state = await waitForPageState(browser);
+  } else if (pinned.navigated) {
+    // The cart's place did not load; return to the place the brand resolved
+    // to and let the cart check decide.
+    await navigate(browser, selected.url);
+    state = await waitForPageState(browser);
+  }
   const catalog = await evaluate(browser, catalogExpression({ ...location, placeSlug: selected.placeSlug }));
   classifyApiStatus(Number(catalog?.status || 0), "Каталог магазина недоступен.");
   if (!catalog?.place || catalog.place.slug !== selected.placeSlug) {
@@ -1555,10 +1654,10 @@ async function applyLavkaSelection({
 
 // The page must still be on the signed storefront before the cart is touched:
 // the brand path of the signed store URL, a resolved delivery location and the
-// signed place. Only the catalog the page loaded successfully confirms the
-// place here; the deep-link parameter alone does not, because the page may
-// still replace a place that is gone. The catalog API check that follows
-// verifies the place once more.
+// signed place. Only the place the page itself has loaded confirms it here;
+// the deep-link parameter alone does not, because the page may still replace
+// a place that is gone. The catalog API check that follows verifies the place
+// once more.
 function isSignedStorefront(state, context) {
   let signedGroupSlug = "";
   try {
@@ -1569,7 +1668,7 @@ function isSignedStorefront(state, context) {
     storefront
     && signedGroupSlug
     && storefront.groupSlug === signedGroupSlug
-    && state?.catalogPlaceSlug === context.place_slug
+    && loadedPlaceSlug(state) === context.place_slug
     && storefront.placeSlug === context.place_slug
     && Number.isFinite(state?.latitude)
     && Number.isFinite(state?.longitude),
@@ -2501,7 +2600,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   chooseLavkaAddress,
   classifyStorefrontUrl,
+  cartPlaceExpression,
   currentStorefront,
+  loadedPlaceSlug,
   isSignedStorefront,
   pageStateExpression,
   removeOperationRecord,
