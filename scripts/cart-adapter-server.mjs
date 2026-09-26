@@ -920,9 +920,13 @@ async function openBrandStorefront(browser, store, storefrontUrl) {
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    const selected = classifyStorefrontUrl(store, state?.url, loadedPlaceSlug(state));
+    const loaded = loadedPlaceSlug(state);
+    const selected = classifyStorefrontUrl(store, state?.url, loaded);
     if (selected === null) return null;
-    if (selected) {
+    // A ?placeSlug= deep link parses as a storefront before the page has
+    // loaded anything; only a place the page itself reports confirms it,
+    // because a place that is gone is replaced by another one of the brand.
+    if (selected && loaded) {
       // Keep the coordinates already observed while the storefront redirect
       // settled, mirroring the landing-page fallback path.
       const location = Number.isFinite(state?.latitude) && Number.isFinite(state?.longitude)
