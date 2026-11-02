@@ -785,6 +785,10 @@ class CartAttempt(models.Model):
     cart_url = models.URLField("ссылка на корзину", max_length=2048, blank=True)
     summary = models.CharField("результат", max_length=500, blank=True)
     result = models.JSONField("ответ агента", default=dict, blank=True)
+    # The signed search a comparison produced for this store. Kept apart from
+    # result, which assembly attempts and failures overwrite, so a retry of
+    # the chosen store still adds exactly the products the user reviewed.
+    comparison = models.JSONField("результат сравнения", default=dict, blank=True)
     total_price = models.DecimalField(
         "стоимость набора",
         max_digits=10,

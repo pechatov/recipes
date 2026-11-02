@@ -793,22 +793,18 @@ def _save_comparison(run: CartRun, attempt: CartAttempt, outcome: dict) -> None:
         f"Точно: {counts['exact']}, замены: {counts['substitute']}, "
         f"не найдено: {counts['missing']}."
     )
-    result.update(
-        {
-            "counts": counts,
-            "price_complete": price_complete,
-            "comparison": {
-                "selection_token": selection_token,
-                "cart_url": _safe_yandex_food_url(outcome.get("cart_url")),
-                "elapsed_ms": outcome.get("elapsed_ms"),
-                "searched_at": timezone.now().isoformat(),
-                "matches": matches,
-            },
-        }
-    )
+    result.update({"counts": counts, "price_complete": price_complete})
     attempt.result = result
+    attempt.comparison = {
+        "selection_token": selection_token,
+        "cart_url": _safe_yandex_food_url(outcome.get("cart_url")),
+        "elapsed_ms": outcome.get("elapsed_ms"),
+        "searched_at": timezone.now().isoformat(),
+        "matches": matches,
+    }
     attempt.save(
         update_fields=[
+            "comparison",
             "status",
             "summary",
             "result",
@@ -842,9 +838,9 @@ def _save_comparison(run: CartRun, attempt: CartAttempt, outcome: dict) -> None:
 
 def comparison_selection(attempt: CartAttempt | None) -> dict | None:
     """The signed comparison of one store, if it can still be applied."""
-    if not attempt or not isinstance(attempt.result, dict):
+    if not attempt:
         return None
-    comparison = attempt.result.get("comparison")
+    comparison = attempt.comparison
     if not isinstance(comparison, dict):
         return None
     try:
@@ -871,6 +867,16 @@ def comparison_is_fresh(attempt: CartAttempt | None) -> bool:
     return comparison_selection(attempt) is not None
 
 
+def _finish_stale_choice(run: CartRun) -> None:
+    run.status = CartRun.Status.FAILED
+    run.finished_at = timezone.now()
+    run.error = (
+        "Результат сравнения устарел: цены и наличие могли измениться. "
+        "Корзина не менялась — проверьте магазины заново."
+    )
+    run.save(update_fields=["status", "finished_at", "error"])
+
+
 def process_cart_comparison(run: CartRun) -> None:
     """Search every store at once; never touch a cart."""
     if finish_requested_cart_stop(run):
@@ -886,6 +892,7 @@ def process_cart_comparison(run: CartRun) -> None:
                 "cart_url": "",
                 "summary": "",
                 "result": {},
+                "comparison": {},
                 "total_price": None,
                 "finished_at": None,
             },
@@ -967,6 +974,11 @@ def process_cart_run(run: CartRun) -> None:
             prepared = comparison_selection(
                 run.attempts.filter(store=store).select_related("run").first()
             )
+            if prepared is None:
+                # Never fall back to a fresh search: it could add products
+                # the user has not reviewed. Nothing has touched the cart.
+                _finish_stale_choice(run)
+                return
         attempt, _ = CartAttempt.objects.update_or_create(
             run=run,
             store=store,

@@ -503,9 +503,6 @@ def _assemble_with_adapter(
             allow_partial=True,
         )
     search = _search_with_adapter(run, store)
-    # A store the user chose from a comparison is assembled with whatever
-    # was found there; the user already saw what is missing.
-    allow_partial = bool(getattr(run, "chosen_store", ""))
     search_status = str(search.get("status") or "")
     reported_mutation = search.get("mutation_possible")
     if reported_mutation is True:
@@ -547,7 +544,6 @@ def _assemble_with_adapter(
         matches=match_search_results(run, search),
         cart_url=str(search.get("cart_url") or ""),
         search_elapsed_ms=search.get("elapsed_ms"),
-        allow_partial=allow_partial,
     )
 
 

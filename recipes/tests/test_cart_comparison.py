@@ -152,7 +152,7 @@ class CartComparisonTests(TestCase):
             list(auchan.matches.values_list("price", flat=True)),
             [Decimal("120.00"), Decimal("99.50")],
         )
-        self.assertEqual(auchan.result["comparison"]["selection_token"], "signed-auchan")
+        self.assertEqual(auchan.comparison["selection_token"], "signed-auchan")
         self.assertTrue(comparison_is_fresh(auchan))
         lavka = run.attempts.get(store="lavka")
         self.assertEqual(lavka.status, CartAttempt.Status.INCOMPLETE)
@@ -276,10 +276,10 @@ class CartComparisonTests(TestCase):
         run = self.make_run()
         process_cart_run(run)
         attempt = run.attempts.get(store="auchan")
-        attempt.result["comparison"]["searched_at"] = (
+        attempt.comparison["searched_at"] = (
             timezone.now() - timedelta(hours=2)
         ).isoformat()
-        attempt.save(update_fields=["result"])
+        attempt.save(update_fields=["comparison"])
         self.client.force_login(self.user)
 
         self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
@@ -336,6 +336,111 @@ class CartComparisonTests(TestCase):
         self.assertEqual(run.selected_attempt.store, "auchan")
         # Additions of the chosen store may remain, so the run warns.
         self.assertIsNone(run.cleaned_at)
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_comparison_that_expired_in_the_queue_is_never_replaced_by_a_search(
+        self, adapter_task
+    ):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+        attempt = run.attempts.get(store="auchan")
+        attempt.comparison["searched_at"] = (
+            timezone.now() - timedelta(hours=2)
+        ).isoformat()
+        attempt.save(update_fields=["comparison"])
+        claimed = claim_cart_run()
+        adapter_task.reset_mock()
+
+        process_cart_run(claimed)
+
+        adapter_task.assert_not_called()
+        claimed.refresh_from_db()
+        self.assertEqual(claimed.status, CartRun.Status.FAILED)
+        self.assertIn("устарел", claimed.error)
+        self.assertEqual(
+            claimed.attempts.get(store="auchan").status, CartAttempt.Status.EXACT
+        )
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_retry_after_a_safe_apply_failure_reuses_the_comparison(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+        claimed = claim_cart_run()
+        adapter_task.reset_mock()
+        adapter_task.return_value = {
+            "status": "login_required",
+            "summary": "Нужно войти в Яндекс Еду.",
+            "mutation_possible": False,
+        }
+        process_cart_run(claimed)
+        claimed.refresh_from_db()
+        self.assertEqual(claimed.status, CartRun.Status.LOGIN_REQUIRED)
+
+        self.client.post(reverse("cart-retry", args=[run.pk]))
+        retried = claim_cart_run()
+        adapter_task.reset_mock()
+        adapter_task.return_value = {
+            "status": "applied",
+            "cart_url": "https://eda.yandex.ru/retail/asan_giper?placeSlug=ashan_w5r8t",
+            "additions": [
+                {"product_id": PASTA_ID, "added_quantity": 1},
+                {"product_id": CREAM_ID, "added_quantity": 1},
+            ],
+            "cleanup_token": "signed-cleanup",
+        }
+        process_cart_run(retried)
+
+        adapter_task.assert_called_once()
+        self.assertEqual(adapter_task.call_args.args[0], "/v1/apply")
+        self.assertEqual(adapter_task.call_args.args[1]["selection_token"], "signed-auchan")
+        retried.refresh_from_db()
+        self.assertEqual(retried.status, CartRun.Status.COMPLETED)
+
+    def test_compare_again_does_not_cancel_a_run_already_chosen(self):
+        run = self.make_run(
+            status=CartRun.Status.PENDING,
+            chosen_store="auchan",
+            store_priority=["auchan"],
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("cart-compare-again", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertEqual(CartRun.objects.count(), 1)
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_partial_total_is_never_the_cheapest(self, adapter_task):
+        response = self.compare_response()
+        for result in response["stores"]["auchan"]["results"]:
+            result["candidates"][0]["price"] = None
+        response["stores"]["auchan"]["results"][0]["candidates"][0]["price"] = "10.00"
+        adapter_task.return_value = response
+        run = self.make_run(stores=("auchan", "lavka"))
+        process_cart_run(run)
+        self.client.force_login(self.user)
+        # Make Lavka complete too, but pricier than Auchan's partial sum.
+        lavka = run.attempts.get(store="lavka")
+        lavka.matches.filter(quality="missing").update(
+            quality="exact", product_name="Сливки", package_count=1, price=Decimal("150")
+        )
+        lavka.total_price = Decimal("239.00")
+        lavka.save(update_fields=["total_price"])
+
+        rows = self.client.get(
+            reverse("cart-detail", args=[run.pk])
+        ).context["comparison_rows"]
+
+        best = [row["store"] for row in rows if row["best"]]
+        self.assertEqual(best, ["lavka"])
 
     def test_choosing_run_can_be_cancelled(self):
         run = self.make_run(status=CartRun.Status.CHOOSING)

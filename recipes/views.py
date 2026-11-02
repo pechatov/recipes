@@ -1155,6 +1155,8 @@ def cart_choose(request, pk):
         messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
         return redirect("cart-detail", pk=active.pk)
     with transaction.atomic():
+        # The conditional update is the only transition out of CHOOSING;
+        # cart_compare_again takes the same row lock before cancelling it.
         updated = CartRun.objects.filter(
             pk=run.pk,
             status=CartRun.Status.CHOOSING,
@@ -1180,18 +1182,25 @@ def cart_choose(request, pk):
 @login_required
 @require_POST
 def cart_compare_again(request, pk):
-    run = get_object_or_404(CartRun, pk=pk, requested_by=request.user)
-    active = _active_cart_run(request.user)
-    if active:
-        messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
-        return redirect("cart-detail", pk=active.pk)
-    if run.status == CartRun.Status.CHOOSING:
-        run.status = CartRun.Status.CANCELLED
-        run.cleaned_at = timezone.now()
-        run.save(update_fields=["status", "cleaned_at"])
-    next_run = _start_store_comparison(
-        run.recipe, request.user, run.servings, run.ingredient_snapshot
-    )
+    with transaction.atomic():
+        # Lock the row so a concurrent cart_choose either commits first (the
+        # run is then active and blocks a new comparison) or sees it cancelled.
+        run = get_object_or_404(
+            CartRun.objects.select_for_update().select_related("recipe"),
+            pk=pk,
+            requested_by=request.user,
+        )
+        active = _active_cart_run(request.user)
+        if active:
+            messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+            return redirect("cart-detail", pk=active.pk)
+        if run.status == CartRun.Status.CHOOSING:
+            run.status = CartRun.Status.CANCELLED
+            run.cleaned_at = timezone.now()
+            run.save(update_fields=["status", "cleaned_at"])
+        next_run = _start_store_comparison(
+            run.recipe, request.user, run.servings, run.ingredient_snapshot
+        )
     messages.success(request, "Проверяем магазины заново.")
     return redirect("cart-detail", pk=next_run.pk)
 
@@ -1318,10 +1327,14 @@ def _comparison_rows(run, attempts):
     found_rows = [row for row in rows if row["found"]]
     if found_rows:
         fewest_missing = min(row["missing"] for row in found_rows)
+        # Only a total with every price known can be the cheapest; a partial
+        # sum is a lower bound and would win unfairly.
         priced = [
             row
             for row in found_rows
-            if row["missing"] == fewest_missing and row["total_price"] is not None
+            if row["missing"] == fewest_missing
+            and row["total_price"] is not None
+            and row["price_complete"]
         ]
         if priced:
             min(priced, key=lambda row: row["total_price"])["best"] = True
