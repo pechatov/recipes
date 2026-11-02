@@ -15,6 +15,7 @@ STORE_LINKS = {
     StorePreference.Store.PYATEROCHKA: ("paterocka", ""),
     StorePreference.Store.MAGNIT: ("magnit_celevaya", ""),
     StorePreference.Store.LAVKA: ("lavka", ""),
+    StorePreference.Store.CHIZHIK: ("cizik", ""),
 }
 
 

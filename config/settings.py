@@ -150,6 +150,13 @@ CART_ADAPTER_TIMEOUT_SECONDS = int(
 # 20 seconds to close its profile. Keep enough client-side delivery margin so
 # Django never abandons an operation that the adapter still considers valid.
 CART_ADAPTER_TIMEOUT_SECONDS = max(210, CART_ADAPTER_TIMEOUT_SECONDS)
+# Shared budget for searching every store at once. A store that has not
+# answered by then is left out of the comparison. The adapter caps it at four
+# minutes; the HTTP client waits another minute for the browser to close.
+CART_COMPARE_TIMEOUT_SECONDS = min(
+    240,
+    max(30, int(os.environ.get("CART_COMPARE_TIMEOUT_SECONDS", "180"))),
+)
 CART_ADAPTER_FALLBACK_TO_HERMES = env_bool(
     "CART_ADAPTER_FALLBACK_TO_HERMES",
     True,

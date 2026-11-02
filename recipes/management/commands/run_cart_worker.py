@@ -12,6 +12,7 @@ from recipes.carting.pipeline import (
     claim_cleanup_run,
     expire_unconfirmed_cart_runs,
     finish_requested_cart_stop,
+    maximum_browser_operation_seconds,
     process_cart_cleanup,
     process_cart_run,
     record_unexpected_browser_failure,
@@ -33,13 +34,7 @@ class Command(BaseCommand):
     def recover_stale_jobs():
         now = timezone.now()
         cutoff = now - timedelta(minutes=30)
-        operation_cutoff = now - timedelta(
-            seconds=max(
-                settings.CART_AI_TIMEOUT_SECONDS,
-                settings.CART_ADAPTER_TIMEOUT_SECONDS,
-            )
-            + 60
-        )
+        operation_cutoff = now - timedelta(seconds=maximum_browser_operation_seconds())
         uncertain_mutations = CartRun.objects.filter(
             status__in=[CartRun.Status.PROCESSING, CartRun.Status.CLEANING],
             browser_operation_started_at__lte=operation_cutoff,

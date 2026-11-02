@@ -1,0 +1,535 @@
+from datetime import timedelta
+from decimal import Decimal
+from unittest.mock import patch
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.utils import timezone
+
+from recipes.carting.client import CartAgentError
+from recipes.carting.pipeline import (
+    claim_cart_run,
+    comparison_is_fresh,
+    matches_total_price,
+    process_cart_run,
+)
+from recipes.models import CartAttempt, CartItemMatch, CartRun, Recipe
+
+
+PASTA_ID = "12345678-1234-1234-1234-123456789abc"
+CREAM_ID = "abcdefab-1234-1234-1234-123456789abc"
+LAVKA_PASTA_ID = "lavkapasta0000000000000001"
+
+
+def eda_candidate(product_id, name, weight, price, store="asan_giper"):
+    return {
+        "product_id": product_id,
+        "sku_id": product_id,
+        "name": name,
+        "weight": weight,
+        "available": True,
+        "in_stock": 20,
+        "price": price,
+        "product_url": (
+            f"https://eda.yandex.ru/retail/{store}/product/{product_id}"
+            "?placeSlug=ashan_w5r8t"
+        ),
+    }
+
+
+ADAPTER_SETTINGS = {
+    "CART_ADAPTER_BASE_URL": "https://adapter.example",
+    "CART_ADAPTER_API_KEY": "adapter-key",
+    "CART_COMPARE_TIMEOUT_SECONDS": 120,
+}
+
+
+@override_settings(**ADAPTER_SETTINGS)
+class CartComparisonTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="cook")
+        self.recipe = Recipe.objects.create(
+            title="Паста", servings=2, created_by=self.user
+        )
+        self.snapshot = [
+            {"name": "Спагетти", "quantity": "400", "unit": "г", "search_query": "спагетти"},
+            {"name": "Сливки", "quantity": "200", "unit": "мл", "search_query": "сливки"},
+        ]
+
+    def make_run(self, stores=("auchan", "lavka", "magnit"), **fields):
+        defaults = {
+            "recipe": self.recipe,
+            "requested_by": self.user,
+            "servings": 2,
+            "status": CartRun.Status.PROCESSING,
+            "store_priority": list(stores),
+            "ingredient_snapshot": self.snapshot,
+            "comparison": True,
+        }
+        defaults.update(fields)
+        return CartRun.objects.create(**defaults)
+
+    def compare_response(self):
+        return {
+            "status": "ready",
+            "elapsed_ms": 40_000,
+            "stores": {
+                "auchan": {
+                    "status": "ready",
+                    "selection_token": "signed-auchan",
+                    "cart_url": "https://eda.yandex.ru/retail/asan_giper?placeSlug=ashan_w5r8t",
+                    "elapsed_ms": 30_000,
+                    "results": [
+                        {
+                            "index": 0,
+                            "candidates": [
+                                eda_candidate(PASTA_ID, "Спагетти 450 г", "450 g", "120.00")
+                            ],
+                        },
+                        {
+                            "index": 1,
+                            "candidates": [
+                                eda_candidate(CREAM_ID, "Сливки 200 мл", "200 мл", "99.50")
+                            ],
+                        },
+                    ],
+                },
+                "lavka": {
+                    "status": "ready",
+                    "selection_token": "signed-lavka",
+                    "cart_url": "https://lavka.yandex.ru/cart",
+                    "results": [
+                        {
+                            "index": 0,
+                            "candidates": [
+                                {
+                                    "product_id": LAVKA_PASTA_ID,
+                                    "sku_id": LAVKA_PASTA_ID,
+                                    "name": "Спагетти 500 г",
+                                    "weight": "500 г",
+                                    "price": "89",
+                                    "product_url": f"https://lavka.yandex.ru/good/{LAVKA_PASTA_ID}",
+                                }
+                            ],
+                        },
+                        {"index": 1, "candidates": []},
+                    ],
+                },
+                "magnit": {"status": "timeout", "summary": "Магазин не ответил вовремя."},
+            },
+        }
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_comparison_searches_all_stores_at_once_without_cart_changes(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+
+        process_cart_run(run)
+
+        adapter_task.assert_called_once()
+        path, payload = adapter_task.call_args.args
+        self.assertEqual(path, "/v1/compare")
+        self.assertEqual(payload["stores"], ["auchan", "lavka", "magnit"])
+        self.assertEqual(payload["budget_ms"], 120_000)
+        self.assertEqual(adapter_task.call_args.kwargs["timeout"], 180)
+        self.assertFalse(adapter_task.call_args.kwargs["mutation_possible"])
+        for store in ("auchan", "lavka", "magnit"):
+            self.assertRegex(
+                payload["operation_ids"][store],
+                rf"^cart-run-{run.pk}-[0-9]{{20}}-{store}$",
+            )
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CHOOSING)
+        self.assertIsNone(run.browser_operation_started_at)
+        self.assertIsNone(run.selected_attempt)
+        auchan = run.attempts.get(store="auchan")
+        self.assertEqual(auchan.status, CartAttempt.Status.EXACT)
+        self.assertEqual(auchan.cart_url, "")
+        self.assertEqual(auchan.total_price, Decimal("219.50"))
+        self.assertEqual(
+            list(auchan.matches.values_list("price", flat=True)),
+            [Decimal("120.00"), Decimal("99.50")],
+        )
+        self.assertEqual(auchan.comparison["selection_token"], "signed-auchan")
+        self.assertTrue(comparison_is_fresh(auchan))
+        lavka = run.attempts.get(store="lavka")
+        self.assertEqual(lavka.status, CartAttempt.Status.INCOMPLETE)
+        self.assertEqual(lavka.total_price, Decimal("89.00"))
+        self.assertEqual(lavka.result["counts"]["missing"], 1)
+        magnit = run.attempts.get(store="magnit")
+        self.assertEqual(magnit.status, CartAttempt.Status.FAILED)
+        self.assertEqual(magnit.summary, "Магазин не ответил вовремя.")
+        self.assertFalse(magnit.matches.exists())
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_comparison_page_offers_each_found_store(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("cart-detail", args=[run.pk]))
+
+        self.assertContains(response, "Выберите магазин")
+        self.assertContains(response, "Собрать в «Ашан»")
+        self.assertContains(response, "Собрать в «Яндекс Лавка»")
+        self.assertContains(response, "Дешевле всего")
+        self.assertContains(response, "219,5")
+        self.assertContains(response, "без 1 поз.")
+        self.assertContains(response, "Магазин не ответил вовремя.")
+        rows = response.context["comparison_rows"]
+        self.assertEqual([row["store"] for row in rows], ["auchan", "lavka", "magnit"])
+        self.assertTrue(rows[0]["best"])
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_transport_failure_of_a_read_only_comparison_is_retryable(self, adapter_task):
+        adapter_task.side_effect = CartAgentError(
+            "Адаптер корзины недоступен.",
+            mutation_possible=True,
+            operation_uncertain=True,
+        )
+        run = self.make_run()
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.FAILED)
+        self.assertIsNone(run.browser_operation_started_at)
+        self.assertEqual(
+            set(run.attempts.values_list("status", flat=True)),
+            {CartAttempt.Status.FAILED},
+        )
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_all_stores_asking_for_login_pause_for_login(self, adapter_task):
+        adapter_task.return_value = {
+            "status": "login_required",
+            "summary": "Нужно войти в Яндекс Еду.",
+        }
+        run = self.make_run()
+
+        process_cart_run(run)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.LOGIN_REQUIRED)
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_choosing_a_store_applies_exactly_the_compared_products(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+
+        response = self.client.post(
+            reverse("cart-choose", args=[run.pk]), {"store": "lavka"}
+        )
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertEqual(run.chosen_store, "lavka")
+        self.assertEqual(run.store_priority, ["lavka"])
+        claimed = claim_cart_run()
+        self.assertEqual(claimed.pk, run.pk)
+
+        adapter_task.reset_mock()
+        adapter_task.side_effect = None
+        adapter_task.return_value = {
+            "status": "applied",
+            "cart_url": "https://lavka.yandex.ru/cart",
+            "elapsed_ms": 900,
+            "additions": [{"product_id": LAVKA_PASTA_ID, "added_quantity": 1}],
+            "cleanup_token": "signed-cleanup",
+        }
+        process_cart_run(claimed)
+
+        # No new search: the signed comparison is applied as reviewed, even
+        # though one ingredient is missing in this store.
+        adapter_task.assert_called_once()
+        path, payload = adapter_task.call_args.args
+        self.assertEqual(path, "/v1/apply")
+        self.assertEqual(payload["store"], "lavka")
+        self.assertEqual(payload["selection_token"], "signed-lavka")
+        self.assertEqual(
+            payload["items"],
+            [{"product_id": LAVKA_PASTA_ID, "sku_id": LAVKA_PASTA_ID, "package_count": 1}],
+        )
+        claimed.refresh_from_db()
+        self.assertEqual(claimed.status, CartRun.Status.REVIEW)
+        self.assertEqual(claimed.selected_attempt.store, "lavka")
+        self.assertEqual(claimed.selected_attempt.cart_url, "https://lavka.yandex.ru/cart")
+        self.assertEqual(claimed.selected_attempt.total_price, Decimal("89.00"))
+        self.assertIsNotNone(claimed.confirmation_deadline)
+        # The other stores keep their comparison results.
+        self.assertEqual(
+            claimed.attempts.get(store="auchan").status, CartAttempt.Status.EXACT
+        )
+        detail = self.client.get(reverse("cart-detail", args=[run.pk]))
+        self.assertContains(detail, "Выбран")
+        self.assertContains(detail, "Проверить магазины заново")
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_stale_comparison_cannot_be_applied(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        attempt = run.attempts.get(store="auchan")
+        attempt.comparison["searched_at"] = (
+            timezone.now() - timedelta(hours=2)
+        ).isoformat()
+        attempt.save(update_fields=["comparison"])
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CHOOSING)
+        self.assertEqual(run.chosen_store, "")
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_failed_store_cannot_be_chosen(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "magnit"})
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CHOOSING)
+
+    def test_compare_again_starts_a_new_comparison(self):
+        run = self.make_run(status=CartRun.Status.CHOOSING)
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("cart-compare-again", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        new_run = CartRun.objects.exclude(pk=run.pk).get()
+        self.assertRedirects(response, reverse("cart-detail", args=[new_run.pk]))
+        self.assertTrue(new_run.comparison)
+        self.assertEqual(new_run.status, CartRun.Status.PENDING)
+        self.assertEqual(new_run.ingredient_snapshot, self.snapshot)
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_stop_after_choosing_judges_the_chosen_store_only(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        chosen = run.attempts.get(store="auchan")
+        chosen.result = {**chosen.result, "mutation_unknown": True}
+        chosen.save(update_fields=["result"])
+        CartRun.objects.filter(pk=run.pk).update(
+            status=CartRun.Status.PENDING,
+            chosen_store="auchan",
+            store_priority=["auchan"],
+        )
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertEqual(run.selected_attempt.store, "auchan")
+        # Additions of the chosen store may remain, so the run warns.
+        self.assertIsNone(run.cleaned_at)
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_comparison_that_expired_in_the_queue_is_never_replaced_by_a_search(
+        self, adapter_task
+    ):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+        attempt = run.attempts.get(store="auchan")
+        attempt.comparison["searched_at"] = (
+            timezone.now() - timedelta(hours=2)
+        ).isoformat()
+        attempt.save(update_fields=["comparison"])
+        claimed = claim_cart_run()
+        adapter_task.reset_mock()
+
+        process_cart_run(claimed)
+
+        adapter_task.assert_not_called()
+        claimed.refresh_from_db()
+        self.assertEqual(claimed.status, CartRun.Status.FAILED)
+        self.assertIn("устарел", claimed.error)
+        self.assertEqual(
+            claimed.attempts.get(store="auchan").status, CartAttempt.Status.EXACT
+        )
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_retry_after_a_safe_apply_failure_reuses_the_comparison(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        run = self.make_run()
+        process_cart_run(run)
+        self.client.force_login(self.user)
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+        claimed = claim_cart_run()
+        adapter_task.reset_mock()
+        adapter_task.return_value = {
+            "status": "login_required",
+            "summary": "Нужно войти в Яндекс Еду.",
+            "mutation_possible": False,
+        }
+        process_cart_run(claimed)
+        claimed.refresh_from_db()
+        self.assertEqual(claimed.status, CartRun.Status.LOGIN_REQUIRED)
+
+        self.client.post(reverse("cart-retry", args=[run.pk]))
+        retried = claim_cart_run()
+        adapter_task.reset_mock()
+        adapter_task.return_value = {
+            "status": "applied",
+            "cart_url": "https://eda.yandex.ru/retail/asan_giper?placeSlug=ashan_w5r8t",
+            "additions": [
+                {"product_id": PASTA_ID, "added_quantity": 1},
+                {"product_id": CREAM_ID, "added_quantity": 1},
+            ],
+            "cleanup_token": "signed-cleanup",
+        }
+        process_cart_run(retried)
+
+        adapter_task.assert_called_once()
+        self.assertEqual(adapter_task.call_args.args[0], "/v1/apply")
+        self.assertEqual(adapter_task.call_args.args[1]["selection_token"], "signed-auchan")
+        retried.refresh_from_db()
+        self.assertEqual(retried.status, CartRun.Status.COMPLETED)
+
+    def test_compare_again_does_not_cancel_a_run_already_chosen(self):
+        run = self.make_run(
+            status=CartRun.Status.PENDING,
+            chosen_store="auchan",
+            store_priority=["auchan"],
+        )
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("cart-compare-again", args=[run.pk]))
+
+        self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.PENDING)
+        self.assertEqual(CartRun.objects.count(), 1)
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_partial_total_is_never_the_cheapest(self, adapter_task):
+        response = self.compare_response()
+        for result in response["stores"]["auchan"]["results"]:
+            result["candidates"][0]["price"] = None
+        response["stores"]["auchan"]["results"][0]["candidates"][0]["price"] = "10.00"
+        adapter_task.return_value = response
+        run = self.make_run(stores=("auchan", "lavka"))
+        process_cart_run(run)
+        self.client.force_login(self.user)
+        # Make Lavka complete too, but pricier than Auchan's partial sum.
+        lavka = run.attempts.get(store="lavka")
+        lavka.matches.filter(quality="missing").update(
+            quality="exact", product_name="Сливки", package_count=1, price=Decimal("150")
+        )
+        lavka.total_price = Decimal("239.00")
+        lavka.save(update_fields=["total_price"])
+
+        rows = self.client.get(
+            reverse("cart-detail", args=[run.pk])
+        ).context["comparison_rows"]
+
+        best = [row["store"] for row in rows if row["best"]]
+        self.assertEqual(best, ["lavka"])
+
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_only_one_of_two_choosing_runs_can_be_queued(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        first = self.make_run()
+        process_cart_run(first)
+        second = self.make_run()
+        process_cart_run(second)
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-choose", args=[first.pk]), {"store": "auchan"})
+        response = self.client.post(
+            reverse("cart-choose", args=[second.pk]), {"store": "auchan"}
+        )
+
+        self.assertRedirects(response, reverse("cart-detail", args=[first.pk]))
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.status, CartRun.Status.PENDING)
+        self.assertEqual(second.status, CartRun.Status.CHOOSING)
+
+    @patch("recipes.views._lock_cart_queue")
+    def test_queueing_paths_take_the_user_lock(self, lock):
+        run = self.make_run(status=CartRun.Status.CHOOSING)
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-compare-again", args=[run.pk]))
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+
+        self.assertEqual(lock.call_count, 1)
+        lock.reset_mock()
+        new_run = CartRun.objects.exclude(pk=run.pk).get()
+        CartRun.objects.filter(pk=new_run.pk).update(status=CartRun.Status.CHOOSING)
+        attempt = CartAttempt.objects.create(
+            run=new_run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            comparison={
+                "selection_token": "token",
+                "searched_at": timezone.now().isoformat(),
+                "matches": [
+                    {"quality": "exact", "product_id": PASTA_ID},
+                    {"quality": "missing"},
+                ],
+            },
+        )
+        self.client.post(reverse("cart-choose", args=[new_run.pk]), {"store": "auchan"})
+        self.assertEqual(lock.call_count, 1)
+        self.assertEqual(attempt.run_id, new_run.pk)
+
+    def test_choosing_run_can_be_cancelled(self):
+        run = self.make_run(status=CartRun.Status.CHOOSING)
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-stop", args=[run.pk]))
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, CartRun.Status.CANCELLED)
+        self.assertIsNotNone(run.cleaned_at)
+
+
+class TotalPriceTests(TestCase):
+    def test_total_counts_packages_and_skips_missing_items(self):
+        total, complete = matches_total_price(
+            [
+                {"quality": "exact", "price": "120.00", "package_count": 2},
+                {"quality": "substitute", "price": "99.5", "package_count": 1},
+                {"quality": "missing", "price": "", "package_count": 0},
+            ]
+        )
+        self.assertEqual(total, Decimal("339.50"))
+        self.assertTrue(complete)
+
+    def test_unknown_price_marks_total_as_partial(self):
+        total, complete = matches_total_price(
+            [
+                {"quality": "exact", "price": "120", "package_count": 1},
+                {"quality": "exact", "price": None, "package_count": 1},
+            ]
+        )
+        self.assertEqual(total, Decimal("120.00"))
+        self.assertFalse(complete)
+
+    def test_nothing_found_has_no_total(self):
+        self.assertEqual(
+            matches_total_price([{"quality": "missing"}]),
+            (None, True),
+        )
+
+    def test_match_line_total(self):
+        match = CartItemMatch(price=Decimal("10.50"), package_count=3)
+        self.assertEqual(match.line_total, Decimal("31.50"))

@@ -528,6 +528,7 @@ class StorePreference(models.Model):
         PYATEROCHKA = "pyaterochka", "Пятёрочка"
         MAGNIT = "magnit", "Магнит"
         LAVKA = "lavka", "Яндекс Лавка"
+        CHIZHIK = "chizhik", "Чижик"
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -567,6 +568,7 @@ class CartRun(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", "В очереди"
         PROCESSING = "processing", "Собирается"
+        CHOOSING = "choosing", "Выбор магазина"
         COMPLETED = "completed", "Корзина готова"
         REVIEW = "review", "Нужна проверка"
         CONFIRMED = "confirmed", "Подтверждена"
@@ -592,6 +594,16 @@ class CartRun(models.Model):
         db_index=True,
     )
     store_priority = models.JSONField("очередь магазинов", default=list)
+    # A comparison run first searches every store without touching any cart
+    # and waits for the user to choose one; only then is the chosen store's
+    # cart assembled.
+    comparison = models.BooleanField("сравнение магазинов", default=False)
+    chosen_store = models.CharField(
+        "выбранный магазин",
+        max_length=24,
+        choices=StorePreference.Store.choices,
+        blank=True,
+    )
     ingredient_snapshot = models.JSONField("ингредиенты", default=list)
     next_store_index = models.PositiveSmallIntegerField(default=0)
     selected_attempt = models.ForeignKey(
@@ -631,10 +643,15 @@ class CartRun(models.Model):
         }
 
     @property
+    def is_comparing(self):
+        return self.comparison and not self.chosen_store
+
+    @property
     def can_stop(self):
         return self.status in {
             self.Status.PENDING,
             self.Status.PROCESSING,
+            self.Status.CHOOSING,
             self.Status.CLEANUP_PENDING,
             self.Status.CLEANING,
             self.Status.MANUAL_CHECK,
@@ -768,6 +785,17 @@ class CartAttempt(models.Model):
     cart_url = models.URLField("ссылка на корзину", max_length=2048, blank=True)
     summary = models.CharField("результат", max_length=500, blank=True)
     result = models.JSONField("ответ агента", default=dict, blank=True)
+    # The signed search a comparison produced for this store. Kept apart from
+    # result, which assembly attempts and failures overwrite, so a retry of
+    # the chosen store still adds exactly the products the user reviewed.
+    comparison = models.JSONField("результат сравнения", default=dict, blank=True)
+    total_price = models.DecimalField(
+        "стоимость набора",
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
@@ -795,6 +823,13 @@ class CartItemMatch(models.Model):
     product_name = models.CharField("выбранный товар", max_length=300, blank=True)
     product_url = models.URLField("ссылка на товар", max_length=2048, blank=True)
     package_count = models.PositiveSmallIntegerField("упаковок", default=0)
+    price = models.DecimalField(
+        "цена упаковки",
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
     quality = models.CharField("качество совпадения", max_length=16, choices=MatchQuality.choices)
     warning = models.CharField("предупреждение", max_length=500, blank=True)
     order = models.PositiveSmallIntegerField(default=0)
@@ -806,3 +841,9 @@ class CartItemMatch(models.Model):
 
     def __str__(self):
         return f"{self.ingredient_name}: {self.get_quality_display()}"
+
+    @property
+    def line_total(self):
+        if self.price is None or not self.package_count:
+            return None
+        return self.price * self.package_count

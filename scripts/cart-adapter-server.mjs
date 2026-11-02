@@ -41,6 +41,15 @@ const cleanupOperationIdPattern = new RegExp(
   `^(?:${operationIdPattern.source.slice(1, -1)}|[a-f0-9-]{36})$`,
 );
 const tokenLifetimeMs = 10 * 60 * 1000;
+// A comparison across stores waits for the user to pick one of them, so its
+// selection tokens outlive a single-store search. Apply still re-validates the
+// storefront, the delivery address and the cart before any mutation.
+const compareTokenLifetimeMs = 60 * 60 * 1000;
+const defaultCompareBudgetMs = 150_000;
+const minimumCompareBudgetMs = 30_000;
+const maximumCompareBudgetMs = 240_000;
+// Time reserved at the end of a comparison for closing the browser session.
+const compareCloseReserveMs = 20_000;
 // All normal browser work must stop before Django's 210-second client timeout.
 // closeBrowser has its own 20-second allowance, leaving roughly 30 seconds for
 // response delivery and scheduling jitter.
@@ -64,6 +73,9 @@ const stores = {
   perekrestok: { aliases: ["перекресток", "perekrestok"], groupSlugs: ["perekrestok"] },
   pyaterochka: { aliases: ["пятерочка", "pyaterochka"], groupSlugs: ["paterocka"] },
   magnit: { aliases: ["магнит", "magnit"], groupSlugs: ["magnit_celevaya"] },
+  // Чижик is not listed on the Yandex Food landing page, but its brand
+  // storefront /retail/cizik resolves to a place for the saved address.
+  chizhik: { aliases: ["чижик", "chizhik"], groupSlugs: ["cizik"] },
   lavka: {
     aliases: ["яндекс лавка", "лавка", "yandex lavka"],
     groupSlugs: ["lavka"],
@@ -717,11 +729,54 @@ const pageStateExpression = `(() => {
       text: clean(anchor.innerText || anchor.getAttribute('aria-label') || anchor.title || anchor.querySelector('img')?.alt),
       href: anchor.href,
     }))
-    .filter((link) => link.text && link.href.includes('/retail/') && link.href.includes('placeSlug='))
+    .filter((link) => {
+      // Store cards link to /retail/<brand>, with or without ?placeSlug=.
+      if (!link.text) return false;
+      try {
+        const url = new URL(link.href);
+        const parts = url.pathname.split('/').filter(Boolean);
+        return url.hostname === 'eda.yandex.ru' && parts.length === 2 && parts[0] === 'retail';
+      } catch {
+        return false;
+      }
+    })
     .slice(0, 250);
   let latitude = null;
   let longitude = null;
-  const resources = performance.getEntriesByType('resource').map((entry) => entry.name).reverse();
+  const entries = performance.getEntriesByType('resource').reverse();
+  const resources = entries.map((entry) => entry.name);
+  // The storefront no longer keeps ?placeSlug= in its URL. The place the page
+  // is showing lives in its own store data, which feeds every catalog and menu
+  // request the page makes; older builds instead exposed it through a
+  // /api/v2/catalog/<place> request. Only a successful catalog request counts:
+  // for a place that is gone the page gets a 404 and silently opens another
+  // place of the brand.
+  let storePlaceSlug = '';
+  let storeBrandSlug = '';
+  try {
+    const storeData = window.__EDA_SINGLETON_RETAIL_STORE_DATA__;
+    storePlaceSlug = String(storeData?.currentPlaceSlug || '');
+    storeBrandSlug = String(storeData?.relatedBrandSlug || '');
+  } catch {}
+  let catalogPlaceSlug = '';
+  for (const entry of entries) {
+    try {
+      const status = Number(entry.responseStatus);
+      if (!((status >= 200 && status < 300) || status === 304)) continue;
+      const url = new URL(entry.name);
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (
+        url.hostname === 'eda.yandex.ru'
+        && parts.length === 4
+        && parts[0] === 'api'
+        && parts[1] === 'v2'
+        && parts[2] === 'catalog'
+      ) {
+        catalogPlaceSlug = decodeURIComponent(parts[3]);
+        break;
+      }
+    } catch {}
+  }
   for (const name of resources) {
     try {
       const url = new URL(name);
@@ -746,6 +801,9 @@ const pageStateExpression = `(() => {
     links,
     latitude,
     longitude,
+    storePlaceSlug,
+    storeBrandSlug,
+    catalogPlaceSlug,
     loginRequired: controls.some((label) => ['войти', 'log in', 'sign in'].includes(label)),
     addressRequired: controls.some((label) => [
       'укажите адрес',
@@ -785,19 +843,63 @@ function selectStoreLink(store, links) {
       const url = new URL(link.href);
       const placeSlug = url.searchParams.get("placeSlug") || "";
       const pathGroupSlug = url.pathname.split("/").filter(Boolean)[1] || "";
-      if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru" || !url.pathname.startsWith("/retail/") || !slugPattern.test(placeSlug) || url.pathname.includes("/product/") || !policy.groupSlugs.includes(pathGroupSlug)) continue;
+      // Store cards may link to the bare /retail/<brand> URL; the place is then
+      // resolved by opening the storefront.
+      if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru" || !url.pathname.startsWith("/retail/") || (placeSlug && !slugPattern.test(placeSlug)) || url.pathname.includes("/product/") || !policy.groupSlugs.includes(pathGroupSlug)) continue;
       return { url: url.href, placeSlug, pathGroupSlug };
     } catch {}
   }
   throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
 }
 
+// The storefront a page is showing right now. The brand comes from the
+// /retail/<brand> path, so a page that bounced to the landing, a category or a
+// product is never a storefront even if its document requested a catalog
+// earlier. The place is the catalog the page itself loaded successfully; the
+// ?placeSlug= deep-link parameter only stands in until that load completes,
+// because the page replaces a place that is gone with another one.
+//
+// The place the page has actually loaded: its live store data first (the
+// brand it names must be the brand in the URL, otherwise the data belongs to
+// another storefront), then the latest catalog request it completed. The
+// deep-link parameter is never evidence.
+function loadedPlaceSlug(state) {
+  const storePlaceSlug = String(state?.storePlaceSlug || "");
+  const storeBrandSlug = String(state?.storeBrandSlug || "");
+  let pathBrandSlug = "";
+  try {
+    pathBrandSlug = new URL(String(state?.url || "")).pathname.split("/").filter(Boolean)[1] || "";
+  } catch {}
+  if (storePlaceSlug && (!storeBrandSlug || storeBrandSlug === pathBrandSlug)) {
+    return storePlaceSlug;
+  }
+  return String(state?.catalogPlaceSlug || "");
+}
+
+function currentStorefront(state) {
+  let url;
+  try {
+    url = new URL(String(state?.url || ""));
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "eda.yandex.ru") return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length !== 2 || parts[0] !== "retail") return null;
+  const placeSlug = loadedPlaceSlug(state) || url.searchParams.get("placeSlug") || "";
+  if (!slugPattern.test(parts[1]) || !slugPattern.test(placeSlug)) return null;
+  return { groupSlug: parts[1], placeSlug };
+}
+
 // Yandex Food resolves https://eda.yandex.ru/retail/<brand> to the nearest
-// storefront of that brand for the saved address by appending placeSlug, and
-// bounces unknown or unavailable brands back to the landing page. Classify the
-// current URL as a confirmed storefront (object), an explicit brand miss
-// (null) or an intermediate redirect state (undefined).
-function classifyStorefrontUrl(store, value) {
+// storefront of that brand for the saved address and bounces unknown or
+// unavailable brands back to the landing page. It used to append placeSlug to
+// the URL; it now keeps the bare brand URL (and strips a placeSlug deep-link
+// parameter once loaded), so the place comes from what the page itself has
+// loaded (see loadedPlaceSlug). Classify the current page as a confirmed
+// storefront (object), an explicit brand miss (null) or an intermediate
+// redirect state (undefined).
+function classifyStorefrontUrl(store, value, placeSlug = "") {
   const policy = stores[store];
   let url;
   try {
@@ -811,31 +913,32 @@ function classifyStorefrontUrl(store, value) {
   if (parts.length === 1) {
     return url.searchParams.get("redirectFrom") === "not_found_place" ? null : undefined;
   }
-  const pathGroupSlug = parts[1] || "";
-  const placeSlug = url.searchParams.get("placeSlug") || "";
-  if (
-    parts.length !== 2
-    || !policy.groupSlugs.includes(pathGroupSlug)
-    || !slugPattern.test(placeSlug)
-  ) {
+  const storefront = currentStorefront({ url: url.href, catalogPlaceSlug: placeSlug });
+  if (!storefront || !policy.groupSlugs.includes(storefront.groupSlug)) {
     return undefined;
   }
+  // The placeSlug deep link still opens exactly this place, so it stays the
+  // canonical store URL even though the address bar drops the parameter.
   url.search = "";
-  url.searchParams.set("placeSlug", placeSlug);
-  return { url: url.href, placeSlug, pathGroupSlug };
+  url.searchParams.set("placeSlug", storefront.placeSlug);
+  return { url: url.href, placeSlug: storefront.placeSlug, pathGroupSlug: storefront.groupSlug };
 }
 
-async function openBrandStorefront(browser, store, groupSlug) {
-  await navigate(browser, `https://eda.yandex.ru/retail/${encodeURIComponent(groupSlug)}`);
+async function openBrandStorefront(browser, store, storefrontUrl) {
+  await navigate(browser, storefrontUrl);
   let state = null;
   for (let attempt = 0; attempt < 30; attempt += 1) {
     state = await evaluate(browser, pageStateExpression);
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    const selected = classifyStorefrontUrl(store, state?.url);
+    const loaded = loadedPlaceSlug(state);
+    const selected = classifyStorefrontUrl(store, state?.url, loaded);
     if (selected === null) return null;
-    if (selected) {
+    // A ?placeSlug= deep link parses as a storefront before the page has
+    // loaded anything; only a place the page itself reports confirms it,
+    // because a place that is gone is replaced by another one of the brand.
+    if (selected && loaded) {
       // Keep the coordinates already observed while the storefront redirect
       // settled, mirroring the landing-page fallback path.
       const location = Number.isFinite(state?.latitude) && Number.isFinite(state?.longitude)
@@ -911,17 +1014,123 @@ function catalogExpression(input) {
   })()`;
 }
 
+// The storefront renders for anonymous visitors too, at a default location in
+// the city centre, and its «Войти» button may appear only after the checks
+// above have passed. The address book endpoint answers 401 for a visitor
+// without a Yandex session, so it is an unambiguous login probe; any other
+// answer is left to the regular checks.
+const edaAuthExpression = `(async () => {
+  try {
+    const response = await fetch('/eats/v1/eats-addresses/v1/addresses', {headers: {accept: 'application/json'}});
+    return {status: response.status};
+  } catch {
+    return {status: 0};
+  }
+})()`;
+
+async function requireEdaSession(browser) {
+  const auth = await evaluate(browser, edaAuthExpression);
+  if (Number(auth?.status) === 401) {
+    throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
+  }
+}
+
 function classifyApiStatus(status, message) {
   if (status === 401 || status === 403) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
   if (status === 429) throw new OperationError("blocked", "Яндекс временно ограничил запросы.");
   if (status < 200 || status >= 300) throw new OperationError("upstream_failed", message);
 }
 
+// Yandex Food may serve one address from several places of the same brand and
+// resolves the bare brand URL to a different one of them from minute to
+// minute. A cart the user already has at one of those places pins the
+// storefront: items are added to that cart, and adding to another place would
+// open a second cart. The cart is only read here. Yandex answers with the
+// brand's existing cart only when asked for a place of that brand; without a
+// place it returns an empty unscoped cart.
+function cartPlaceExpression(context) {
+  const params = cartParams(context);
+  return `(async () => {
+    const query = new URLSearchParams(${JSON.stringify(params)});
+    const response = await fetch('/eats/v1/cart/v2/full-carts?' + query, {method: 'POST', headers: {'content-type': 'application/json'}, body: '{}'});
+    let data = {};
+    try { data = await response.json(); } catch {}
+    const cart = data?.cart && typeof data.cart === 'object' ? data.cart : null;
+    const place = cart?.place && typeof cart.place === 'object' ? cart.place : {};
+    return {
+      status: response.status,
+      place: cart ? {
+        place_slug: String(cart.place_slug ?? cart.placeSlug ?? place.slug ?? ''),
+        brand_slug: String(place.brand_slug ?? place.brandSlug ?? place.brand?.slug ?? ''),
+        items: Array.isArray(cart.items) ? cart.items.length : 0,
+      } : null,
+    };
+  })()`;
+}
+
+// What the page says after navigating to the cart's place. The deep link is
+// honoured for a live place; a place that is gone makes the page open another
+// one of the brand. Only the place the page itself reports counts, never the
+// parameter. Right after the navigation the previous document may still
+// answer, or the new one may not have loaded its place yet: as long as the
+// page reports nothing or still the place the brand resolved to, keep
+// waiting. The attempt cap bounds a new page that settled on that same place.
+function cartPinVerdict(store, state, cartPlaceSlug, resolvedPlaceSlug) {
+  const loaded = loadedPlaceSlug(state);
+  if (loaded === cartPlaceSlug) return "pinned";
+  if (!loaded || loaded === resolvedPlaceSlug) {
+    return classifyStorefrontUrl(store, state?.url, loaded) === null ? "lost" : "wait";
+  }
+  return "lost";
+}
+
+async function pinStorefrontToCart(browser, store, selected, location) {
+  const cart = await evaluate(browser, cartPlaceExpression({ ...location, place_slug: selected.placeSlug }));
+  classifyApiStatus(Number(cart?.status || 0), "Корзина Яндекс Еды недоступна.");
+  const place = cart?.place;
+  if (
+    !place
+    || !place.items
+    || !slugPattern.test(place.place_slug)
+    || place.place_slug === selected.placeSlug
+    || !stores[store].groupSlugs.includes(place.brand_slug)
+  ) {
+    return { navigated: false, selected: null };
+  }
+  const pinnedUrl = new URL(`https://eda.yandex.ru/retail/${encodeURIComponent(place.brand_slug)}`);
+  pinnedUrl.searchParams.set("placeSlug", place.place_slug);
+  await navigate(browser, pinnedUrl.href);
+  let last = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const state = await evaluate(browser, pageStateExpression);
+    if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
+    if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
+    last = { url: String(state?.url || ""), loaded: loadedPlaceSlug(state) };
+    const verdict = cartPinVerdict(store, state, place.place_slug, selected.placeSlug);
+    if (verdict === "pinned") {
+      return { navigated: true, selected: classifyStorefrontUrl(store, state?.url, last.loaded) || null };
+    }
+    if (verdict === "lost") break;
+    await sleep(400);
+  }
+  console.warn("Storefront of the user's cart did not load", {
+    store,
+    cart_place: place.place_slug,
+    resolved_place: selected.placeSlug,
+    ...last,
+  });
+  return { navigated: true, selected: null };
+}
+
 async function resolveStore(browser, store) {
   let selected = null;
   let fallbackLocation = null;
   for (const groupSlug of stores[store].groupSlugs) {
-    selected = await openBrandStorefront(browser, store, groupSlug);
+    selected = await openBrandStorefront(
+      browser,
+      store,
+      `https://eda.yandex.ru/retail/${encodeURIComponent(groupSlug)}`,
+    );
     if (selected) {
       fallbackLocation = selected.location;
       break;
@@ -931,14 +1140,29 @@ async function resolveStore(browser, store) {
     await navigate(browser, "https://eda.yandex.ru/retail");
     const listingState = await collectLandingLinks(browser);
     fallbackLocation = { latitude: listingState.latitude, longitude: listingState.longitude };
-    selected = selectStoreLink(store, listingState.links);
-    await navigate(browser, selected.url);
+    const link = selectStoreLink(store, listingState.links);
+    selected = await openBrandStorefront(browser, store, link.url);
+    if (!selected) {
+      throw new OperationError("store_unavailable", "Выбранная сеть недоступна по сохранённому адресу.");
+    }
+    fallbackLocation = selected.location || fallbackLocation;
   }
-  const state = await waitForPageState(browser);
+  let state = await waitForPageState(browser);
+  await requireEdaSession(browser);
   const location = {
     latitude: state.latitude ?? fallbackLocation?.latitude,
     longitude: state.longitude ?? fallbackLocation?.longitude,
   };
+  const pinned = await pinStorefrontToCart(browser, store, selected, location);
+  if (pinned.selected) {
+    selected = pinned.selected;
+    state = await waitForPageState(browser);
+  } else if (pinned.navigated) {
+    // The cart's place did not load; return to the place the brand resolved
+    // to and let the cart check decide.
+    await navigate(browser, selected.url);
+    state = await waitForPageState(browser);
+  }
   const catalog = await evaluate(browser, catalogExpression({ ...location, placeSlug: selected.placeSlug }));
   classifyApiStatus(Number(catalog?.status || 0), "Каталог магазина недоступен.");
   if (!catalog?.place || catalog.place.slug !== selected.placeSlug) {
@@ -1282,77 +1506,78 @@ function lavkaUpdateExpression(context, cart, updates) {
   });
 }
 
-async function searchLavka(scope, store, operationId, ingredients, started) {
-  return withBrowser(scope, async (browser) => {
-    await lavkaBootstrap(browser);
-    const address = await resolveLavkaAddress(browser);
-    const context = {
-      site: "lavka",
-      address_id: address.address_id,
-      latitude: address.latitude,
-      longitude: address.longitude,
-      store_url: lavkaStoreUrl,
-    };
-    // Reading the cart validates the authenticated session and confirms the
-    // saved address is inside a Lavka delivery zone. It changes nothing.
-    await readLavkaCart(browser, context);
-    const rawResults = await evaluate(
-      browser,
-      lavkaSearchExpression(context, ingredients),
-      90_000,
-    );
-    if (!Array.isArray(rawResults) || rawResults.length !== ingredients.length) {
-      throw new OperationError("upstream_failed", "Поиск товаров вернул неполный ответ.");
+async function searchLavkaInBrowser(
+  browser,
+  { scope, store, operationId, ingredients, started, lifetimeMs = tokenLifetimeMs },
+) {
+  await lavkaBootstrap(browser);
+  const address = await resolveLavkaAddress(browser);
+  const context = {
+    site: "lavka",
+    address_id: address.address_id,
+    latitude: address.latitude,
+    longitude: address.longitude,
+    store_url: lavkaStoreUrl,
+  };
+  // Reading the cart validates the authenticated session and confirms the
+  // saved address is inside a Lavka delivery zone. It changes nothing.
+  await readLavkaCart(browser, context);
+  const rawResults = await evaluate(
+    browser,
+    lavkaSearchExpression(context, ingredients),
+    90_000,
+  );
+  if (!Array.isArray(rawResults) || rawResults.length !== ingredients.length) {
+    throw new OperationError("upstream_failed", "Поиск товаров вернул неполный ответ.");
+  }
+  const allowed = Object.create(null);
+  const prices = Object.create(null);
+  const results = rawResults.map((result, index) => {
+    classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
+    if (!(result?.candidates || []).length && result?.fallback_status) {
+      classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
     }
-    const allowed = Object.create(null);
-    const prices = Object.create(null);
-    const results = rawResults.map((result, index) => {
-      classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
-      if (!(result?.candidates || []).length && result?.fallback_status) {
-        classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
+    const candidates = [];
+    for (const candidate of result.candidates || []) {
+      const productId = text(candidate.product_id, 128);
+      const name = text(candidate.name, 300);
+      const price = text(candidate.price, 24);
+      if (
+        !productIdPattern.test(productId)
+        || !name
+        || !lavkaPricePattern.test(price)
+      ) {
+        continue;
       }
-      const candidates = [];
-      for (const candidate of result.candidates || []) {
-        const productId = text(candidate.product_id, 128);
-        const name = text(candidate.name, 300);
-        const price = text(candidate.price, 24);
-        if (
-          !productIdPattern.test(productId)
-          || !name
-          || !lavkaPricePattern.test(price)
-        ) {
-          continue;
-        }
-        allowed[productId] = productId;
-        prices[productId] = price;
-        candidates.push({
-          ...candidate,
-          product_id: productId,
-          sku_id: productId,
-          name,
-          price,
-          product_url: `https://lavka.yandex.ru/good/${encodeURIComponent(productId)}`,
-        });
-      }
-      return { index, candidates };
-    });
-    const selectionToken = sealSelection({
-      scope,
-      store,
-      operation_id: operationId,
-      context,
-      allowed,
-      prices,
-      expires_at: Date.now() + tokenLifetimeMs,
-    });
-    return {
-      status: "ready",
-      cart_url: lavkaCartUrl,
-      selection_token: selectionToken,
-      results,
-      elapsed_ms: Date.now() - started,
-    };
-  }, { possible: false }, lavkaStoreUrl);
+      allowed[productId] = productId;
+      prices[productId] = price;
+      candidates.push({
+        ...candidate,
+        product_id: productId,
+        sku_id: productId,
+        name,
+        price,
+        product_url: `https://lavka.yandex.ru/good/${encodeURIComponent(productId)}`,
+      });
+    }
+    return { index, candidates };
+  });
+  const selectionToken = sealSelection({
+    scope,
+    store,
+    operation_id: operationId,
+    context,
+    allowed,
+    prices,
+    expires_at: Date.now() + lifetimeMs,
+  });
+  return {
+    status: "ready",
+    cart_url: lavkaCartUrl,
+    selection_token: selectionToken,
+    results,
+    elapsed_ms: Date.now() - started,
+  };
 }
 
 async function applyLavkaSelection({
@@ -1488,6 +1713,29 @@ async function applyLavkaSelection({
   }, mutationState, lavkaStoreUrl);
 }
 
+// The page must still be on the signed storefront before the cart is touched:
+// the brand path of the signed store URL, a resolved delivery location and the
+// signed place. Only the place the page itself has loaded confirms it here;
+// the deep-link parameter alone does not, because the page may still replace
+// a place that is gone. The catalog API check that follows verifies the place
+// once more.
+function isSignedStorefront(state, context) {
+  let signedGroupSlug = "";
+  try {
+    signedGroupSlug = new URL(context.store_url).pathname.split("/").filter(Boolean)[1] || "";
+  } catch {}
+  const storefront = currentStorefront(state);
+  return Boolean(
+    storefront
+    && signedGroupSlug
+    && storefront.groupSlug === signedGroupSlug
+    && loadedPlaceSlug(state) === context.place_slug
+    && storefront.placeSlug === context.place_slug
+    && Number.isFinite(state?.latitude)
+    && Number.isFinite(state?.longitude),
+  );
+}
+
 async function validateSignedStore(browser, context) {
   let state = null;
   let ready = false;
@@ -1496,21 +1744,14 @@ async function validateSignedStore(browser, context) {
     if (state?.blocked) throw new OperationError("blocked", "Яндекс запросил ручную проверку.");
     if (state?.loginRequired) throw new OperationError("login_required", "Нужно войти в Яндекс Еду.");
     if (state?.addressRequired) throw new OperationError("login_required", "Нужно сохранить адрес доставки в Яндекс Еде.");
-    try {
-      const current = new URL(state?.url || "");
-      if (
-        current.hostname === "eda.yandex.ru"
-        && current.searchParams.get("placeSlug") === context.place_slug
-        && Number.isFinite(state?.latitude)
-        && Number.isFinite(state?.longitude)
-      ) {
-        ready = true;
-        break;
-      }
-    } catch {}
+    if (isSignedStorefront(state, context)) {
+      ready = true;
+      break;
+    }
     await sleep(300);
   }
   if (!ready) throw new OperationError("store_unavailable", "Витрина магазина не загрузилась.");
+  await requireEdaSession(browser);
   if (!sameLocation(state, context)) {
     throw new OperationError(
       "invalid_selection",
@@ -1946,68 +2187,227 @@ function searchQueries(query, name) {
   return queries.slice(0, 6);
 }
 
-async function search(body) {
-  const { scope, store } = validateBaseRequest(body);
-  const operationId = text(body?.operation_id, 128);
+function storeStartUrl(store) {
+  if (storeSite(store) === "lavka") return lavkaStoreUrl;
+  return `https://eda.yandex.ru/retail/${encodeURIComponent(stores[store].groupSlugs[0])}`;
+}
+
+// Search one store in an already opened tab. Read-only: it resolves the
+// storefront, reads the cart to validate the session and searches products.
+async function searchStoreInBrowser(browser, request) {
+  if (storeSite(request.store) === "lavka") {
+    return searchLavkaInBrowser(browser, request);
+  }
+  const {
+    scope,
+    store,
+    operationId,
+    ingredients,
+    started,
+    lifetimeMs = tokenLifetimeMs,
+  } = request;
+  const context = await resolveStore(browser, store);
+  // Reading the cart here validates the authenticated cookie/session before
+  // returning a selection token. It never changes existing items.
+  await readCart(browser, context);
+  const rawResults = await evaluate(browser, searchExpression(context, ingredients), 90_000);
+  if (!Array.isArray(rawResults) || rawResults.length !== ingredients.length) {
+    throw new OperationError("upstream_failed", "Поиск товаров вернул неполный ответ.");
+  }
+  const allowed = Object.create(null);
+  const results = rawResults.map((result, index) => {
+    classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
+    if (!(result?.candidates || []).length && result?.fallback_status) {
+      // Without any candidate a failed fallback query is indistinguishable
+      // from a missing product, so surface the outage instead of silently
+      // reporting the ingredient as not found.
+      classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
+    }
+    const candidates = [];
+    for (const candidate of result.candidates || []) {
+      const productId = text(candidate.product_id, 128);
+      const skuId = text(candidate.sku_id || candidate.product_id, 128);
+      const name = text(candidate.name, 300);
+      if (!productIdPattern.test(productId) || !productIdPattern.test(skuId) || !name) continue;
+      allowed[productId] = skuId;
+      candidates.push({
+        ...candidate,
+        product_id: productId,
+        sku_id: skuId,
+        name,
+        product_url: `https://eda.yandex.ru/retail/${encodeURIComponent(context.group_slug)}/product/${encodeURIComponent(productId)}?placeSlug=${encodeURIComponent(context.place_slug)}`,
+      });
+    }
+    return { index, candidates };
+  });
+  const selectionToken = sealSelection({
+    scope,
+    store,
+    operation_id: operationId,
+    context,
+    allowed,
+    expires_at: Date.now() + lifetimeMs,
+  });
+  return {
+    status: "ready",
+    cart_url: context.store_url,
+    selection_token: selectionToken,
+    results,
+    elapsed_ms: Date.now() - started,
+  };
+}
+
+function validateOperationId(value) {
+  const operationId = text(value, 128);
   if (!operationIdPattern.test(operationId)) {
     throw new OperationError("invalid_request", "Неверный идентификатор операции.");
   }
+  return operationId;
+}
+
+async function search(body) {
+  const { scope, store } = validateBaseRequest(body);
+  const operationId = validateOperationId(body?.operation_id);
   const ingredients = validateIngredients(body);
   const started = Date.now();
-  if (storeSite(store) === "lavka") {
-    return searchLavka(scope, store, operationId, ingredients, started);
-  }
-  return withBrowser(scope, async (browser) => {
-    const context = await resolveStore(browser, store);
-    // Reading the cart here validates the authenticated cookie/session before
-    // returning a selection token. It never changes existing items.
-    await readCart(browser, context);
-    const rawResults = await evaluate(browser, searchExpression(context, ingredients), 90_000);
-    if (!Array.isArray(rawResults) || rawResults.length !== ingredients.length) {
-      throw new OperationError("upstream_failed", "Поиск товаров вернул неполный ответ.");
-    }
-    const allowed = Object.create(null);
-    const results = rawResults.map((result, index) => {
-      classifyApiStatus(Number(result?.status || 0), "Поиск товаров недоступен.");
-      if (!(result?.candidates || []).length && result?.fallback_status) {
-        // Without any candidate a failed fallback query is indistinguishable
-        // from a missing product, so surface the outage instead of silently
-        // reporting the ingredient as not found.
-        classifyApiStatus(Number(result.fallback_status), "Поиск товаров недоступен.");
-      }
-      const candidates = [];
-      for (const candidate of result.candidates || []) {
-        const productId = text(candidate.product_id, 128);
-        const skuId = text(candidate.sku_id || candidate.product_id, 128);
-        const name = text(candidate.name, 300);
-        if (!productIdPattern.test(productId) || !productIdPattern.test(skuId) || !name) continue;
-        allowed[productId] = skuId;
-        candidates.push({
-          ...candidate,
-          product_id: productId,
-          sku_id: skuId,
-          name,
-          product_url: `https://eda.yandex.ru/retail/${encodeURIComponent(context.group_slug)}/product/${encodeURIComponent(productId)}?placeSlug=${encodeURIComponent(context.place_slug)}`,
-        });
-      }
-      return { index, candidates };
-    });
-    const selectionToken = sealSelection({
+  return withBrowser(
+    scope,
+    (browser) => searchStoreInBrowser(browser, {
       scope,
       store,
-      operation_id: operationId,
-      context,
-      allowed,
-      expires_at: Date.now() + tokenLifetimeMs,
-    });
-    return {
-      status: "ready",
-      cart_url: context.store_url,
-      selection_token: selectionToken,
-      results,
-      elapsed_ms: Date.now() - started,
-    };
+      operationId,
+      ingredients,
+      started,
+    }),
+    { possible: false },
+    storeSite(store) === "lavka" ? lavkaStoreUrl : "https://eda.yandex.ru/retail",
+  );
+}
+
+function validateCompareRequest(body) {
+  const scope = text(body?.scope, 80);
+  if (!scopePattern.test(scope)) {
+    throw new OperationError("invalid_request", "Неверные границы операции с корзиной.");
+  }
+  const requested = Array.isArray(body?.stores) ? body.stores : [];
+  const unique = [...new Set(requested.map((store) => text(store, 32)))];
+  if (
+    !unique.length
+    || unique.length !== requested.length
+    || unique.length > Object.keys(stores).length
+    || unique.some((store) => !Object.hasOwn(stores, store))
+  ) {
+    throw new OperationError("invalid_request", "Неверный список магазинов для сравнения.");
+  }
+  const operationIds = body?.operation_ids && typeof body.operation_ids === "object"
+    ? body.operation_ids
+    : {};
+  const operations = unique.map((store) => {
+    const operationId = validateOperationId(operationIds[store]);
+    if (!operationId.endsWith(`-${store}`)) {
+      throw new OperationError("invalid_request", "Неверный идентификатор операции.");
+    }
+    return { store, operationId };
   });
+  const rawBudget = Number(body?.budget_ms);
+  const budgetMs = Number.isFinite(rawBudget)
+    ? Math.min(maximumCompareBudgetMs, Math.max(minimumCompareBudgetMs, rawBudget))
+    : defaultCompareBudgetMs;
+  return { scope, operations, budgetMs };
+}
+
+async function openExtraTab(scope, browser, url) {
+  await deferScopeRecovery(scope);
+  const opened = await camofoxRequest("/tabs", {
+    method: "POST",
+    body: JSON.stringify({
+      userId: browser.identity.user_id,
+      sessionKey: browser.identity.session_key,
+      url,
+    }),
+    timeout: 25_000,
+  });
+  const tabId = String(opened.tabId || opened.id || "");
+  if (!tabId) throw new OperationError("browser_unavailable", "Браузер не вернул вкладку.");
+  return { identity: browser.identity, tabId };
+}
+
+function storeOutcome(error) {
+  const body = errorBody(error);
+  delete body.mutation_possible;
+  return body;
+}
+
+// Search every requested store at once, each in its own tab of the one
+// persistent profile, and never touch a cart. A store that has not answered
+// when the shared budget runs out is reported as timed out and the whole
+// session is closed, which also stops its pending requests.
+async function compare(body, { budgetMs }) {
+  const { scope, operations } = validateCompareRequest(body);
+  const ingredients = validateIngredients(body);
+  const started = Date.now();
+  const storeDeadline = started + Math.max(1, budgetMs - compareCloseReserveMs);
+  const primary = await openBrowser(scope, storeStartUrl(operations[0].store));
+  const outcomes = Object.create(null);
+  let closeError = null;
+  try {
+    const tasks = operations.map(({ store, operationId }, index) => {
+      const task = (async () => {
+        const browser = index === 0
+          ? primary
+          : await openExtraTab(scope, primary, storeStartUrl(store));
+        const storeStarted = Date.now();
+        return searchStoreInBrowser(browser, {
+          scope,
+          store,
+          operationId,
+          ingredients,
+          started: storeStarted,
+          lifetimeMs: compareTokenLifetimeMs,
+        });
+      })();
+      // The timed-out branch keeps running until the session is closed; its
+      // late failure must not become an unhandled rejection.
+      task.catch(() => {});
+      let timer;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ status: "timeout", summary: "Магазин не ответил вовремя." }),
+          Math.max(1, storeDeadline - Date.now()),
+        );
+      });
+      return Promise.race([
+        task.then(
+          (result) => result,
+          (error) => storeOutcome(error),
+        ),
+        timeout,
+      ]).then((outcome) => {
+        clearTimeout(timer);
+        outcomes[store] = outcome;
+        if (outcome?.status !== "ready") {
+          console.warn("Cart comparison store did not finish", {
+            store,
+            status: outcome?.status,
+            summary: outcome?.summary,
+          });
+        }
+      });
+    });
+    await Promise.all(tasks);
+  } finally {
+    try {
+      await closeBrowser(primary.identity.user_id);
+    } catch (error) {
+      closeError = error;
+    }
+  }
+  if (closeError) throw markProfileUncertain(closeError);
+  return {
+    status: "ready",
+    stores: outcomes,
+    elapsed_ms: Date.now() - started,
+  };
 }
 
 function publicCartItems(cart) {
@@ -2366,11 +2766,22 @@ const handleRequest = async (request, response) => {
     return sendJson(response, 200, { status: "ok" });
   }
   if (!isAuthorized(request)) return sendJson(response, 401, { error: "unauthorized" });
-  if (request.method !== "POST" || !["/v1/search", "/v1/cart-state", "/v1/apply", "/v1/cleanup"].includes(url.pathname)) {
+  if (request.method !== "POST" || !["/v1/search", "/v1/compare", "/v1/cart-state", "/v1/apply", "/v1/cleanup"].includes(url.pathname)) {
     return sendJson(response, 404, { error: "not_found" });
   }
   try {
     const body = await readJson(request);
+    if (url.pathname === "/v1/compare") {
+      const { budgetMs } = validateCompareRequest(body);
+      return sendJson(
+        response,
+        200,
+        await runExclusiveOperation(
+          text(body?.scope, 80),
+          () => runWithOperationDeadline(() => compare(body, { budgetMs }), budgetMs),
+        ),
+      );
+    }
     const operation = url.pathname === "/v1/search" ? () => search(body)
       : url.pathname === "/v1/cart-state" ? () => cartState(body)
       : url.pathname === "/v1/apply" ? () => applySelection(body)
@@ -2411,6 +2822,8 @@ const server = tlsEnabled
   : http.createServer(handleRequest);
 
 server.requestTimeout = 180_000;
+// A comparison answers only after its budget (up to four minutes) ends.
+server.timeout = 0;
 server.headersTimeout = 10_000;
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   server.listen(port, bindHost, () => {
@@ -2420,7 +2833,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   chooseLavkaAddress,
+  validateCompareRequest,
+  edaAuthExpression,
   classifyStorefrontUrl,
+  cartPinVerdict,
+  cartPlaceExpression,
+  currentStorefront,
+  loadedPlaceSlug,
+  isSignedStorefront,
+  pageStateExpression,
   removeOperationRecord,
   searchQueries,
   storeSite,

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 
 from django.conf import settings
@@ -12,7 +13,13 @@ from django.utils import timezone
 from recipes.models import CartAttempt, CartItemMatch, CartRun
 from recipes.locking import CART_BROWSER_LOCK, acquire_application_lock
 
-from .client import CartAgentError, assemble_store_cart, cleanup_store_cart
+from .client import (
+    CartAgentError,
+    assemble_store_cart,
+    cleanup_store_cart,
+    compare_stores,
+    match_search_results,
+)
 from .coordination import (
     browser_login_session_blocks_worker,
     reconcile_expired_browser_login_sessions,
@@ -65,6 +72,50 @@ def _yandex_food_product_id(value) -> str:
     return product_id if PRODUCT_ID_PATTERN.fullmatch(product_id) else ""
 
 
+# The adapter signs comparison results for an hour; leave a margin for the
+# worker to pick the chosen store up and reach the apply call.
+COMPARISON_LIFETIME = timedelta(minutes=50)
+
+
+def maximum_browser_operation_seconds() -> int:
+    """Longest a single remote browser call may legitimately run."""
+    return max(
+        settings.CART_AI_TIMEOUT_SECONDS,
+        settings.CART_ADAPTER_TIMEOUT_SECONDS,
+        settings.CART_COMPARE_TIMEOUT_SECONDS + 60,
+    ) + 60
+
+
+def _price(value) -> Decimal | None:
+    try:
+        price = Decimal(str(value or "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not price.is_finite() or price <= 0 or price >= Decimal("100000000"):
+        return None
+    return price.quantize(Decimal("0.01"))
+
+
+def matches_total_price(matches) -> tuple[Decimal | None, bool]:
+    """Sum price × packages over found items; report whether every price was known."""
+    total = Decimal("0")
+    complete = True
+    found = False
+    for match in matches:
+        if _text(match.get("quality"), 16) == CartItemMatch.MatchQuality.MISSING:
+            continue
+        found = True
+        price = _price(match.get("price"))
+        count = _package_count(match.get("package_count"))
+        if price is None or count < 1:
+            complete = False
+            continue
+        total += price * count
+    if not found:
+        return None, True
+    return total, complete
+
+
 def _package_count(value, *, maximum: int = 100) -> int:
     try:
         return max(0, min(int(value or 0), maximum))
@@ -104,6 +155,11 @@ def _save_result(attempt: CartAttempt, data: dict) -> None:
                 product_name=product_name,
                 product_url=product_url,
                 package_count=package_count,
+                price=(
+                    _price(item.get("price"))
+                    if quality != CartItemMatch.MatchQuality.MISSING
+                    else None
+                ),
                 quality=quality,
                 warning=_text(item.get("warning"), 500),
                 order=order,
@@ -178,13 +234,33 @@ def _save_result(attempt: CartAttempt, data: dict) -> None:
         status = CartAttempt.Status.FAILED
         result["validation_error"] = "missing_safe_cart_url"
 
+    total_price, price_complete = matches_total_price(
+        [
+            {
+                "quality": match.quality,
+                "price": match.price,
+                "package_count": match.package_count,
+            }
+            for match in matches
+        ]
+    )
+    result["price_complete"] = price_complete
+
     attempt.status = status
     attempt.cart_url = cart_url
     attempt.summary = _text(data.get("summary"), 500)
     attempt.result = result
+    attempt.total_price = total_price
     attempt.finished_at = timezone.now()
     attempt.save(
-        update_fields=["status", "cart_url", "summary", "result", "finished_at"]
+        update_fields=[
+            "status",
+            "cart_url",
+            "summary",
+            "result",
+            "total_price",
+            "finished_at",
+        ]
     )
 
 
@@ -222,7 +298,7 @@ def finish_requested_cart_stop(
         attempt = (
             attempt
             or locked_run.selected_attempt
-            or locked_run.attempts.order_by("-started_at").first()
+            or latest_cart_attempt(locked_run)
         )
         attempt_result = (
             attempt.result if attempt and isinstance(attempt.result, dict) else {}
@@ -284,6 +360,21 @@ def finish_requested_cart_stop(
     return True
 
 
+def latest_cart_attempt(run: CartRun, queryset=None):
+    """The attempt that may have touched a cart.
+
+    In a comparison run every store has an attempt, but only the chosen store
+    is ever assembled.
+    """
+    attempts = queryset if queryset is not None else CartAttempt.objects.all()
+    attempts = attempts.filter(run=run)
+    if run.chosen_store:
+        return attempts.filter(store=run.chosen_store).first()
+    if run.comparison:
+        return None
+    return attempts.order_by("-started_at").first()
+
+
 def _reserve_browser_operation(run: CartRun) -> bool:
     """Serialize an external browser dispatch against a concurrent stop request."""
     with transaction.atomic():
@@ -342,11 +433,8 @@ def record_unexpected_browser_failure(
                 run=locked_run,
             ).first()
         if not locked_attempt:
-            locked_attempt = (
-                CartAttempt.objects.select_for_update()
-                .filter(run=locked_run)
-                .order_by("-started_at")
-                .first()
+            locked_attempt = latest_cart_attempt(
+                locked_run, CartAttempt.objects.select_for_update()
             )
         diagnostic = _text(error, 500)
         if locked_attempt:
@@ -636,11 +724,166 @@ def _best_attempt(run: CartRun):
     return max(candidates, key=score)
 
 
-def process_cart_run(run: CartRun) -> None:
-    while run.next_store_index < len(run.store_priority):
-        if finish_requested_cart_stop(run):
-            return
-        store = run.store_priority[run.next_store_index]
+COMPARISON_FAILURES = {
+    "login_required": (CartAttempt.Status.LOGIN_REQUIRED, "Нужно войти в Яндекс."),
+    "blocked": (CartAttempt.Status.BLOCKED, "Яндекс запросил ручную проверку."),
+    "incomplete": (CartAttempt.Status.FAILED, "Магазин недоступен по сохранённому адресу."),
+    "timeout": (CartAttempt.Status.FAILED, "Магазин не ответил вовремя."),
+    "failed": (CartAttempt.Status.FAILED, "Магазин не удалось проверить."),
+}
+
+
+def comparison_counts(matches) -> dict[str, int]:
+    counts = {quality: 0 for quality in MATCH_QUALITIES}
+    for match in matches:
+        quality = _text(match.get("quality"), 16)
+        if quality in counts:
+            counts[quality] += 1
+    return counts
+
+
+def _save_comparison(run: CartRun, attempt: CartAttempt, outcome: dict) -> None:
+    status = _text(outcome.get("status"), 24)
+    attempt.matches.all().delete()
+    attempt.cart_url = ""
+    attempt.total_price = None
+    attempt.finished_at = timezone.now()
+    result = {"provider": "yandex_api_adapter", "comparison_outcome": status}
+    matches = None
+    if status == "ready":
+        try:
+            matches = match_search_results(run, outcome)
+        except CartAgentError as error:
+            status = "failed"
+            result["comparison_outcome"] = status
+            result["error"] = _text(error, 500)
+        selection_token = _text(outcome.get("selection_token"), 60_000)
+        if matches is not None and not selection_token:
+            matches = None
+            status = "failed"
+            result["comparison_outcome"] = status
+    if matches is None:
+        attempt.status, default_summary = COMPARISON_FAILURES.get(
+            status, COMPARISON_FAILURES["failed"]
+        )
+        attempt.summary = _text(outcome.get("summary"), 500) or default_summary
+        attempt.result = result
+        attempt.save(
+            update_fields=[
+                "status",
+                "summary",
+                "result",
+                "cart_url",
+                "total_price",
+                "finished_at",
+            ]
+        )
+        return
+
+    counts = comparison_counts(matches)
+    if counts[CartItemMatch.MatchQuality.MISSING]:
+        attempt.status = CartAttempt.Status.INCOMPLETE
+    elif counts[CartItemMatch.MatchQuality.SUBSTITUTE]:
+        attempt.status = CartAttempt.Status.SUBSTITUTIONS
+    else:
+        attempt.status = CartAttempt.Status.EXACT
+    total_price, price_complete = matches_total_price(matches)
+    attempt.total_price = total_price
+    attempt.summary = (
+        f"Точно: {counts['exact']}, замены: {counts['substitute']}, "
+        f"не найдено: {counts['missing']}."
+    )
+    result.update({"counts": counts, "price_complete": price_complete})
+    attempt.result = result
+    attempt.comparison = {
+        "selection_token": selection_token,
+        "cart_url": _safe_yandex_food_url(outcome.get("cart_url")),
+        "elapsed_ms": outcome.get("elapsed_ms"),
+        "searched_at": timezone.now().isoformat(),
+        "matches": matches,
+    }
+    attempt.save(
+        update_fields=[
+            "comparison",
+            "status",
+            "summary",
+            "result",
+            "cart_url",
+            "total_price",
+            "finished_at",
+        ]
+    )
+    CartItemMatch.objects.bulk_create(
+        [
+            CartItemMatch(
+                attempt=attempt,
+                ingredient_name=_text(match.get("ingredient_name"), 180),
+                requested_quantity=_text(match.get("requested_quantity"), 80),
+                product_name=_text(match.get("product_name"), 300),
+                product_url=_safe_yandex_food_url(match.get("product_url")),
+                package_count=_package_count(match.get("package_count")),
+                price=(
+                    _price(match.get("price"))
+                    if match.get("quality") != CartItemMatch.MatchQuality.MISSING
+                    else None
+                ),
+                quality=match.get("quality"),
+                warning=_text(match.get("warning"), 500),
+                order=order,
+            )
+            for order, match in enumerate(matches)
+        ]
+    )
+
+
+def comparison_selection(attempt: CartAttempt | None) -> dict | None:
+    """The signed comparison of one store, if it can still be applied."""
+    if not attempt:
+        return None
+    comparison = attempt.comparison
+    if not isinstance(comparison, dict):
+        return None
+    try:
+        searched_at = datetime.fromisoformat(str(comparison.get("searched_at") or ""))
+    except ValueError:
+        return None
+    if timezone.is_naive(searched_at) or timezone.now() - searched_at > COMPARISON_LIFETIME:
+        return None
+    matches = comparison.get("matches")
+    if (
+        not comparison.get("selection_token")
+        or not isinstance(matches, list)
+        or len(matches) != len(attempt.run.ingredient_snapshot)
+        or not any(
+            isinstance(match, dict) and match.get("quality") != "missing"
+            for match in matches
+        )
+    ):
+        return None
+    return comparison
+
+
+def comparison_is_fresh(attempt: CartAttempt | None) -> bool:
+    return comparison_selection(attempt) is not None
+
+
+def _finish_stale_choice(run: CartRun) -> None:
+    run.status = CartRun.Status.FAILED
+    run.finished_at = timezone.now()
+    run.error = (
+        "Результат сравнения устарел: цены и наличие могли измениться. "
+        "Корзина не менялась — проверьте магазины заново."
+    )
+    run.save(update_fields=["status", "finished_at", "error"])
+
+
+def process_cart_comparison(run: CartRun) -> None:
+    """Search every store at once; never touch a cart."""
+    if finish_requested_cart_stop(run):
+        return
+    stores = list(run.store_priority)
+    attempts = {}
+    for store in stores:
         attempt, _ = CartAttempt.objects.update_or_create(
             run=run,
             store=store,
@@ -649,6 +892,102 @@ def process_cart_run(run: CartRun) -> None:
                 "cart_url": "",
                 "summary": "",
                 "result": {},
+                "comparison": {},
+                "total_price": None,
+                "finished_at": None,
+            },
+        )
+        attempt.matches.all().delete()
+        attempts[store] = attempt
+    if not _reserve_browser_operation(run):
+        finish_requested_cart_stop(run)
+        return
+    try:
+        outcomes = compare_stores(run, stores)
+    except Exception as error:
+        if not _browser_operation_is_current(run):
+            return
+        # The comparison never changes a cart, so a failure leaves nothing
+        # to clean up: release the reservation and let the user retry.
+        _release_browser_operation(run)
+        if finish_requested_cart_stop(run):
+            return
+        message = (
+            _text(error, 500)
+            if isinstance(error, CartAgentError)
+            else "Сравнение магазинов завершилось неожиданно."
+        )
+        CartAttempt.objects.filter(
+            run=run, status=CartAttempt.Status.PROCESSING
+        ).update(
+            status=CartAttempt.Status.FAILED,
+            summary=message,
+            finished_at=timezone.now(),
+        )
+        run.status = CartRun.Status.FAILED
+        run.error = message or "Сравнение магазинов не завершилось."
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error", "finished_at"])
+        if not isinstance(error, CartAgentError):
+            raise
+        return
+    if not _browser_operation_is_current(run):
+        return
+    try:
+        for store in stores:
+            _save_comparison(run, attempts[store], outcomes.get(store) or {})
+    finally:
+        _release_browser_operation(run)
+    if finish_requested_cart_stop(run):
+        return
+
+    statuses = {attempt.status for attempt in attempts.values()}
+    found = statuses & {
+        CartAttempt.Status.EXACT,
+        CartAttempt.Status.SUBSTITUTIONS,
+        CartAttempt.Status.INCOMPLETE,
+    }
+    run.finished_at = timezone.now()
+    run.selected_attempt = None
+    if found:
+        run.status = CartRun.Status.CHOOSING
+        run.error = ""
+    elif statuses & {CartAttempt.Status.LOGIN_REQUIRED, CartAttempt.Status.BLOCKED}:
+        run.status = CartRun.Status.LOGIN_REQUIRED
+        run.error = "Яндекс попросил войти или пройти проверку в браузере."
+    else:
+        run.status = CartRun.Status.FAILED
+        run.error = "Ни один магазин не удалось проверить."
+    run.save(update_fields=["status", "error", "finished_at", "selected_attempt"])
+
+
+def process_cart_run(run: CartRun) -> None:
+    if run.is_comparing:
+        process_cart_comparison(run)
+        return
+    while run.next_store_index < len(run.store_priority):
+        if finish_requested_cart_stop(run):
+            return
+        store = run.store_priority[run.next_store_index]
+        prepared = None
+        if run.chosen_store == store:
+            prepared = comparison_selection(
+                run.attempts.filter(store=store).select_related("run").first()
+            )
+            if prepared is None:
+                # Never fall back to a fresh search: it could add products
+                # the user has not reviewed. Nothing has touched the cart.
+                _finish_stale_choice(run)
+                return
+        attempt, _ = CartAttempt.objects.update_or_create(
+            run=run,
+            store=store,
+            defaults={
+                "status": CartAttempt.Status.PROCESSING,
+                "cart_url": "",
+                "summary": "",
+                "result": {},
+                "total_price": None,
                 "finished_at": None,
             },
         )
@@ -656,7 +995,7 @@ def process_cart_run(run: CartRun) -> None:
             finish_requested_cart_stop(run, attempt=attempt)
             return
         try:
-            data = assemble_store_cart(run, store)
+            data = assemble_store_cart(run, store, prepared)
         except CartAgentError as error:
             if not _browser_operation_is_current(run):
                 return
@@ -860,7 +1199,11 @@ def process_cart_run(run: CartRun) -> None:
             quality=CartItemMatch.MatchQuality.MISSING
         ).count()
         cleanup_threshold = max(2, math.ceil(len(run.ingredient_snapshot) * 0.25))
-        if attempt_needs_cleanup(attempt) and missing_count >= cleanup_threshold:
+        if (
+            attempt_needs_cleanup(attempt)
+            and missing_count >= cleanup_threshold
+            and not run.chosen_store
+        ):
             try:
                 cleanup_status = _cleanup_attempt(run, attempt)
             except CartAgentError:
@@ -887,7 +1230,13 @@ def process_cart_run(run: CartRun) -> None:
             _finish_ready_run(run, attempt)
             return
 
-    best = _best_attempt(run)
+    if run.chosen_store:
+        # Other stores' attempts are comparison results, not carts.
+        best = run.attempts.filter(store=run.chosen_store).exclude(
+            status=CartAttempt.Status.PROCESSING
+        ).first()
+    else:
+        best = _best_attempt(run)
     run.selected_attempt = best
     run.finished_at = timezone.now()
     run.confirmation_deadline = None

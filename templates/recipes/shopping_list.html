@@ -18,11 +18,11 @@
   <section class="cart-builder-intro">
     <div>
       <p class="eyebrow">Автосборка</p>
-      <h2>Готовая корзина в выбранном магазине</h2>
-      <p>Быстрый адаптер проверит доставку по сохранённому адресу, параллельно подберёт упаковки и добавит их в выбранный магазин. Если корзину не подтвердить, сервис проверит добавления и при необходимости попросит удалить их вручную.</p>
+      <h2>Сравнение магазинов</h2>
+      <p>Сервис параллельно проверит наличие и цены отмеченных продуктов во всех магазинах по сохранённому адресу и покажет, где сколько нашлось и во сколько обойдётся набор. Корзины при этом не меняются: товары добавятся только в тот магазин, который вы выберете.</p>
     </div>
     <label class="store-picker">
-      <span>Магазин для заказа</span>
+      <span>Ссылки «Найти» ведут в</span>
       <select name="store" form="shopping-list-form" data-store-select>
         {% for option in store_options %}
           <option value="{{ option.value }}" data-search-brand="{{ option.search_brand }}" data-search-place="{{ option.search_place }}"{% if option.value == selected_store.store %} selected{% endif %}>{{ option.label }}</option>
@@ -48,7 +48,7 @@
       <p><strong>{{ items|length }}</strong> позиций</p>
       <div class="action-row">
         <button class="button button-secondary" type="button" data-copy-list>Скопировать список</button>
-        <button class="button" type="submit">Собрать корзину</button>
+        <button class="button" type="submit">Сравнить магазины</button>
       </div>
     </div>
     <ul class="shopping-items">

@@ -3,6 +3,7 @@ import re
 import secrets
 import unicodedata
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from django.conf import settings
@@ -38,7 +39,12 @@ from .carting.coordination import (
     reconcile_missing_browser_login_session,
     resume_cart_run_after_login,
 )
-from .carting.pipeline import attempt_needs_cleanup
+from .carting.pipeline import (
+    attempt_needs_cleanup,
+    comparison_is_fresh,
+    latest_cart_attempt,
+    maximum_browser_operation_seconds,
+)
 from .forms import (
     ImportRecipeForm,
     IngredientFormSet,
@@ -1065,32 +1071,13 @@ def cart_start(request, slug):
         messages.error(request, "Выберите хотя бы один ингредиент.")
         return redirect(f"{reverse('shopping-list', args=[recipe.slug])}?servings={servings}")
 
-    active = CartRun.objects.filter(
-        requested_by=request.user,
-    ).filter(
-        Q(
-            status__in=[
-                CartRun.Status.PENDING,
-                CartRun.Status.PROCESSING,
-                CartRun.Status.CLEANUP_PENDING,
-                CartRun.Status.CLEANING,
-                CartRun.Status.MANUAL_CHECK,
-            ]
-        )
-        | Q(cleanup_requested_at__isnull=False, cleaned_at__isnull=True)
-    ).first()
-    if active:
-        messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
-        return redirect("cart-detail", pk=active.pk)
-
     requested_store = request.POST.get("store", "")
-    try:
-        selected_store = select_store(request.user, requested_store)
-    except ValueError:
-        messages.error(request, "Выберите магазин для заказа.")
-        return redirect(
-            f"{reverse('shopping-list', args=[recipe.slug])}?servings={servings}"
-        )
+    if requested_store:
+        # The selector only chooses where «Найти в …» links lead.
+        try:
+            select_store(request.user, requested_store)
+        except ValueError:
+            pass
 
     snapshot = [
         {
@@ -1104,18 +1091,131 @@ def cart_start(request, slug):
         }
         for item in items
     ]
-    run = CartRun.objects.create(
+    with transaction.atomic():
+        _lock_cart_queue(request.user)
+        active = _active_cart_run(request.user)
+        if active:
+            messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+            return redirect("cart-detail", pk=active.pk)
+        run = _start_store_comparison(recipe, request.user, servings, snapshot)
+    messages.success(request, "Проверяем наличие и цены во всех магазинах.")
+    return redirect("cart-detail", pk=run.pk)
+
+
+def _lock_cart_queue(user):
+    """Serialize queueing cart work for one user.
+
+    The check that no other run is active and the transition that makes a run
+    active must not interleave: two runs queued at once would both assemble
+    into the same store cart.
+    """
+    get_user_model().objects.select_for_update().only("pk").get(pk=user.pk)
+
+
+def _start_store_comparison(recipe, user, servings, snapshot):
+    return CartRun.objects.create(
         recipe=recipe,
-        requested_by=request.user,
+        requested_by=user,
         servings=servings,
-        store_priority=[selected_store.store],
+        store_priority=[choice[0] for choice in StorePreference.Store.choices],
         ingredient_snapshot=snapshot,
+        comparison=True,
     )
+
+
+def _active_cart_run(user):
+    return CartRun.objects.filter(requested_by=user).filter(
+        Q(
+            status__in=[
+                CartRun.Status.PENDING,
+                CartRun.Status.PROCESSING,
+                CartRun.Status.CLEANUP_PENDING,
+                CartRun.Status.CLEANING,
+                CartRun.Status.MANUAL_CHECK,
+            ]
+        )
+        | Q(cleanup_requested_at__isnull=False, cleaned_at__isnull=True)
+    ).first()
+
+
+@login_required
+@require_POST
+def cart_choose(request, pk):
+    run = get_object_or_404(CartRun, pk=pk, requested_by=request.user)
+    if run.status != CartRun.Status.CHOOSING:
+        messages.info(request, "Магазин для этой сборки уже выбран.")
+        return redirect("cart-detail", pk=run.pk)
+    store = request.POST.get("store", "")
+    attempt = run.attempts.filter(store=store).select_related("run").first()
+    if not attempt or attempt.status not in {
+        CartAttempt.Status.EXACT,
+        CartAttempt.Status.SUBSTITUTIONS,
+        CartAttempt.Status.INCOMPLETE,
+    }:
+        messages.error(request, "В этом магазине нечего добавить в корзину.")
+        return redirect("cart-detail", pk=run.pk)
+    if not comparison_is_fresh(attempt):
+        messages.error(
+            request,
+            "Результаты сравнения устарели: цены и наличие могли измениться. "
+            "Проверьте магазины заново.",
+        )
+        return redirect("cart-detail", pk=run.pk)
+    with transaction.atomic():
+        _lock_cart_queue(request.user)
+        active = _active_cart_run(request.user)
+        if active and active.pk != run.pk:
+            messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+            return redirect("cart-detail", pk=active.pk)
+        # The conditional update is the only transition out of CHOOSING.
+        updated = CartRun.objects.filter(
+            pk=run.pk,
+            status=CartRun.Status.CHOOSING,
+            cancellation_requested_at__isnull=True,
+        ).update(
+            status=CartRun.Status.PENDING,
+            chosen_store=store,
+            store_priority=[store],
+            next_store_index=0,
+            finished_at=None,
+            error="",
+        )
+    if not updated:
+        messages.info(request, "Магазин для этой сборки уже выбран.")
+        return redirect("cart-detail", pk=run.pk)
     messages.success(
         request,
-        f"Сборка запущена в магазине «{selected_store.get_store_display()}».",
+        f"Добавляем товары в корзину магазина «{attempt.get_store_display()}».",
     )
     return redirect("cart-detail", pk=run.pk)
+
+
+@login_required
+@require_POST
+def cart_compare_again(request, pk):
+    with transaction.atomic():
+        # Under the user's queue lock a concurrent cart_choose either commits
+        # first (the run is then active and blocks a new comparison) or sees
+        # the run cancelled.
+        _lock_cart_queue(request.user)
+        run = get_object_or_404(
+            CartRun.objects.select_for_update().select_related("recipe"),
+            pk=pk,
+            requested_by=request.user,
+        )
+        active = _active_cart_run(request.user)
+        if active:
+            messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+            return redirect("cart-detail", pk=active.pk)
+        if run.status == CartRun.Status.CHOOSING:
+            run.status = CartRun.Status.CANCELLED
+            run.cleaned_at = timezone.now()
+            run.save(update_fields=["status", "cleaned_at"])
+        next_run = _start_store_comparison(
+            run.recipe, request.user, run.servings, run.ingredient_snapshot
+        )
+    messages.success(request, "Проверяем магазины заново.")
+    return redirect("cart-detail", pk=next_run.pk)
 
 
 @login_required
@@ -1128,7 +1228,13 @@ def cart_detail(request, pk):
         requested_by=request.user,
     )
     attempts = list(run.attempts.all())
-    status_attempt = run.selected_attempt or (attempts[-1] if attempts else None)
+    if run.comparison:
+        status_attempt = run.selected_attempt or next(
+            (attempt for attempt in attempts if attempt.store == run.chosen_store),
+            None,
+        )
+    else:
+        status_attempt = run.selected_attempt or (attempts[-1] if attempts else None)
     matches_by_name = {}
     for match in status_attempt.matches.all() if status_attempt else []:
         matches_by_name.setdefault(match.ingredient_name.casefold(), []).append(match)
@@ -1171,11 +1277,89 @@ def cart_detail(request, pk):
                 "match": match,
             }
         )
+    comparison_rows = _comparison_rows(run, attempts) if run.comparison else []
     return render(
         request,
         "recipes/cart_detail.html",
-        {"run": run, "cart_item_statuses": item_statuses},
+        {
+            "run": run,
+            "cart_item_statuses": [] if run.is_comparing else item_statuses,
+            "comparison_rows": comparison_rows,
+            "compare_minutes": max(1, round(settings.CART_COMPARE_TIMEOUT_SECONDS / 60)),
+            "comparison_stores": [
+                label
+                for value, label in StorePreference.Store.choices
+                if value in run.store_priority
+            ],
+        },
     )
+
+
+FOUND_ATTEMPT_STATUSES = {
+    CartAttempt.Status.EXACT,
+    CartAttempt.Status.SUBSTITUTIONS,
+    CartAttempt.Status.INCOMPLETE,
+}
+
+
+def _comparison_rows(run, attempts):
+    """One row per store, best offers first, with match counts and prices."""
+    rows = []
+    for attempt in attempts:
+        if attempt.status == CartAttempt.Status.PROCESSING:
+            continue
+        matches = list(attempt.matches.all())
+        counts = {"exact": 0, "substitute": 0, "missing": 0}
+        for match in matches:
+            counts[match.quality] = counts.get(match.quality, 0) + 1
+        found = attempt.status in FOUND_ATTEMPT_STATUSES and bool(matches)
+        result = attempt.result if isinstance(attempt.result, dict) else {}
+        rows.append(
+            {
+                "attempt": attempt,
+                "store": attempt.store,
+                "label": attempt.get_store_display(),
+                "found": found,
+                "matches": matches,
+                "exact": counts["exact"],
+                "substitute": counts["substitute"],
+                "missing": counts["missing"],
+                "total_price": attempt.total_price,
+                "price_complete": result.get("price_complete", True),
+                "has_products": found and counts["exact"] + counts["substitute"] > 0,
+                "can_choose": (
+                    run.status == CartRun.Status.CHOOSING
+                    and found
+                    and counts["exact"] + counts["substitute"] > 0
+                    and comparison_is_fresh(attempt)
+                ),
+                "chosen": attempt.store == run.chosen_store,
+                "best": False,
+            }
+        )
+    found_rows = [row for row in rows if row["found"]]
+    if found_rows:
+        fewest_missing = min(row["missing"] for row in found_rows)
+        # Only a total with every price known can be the cheapest; a partial
+        # sum is a lower bound and would win unfairly.
+        priced = [
+            row
+            for row in found_rows
+            if row["missing"] == fewest_missing
+            and row["total_price"] is not None
+            and row["price_complete"]
+        ]
+        if priced:
+            min(priced, key=lambda row: row["total_price"])["best"] = True
+    rows.sort(
+        key=lambda row: (
+            not row["found"],
+            row["missing"],
+            row["total_price"] if row["total_price"] is not None else Decimal("1e12"),
+            row["substitute"],
+        )
+    )
+    return rows
 
 
 @login_required
@@ -1391,11 +1575,9 @@ def cart_stop(request, pk):
         run.cancellation_requested_at = now
         stale_reservation = bool(run.browser_operation_started_at)
         if run.status in {CartRun.Status.PROCESSING, CartRun.Status.CLEANING}:
-            maximum_operation_seconds = max(
-                settings.CART_AI_TIMEOUT_SECONDS,
-                settings.CART_ADAPTER_TIMEOUT_SECONDS,
-            ) + 60
-            reservation_cutoff = now - timedelta(seconds=maximum_operation_seconds)
+            reservation_cutoff = now - timedelta(
+                seconds=maximum_browser_operation_seconds()
+            )
             if (
                 run.browser_operation_started_at
                 and run.browser_operation_started_at > reservation_cutoff
@@ -1436,7 +1618,7 @@ def cart_stop(request, pk):
         if run.selected_attempt_id:
             attempt = attempts.filter(pk=run.selected_attempt_id).first()
         if not attempt:
-            attempt = attempts.filter(run=run).order_by("-started_at").first()
+            attempt = latest_cart_attempt(run, attempts)
         if attempt:
             run.selected_attempt = attempt
         mutation_unknown = bool(
