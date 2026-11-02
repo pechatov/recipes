@@ -12,6 +12,14 @@
       <div class="status-orb is-working">…</div>
       <h2>Останавливаем сборку</h2>
       <p>Текущая операция с браузером должна безопасно завершиться. После этого задача остановится автоматически.</p>
+    {% elif run.is_comparing and run.status == 'pending' or run.is_comparing and run.status == 'processing' %}
+      <div class="status-orb is-working">…</div>
+      <h2>{% if run.status == 'pending' %}Ожидает своей очереди{% else %}Сравниваем магазины{% endif %}</h2>
+      <p>Параллельно проверяем наличие и цены в магазинах: {{ comparison_stores|join:", " }}. Корзины пока не меняются. Это займёт не больше {{ compare_minutes }} мин.; магазин, который не успеет ответить, пропустим. Эту страницу можно закрыть.</p>
+    {% elif run.status == 'choosing' %}
+      <div class="status-orb is-done">✓</div>
+      <h2>Выберите магазин</h2>
+      <p>Сравните, сколько продуктов нашлось и во сколько обойдётся набор. После выбора предложенные товары добавятся в корзину этого магазина, а дальше вы работаете с ней сами. Заказ не оформляется.</p>
     {% elif run.status == 'pending' or run.status == 'processing' %}
       <div class="status-orb is-working">…</div>
       <h2>{% if run.status == 'pending' %}Ожидает своей очереди{% else %}Сервис собирает корзину{% endif %}</h2>
@@ -97,7 +105,13 @@
           <button class="button button-secondary" type="submit">Я проверил и удалил добавления</button>
         </form>
       {% endif %}
-      {% if run.status == 'completed' or run.status == 'review' %}
+      {% if run.comparison and run.status != 'pending' and run.status != 'processing' and run.status != 'cleanup_pending' and run.status != 'cleaning' and run.status != 'manual_check' %}
+        <form method="post" action="{% url 'cart-compare-again' run.pk %}">
+          {% csrf_token %}
+          <button class="button button-secondary" type="submit">Проверить магазины заново</button>
+        </form>
+      {% endif %}
+      {% if not run.comparison and run.status == 'completed' or not run.comparison and run.status == 'review' %}
         {% if run.next_store_index < run.store_priority|length %}
         <form method="post" action="{% url 'cart-continue' run.pk %}">
           {% csrf_token %}
@@ -108,11 +122,25 @@
       {% if run.can_stop %}
         <form method="post" action="{% url 'cart-stop' run.pk %}">
           {% csrf_token %}
-          <button class="button button-danger" type="submit">{% if run.stop_is_pending %}Проверить остановку ещё раз{% else %}Остановить сборку{% endif %}</button>
+          <button class="button button-danger" type="submit">{% if run.stop_is_pending %}Проверить остановку ещё раз{% elif run.status == 'choosing' %}Отменить{% else %}Остановить сборку{% endif %}</button>
         </form>
       {% endif %}
     </div>
   </section>
+
+  {% if comparison_rows %}
+    <section class="store-comparison">
+      {% if run.status == 'choosing' %}
+        <h2>Сравнение магазинов</h2>
+        {% include "recipes/_store_comparison.html" %}
+      {% else %}
+        <details>
+          <summary><h2>Сравнение магазинов</h2></summary>
+          {% include "recipes/_store_comparison.html" %}
+        </details>
+      {% endif %}
+    </section>
+  {% endif %}
 
   {% if run.selected_attempt %}
     <section class="selected-cart-result">
@@ -133,7 +161,7 @@
             </div>
             <div>
               {% if match.product_url %}<a href="{{ match.product_url }}" target="_blank" rel="noopener noreferrer">{{ match.product_name|default:"Открыть товар" }} ↗</a>{% else %}<strong>{{ match.product_name|default:"Не найдено" }}</strong>{% endif %}
-              {% if match.package_count %}<span>{{ match.package_count }} уп.</span>{% endif %}
+              {% if match.package_count %}<span>{{ match.package_count }} уп.{% if match.line_total != None %} · {{ match.line_total|floatformat:"-2g" }} ₽{% endif %}</span>{% endif %}
               {% if match.warning %}<p class="match-warning">{{ match.warning }}</p>{% endif %}
             </div>
             <span class="match-quality">{{ match.get_quality_display }}</span>

@@ -82,7 +82,7 @@ class CartViewTests(TestCase):
         preferences = get_store_preferences(self.user)
         self.assertEqual(
             [item.store for item in preferences],
-            ["auchan", "perekrestok", "pyaterochka", "magnit", "lavka"],
+            ["auchan", "perekrestok", "pyaterochka", "magnit", "lavka", "chizhik"],
         )
         self.assertEqual(
             [item.store for item in preferences if item.enabled],
@@ -100,12 +100,24 @@ class CartViewTests(TestCase):
         )
         run = CartRun.objects.get()
         self.assertRedirects(response, reverse("cart-detail", args=[run.pk]))
-        self.assertEqual(run.store_priority, [StorePreference.Store.PEREKRESTOK])
+        # Every store is compared; the selector only remembers where the
+        # «Найти» links lead.
+        self.assertTrue(run.comparison)
+        self.assertEqual(run.chosen_store, "")
+        self.assertEqual(
+            run.store_priority,
+            [value for value, _ in StorePreference.Store.choices],
+        )
+        self.assertEqual(
+            get_store_preferences(self.user)[1].enabled,
+            True,
+        )
         self.assertEqual(run.ingredient_snapshot[0]["name"], "Картофель")
         self.assertEqual(run.ingredient_snapshot[0]["quantity"], "800")
         detail = self.client.get(reverse("cart-detail", args=[run.pk]))
         self.assertNotContains(detail, "Соль")
-        self.assertContains(detail, "В очереди")
+        self.assertContains(detail, "Ожидает своей очереди")
+        self.assertContains(detail, "Чижик")
 
     def test_cart_run_is_private_to_requesting_user(self):
         run = CartRun.objects.create(
@@ -2781,7 +2793,7 @@ class CartPipelineTests(TestCase):
         self.assertIsNotNone(run.confirmation_deadline)
         self.assertEqual(run.selected_attempt.status, CartAttempt.Status.EXACT)
         self.assertEqual(run.selected_attempt.matches.get().quality, CartItemMatch.MatchQuality.EXACT)
-        assemble.assert_called_once_with(run, "auchan")
+        assemble.assert_called_once_with(run, "auchan", None)
 
     @patch("recipes.carting.pipeline.assemble_store_cart")
     def test_cleanup_journal_uses_only_bounded_snapshot_items(self, assemble):

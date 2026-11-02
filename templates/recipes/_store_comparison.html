@@ -1,0 +1,53 @@
+<div class="comparison-list">
+  {% for row in comparison_rows %}
+    <article class="comparison-card{% if row.best %} is-best{% endif %}{% if row.chosen %} is-chosen{% endif %}{% if not row.found %} is-unavailable{% endif %}">
+      <header class="comparison-head">
+        <div>
+          <h3>{{ row.label }}</h3>
+          {% if row.chosen %}<span class="comparison-badge">Выбран</span>{% elif row.best %}<span class="comparison-badge">Дешевле всего</span>{% endif %}
+        </div>
+        {% if row.found %}
+          <div class="comparison-price">
+            {% if row.total_price != None %}<strong>{% if not row.price_complete %}от {% endif %}{{ row.total_price|floatformat:"-2g" }} ₽</strong>{% else %}<strong>—</strong>{% endif %}
+            {% if row.missing %}<small>без {{ row.missing }} поз.</small>{% endif %}
+          </div>
+        {% endif %}
+      </header>
+      {% if row.found %}
+        <ul class="comparison-counts">
+          <li class="count-exact"><strong>{{ row.exact }}</strong> точно</li>
+          <li class="count-substitute"><strong>{{ row.substitute }}</strong> замены</li>
+          <li class="count-missing"><strong>{{ row.missing }}</strong> нет</li>
+        </ul>
+        <details class="comparison-details">
+          <summary>Что предлагается</summary>
+          <ul>
+            {% for match in row.matches %}
+              <li class="comparison-item match-{{ match.quality }}">
+                <span class="comparison-ingredient">{{ match.ingredient_name }}{% if match.requested_quantity %} <small>{{ match.requested_quantity }}</small>{% endif %}</span>
+                <span class="comparison-product">
+                  {% if match.quality == 'missing' %}Не найдено{% elif match.product_url %}<a href="{{ match.product_url }}" target="_blank" rel="noopener noreferrer">{{ match.product_name }} ↗</a>{% else %}{{ match.product_name }}{% endif %}
+                  {% if match.package_count and match.quality != 'missing' %}<small>{{ match.package_count }} уп.{% if match.price != None %} × {{ match.price|floatformat:"-2g" }} ₽{% endif %}</small>{% endif %}
+                </span>
+                <span class="comparison-quality">{{ match.get_quality_display }}</span>
+              </li>
+            {% endfor %}
+          </ul>
+        </details>
+        {% if row.can_choose %}
+          <form method="post" action="{% url 'cart-choose' run.pk %}">
+            {% csrf_token %}
+            <input type="hidden" name="store" value="{{ row.store }}">
+            <button class="button{% if not row.best %} button-secondary{% endif %}" type="submit">Собрать в «{{ row.label }}»</button>
+          </form>
+        {% elif not row.has_products %}
+          <p class="comparison-note">Подходящих товаров не нашлось.</p>
+        {% elif run.status == 'choosing' %}
+          <p class="comparison-note">Результат устарел — проверьте магазины заново.</p>
+        {% endif %}
+      {% else %}
+        <p class="comparison-note">{{ row.attempt.summary|default:row.attempt.get_status_display }}</p>
+      {% endif %}
+    </article>
+  {% endfor %}
+</div>

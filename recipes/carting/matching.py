@@ -130,6 +130,14 @@ def _decimal(value: Any) -> Decimal | None:
     return number
 
 
+def package_price(candidate: dict[str, Any]) -> Decimal | None:
+    """Price of one package as the store reported it, or None when unknown."""
+    price = _decimal(candidate.get("price"))
+    if price is None:
+        return None
+    return price.quantize(Decimal("0.01"))
+
+
 def _unit(value: Any) -> tuple[str, Decimal] | None:
     normalized = _normalized_text(value).rstrip(".")
     aliases = {
@@ -248,6 +256,7 @@ def _missing(ingredient: dict[str, Any], warning: str) -> dict[str, Any]:
         "package_count": 0,
         "added_package_count": 0,
         "available_stock": None,
+        "price": "",
         "quality": "missing",
         "warning": warning,
     }
@@ -296,6 +305,7 @@ def enforce_aggregate_stock(matches: list[dict[str, Any]]) -> list[dict[str, Any
                 "package_count": 0,
                 "added_package_count": 0,
                 "available_stock": None,
+                "price": "",
                 "quality": "missing",
                 "warning": (
                     "Суммарное количество выбранного товара превышает "
@@ -380,6 +390,7 @@ def choose_product(
         "package_count": package_count,
         "added_package_count": 0,
         "available_stock": _available_stock(candidate),
+        "price": str(package_price(candidate) or ""),
         "quality": quality,
         "warning": " ".join(warnings),
     }

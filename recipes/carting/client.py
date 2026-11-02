@@ -51,12 +51,15 @@ STORE_INSTRUCTIONS = {
         "https://eda.yandex.ru/retail",
         "Яндекс Еда · Магазины",
     ),
+    "chizhik": ("Чижик", "https://eda.yandex.ru/retail", "Яндекс Еда · Магазины"),
 }
 
 # The Hermes browser agent is prompted for the Yandex Food «Магазины» UI and
 # must never improvise on lavka.yandex.ru; Лавка is assembled only by the
 # deterministic adapter.
-ADAPTER_ONLY_STORES = {"lavka"}
+# Чижик is missing from the «Магазины» landing page the agent is told to use;
+# only the adapter opens its brand storefront directly.
+ADAPTER_ONLY_STORES = {"lavka", "chizhik"}
 
 
 ASSEMBLE_PROMPT = """Ты агент-сборщик продуктовой корзины для семейной книги рецептов. Используй только браузерные инструменты.
@@ -288,6 +291,7 @@ def _run_adapter_task(
     payload: dict[str, Any],
     *,
     mutation_possible: bool,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     if not settings.CART_ADAPTER_BASE_URL or not settings.CART_ADAPTER_API_KEY:
         raise CartAgentError("Быстрый адаптер корзины ещё не подключён.")
@@ -297,7 +301,7 @@ def _run_adapter_task(
     }
     try:
         with httpx.Client(
-            timeout=settings.CART_ADAPTER_TIMEOUT_SECONDS,
+            timeout=timeout or settings.CART_ADAPTER_TIMEOUT_SECONDS,
             trust_env=False,
             verify=_adapter_tls_context(),
         ) as client:
@@ -367,32 +371,141 @@ def _adapter_operation_id(run, store: str) -> str:
     return f"cart-run-{run.pk}-{created}-{store}"
 
 
+def _adapter_ingredients(run) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": ingredient.get("name", ""),
+            "search_query": ingredient.get("search_query", ""),
+            "quantity": ingredient.get("quantity", ""),
+            "unit": ingredient.get("unit", ""),
+        }
+        for ingredient in run.ingredient_snapshot
+        if isinstance(ingredient, dict)
+    ]
+
+
 def _search_with_adapter(run, store: str) -> dict[str, Any]:
     scope = cart_browser_session_key(run.requested_by_id)
-    ingredients = run.ingredient_snapshot
     return _run_adapter_task(
         "/v1/search",
         {
             "scope": scope,
             "store": store,
             "operation_id": _adapter_operation_id(run, store),
-            "ingredients": [
-                {
-                    "name": ingredient.get("name", ""),
-                    "search_query": ingredient.get("search_query", ""),
-                    "quantity": ingredient.get("quantity", ""),
-                    "unit": ingredient.get("unit", ""),
-                }
-                for ingredient in ingredients
-                if isinstance(ingredient, dict)
-            ],
+            "ingredients": _adapter_ingredients(run),
         },
         mutation_possible=False,
     )
 
 
-def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
+COMPARISON_OUTCOMES = {"ready", "login_required", "blocked", "incomplete", "failed", "timeout"}
+
+
+def compare_stores(run, stores: list[str]) -> dict[str, dict[str, Any]]:
+    """Search every store in parallel without changing any cart.
+
+    Returns the adapter outcome per store. A store missing from the answer, or
+    one that did not finish within the shared budget, gets a "timeout" outcome.
+    """
+    if not settings.CART_ADAPTER_BASE_URL or not settings.CART_ADAPTER_API_KEY:
+        raise CartAgentError("Сравнение магазинов требует подключённый адаптер корзины.")
+    budget = settings.CART_COMPARE_TIMEOUT_SECONDS
+    data = _run_adapter_task(
+        "/v1/compare",
+        {
+            "scope": cart_browser_session_key(run.requested_by_id),
+            "stores": stores,
+            "operation_ids": {
+                store: _adapter_operation_id(run, store) for store in stores
+            },
+            "budget_ms": budget * 1000,
+            "ingredients": _adapter_ingredients(run),
+        },
+        mutation_possible=False,
+        # The adapter answers right after the budget; allow for closing the
+        # browser and delivering the response.
+        timeout=budget + 60,
+    )
+    if data.get("mutation_possible") is True:
+        raise CartAgentError(
+            str(data.get("summary") or "Профиль корзины не был безопасно освобождён."),
+            mutation_possible=True,
+        )
+    if str(data.get("status") or "") in {"login_required", "blocked"}:
+        return {
+            store: {"status": data["status"], "summary": str(data.get("summary") or "")}
+            for store in stores
+        }
+    raw = data.get("stores")
+    if str(data.get("status") or "") != "ready" or not isinstance(raw, dict):
+        raise CartAgentError(
+            str(data.get("summary") or "Сравнение магазинов не завершилось.")
+        )
+    outcomes = {}
+    for store in stores:
+        outcome = raw.get(store)
+        if not isinstance(outcome, dict):
+            outcome = {"status": "timeout", "summary": "Магазин не ответил вовремя."}
+        status = str(outcome.get("status") or "")
+        if status not in COMPARISON_OUTCOMES:
+            outcome = {"status": "failed", "summary": str(outcome.get("summary") or "")}
+        outcomes[store] = outcome
+    return outcomes
+
+
+def match_search_results(run, search: dict[str, Any]) -> list[dict[str, Any]]:
+    """Choose a product for every ingredient from a ready adapter search."""
+    raw_results = search.get("results")
+    if not isinstance(raw_results, list):
+        raise CartAgentError("Быстрый поиск вернул неполный ответ.")
+    by_index = {}
+    for result in raw_results:
+        if not isinstance(result, dict) or not isinstance(result.get("index"), int):
+            continue
+        candidates = result.get("candidates")
+        by_index.setdefault(
+            result["index"],
+            candidates if isinstance(candidates, list) else [],
+        )
+    ingredients = run.ingredient_snapshot
+    if len(by_index) != len(ingredients) or any(
+        index not in by_index for index in range(len(ingredients))
+    ):
+        raise CartAgentError("Быстрый поиск пропустил часть ингредиентов.")
+    return enforce_aggregate_stock(
+        [
+            choose_product(ingredient, by_index[index])
+            for index, ingredient in enumerate(ingredients)
+        ]
+    )
+
+
+def _assemble_with_adapter(
+    run,
+    store: str,
+    prepared: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Search (or reuse a comparison) and add the chosen products.
+
+    ``prepared`` holds a comparison already made for this store: its
+    selection token and the matches the user reviewed. Those exact products
+    are added, even when some ingredients are missing, because the user chose
+    the store knowing that.
+    """
+    if prepared:
+        return _apply_with_adapter(
+            run,
+            store,
+            selection_token=str(prepared.get("selection_token") or ""),
+            matches=[dict(match) for match in prepared.get("matches") or []],
+            cart_url=str(prepared.get("cart_url") or ""),
+            search_elapsed_ms=prepared.get("elapsed_ms"),
+            allow_partial=True,
+        )
     search = _search_with_adapter(run, store)
+    # A store the user chose from a comparison is assembled with whatever
+    # was found there; the user already saw what is missing.
+    allow_partial = bool(getattr(run, "chosen_store", ""))
     search_status = str(search.get("status") or "")
     reported_mutation = search.get("mutation_possible")
     if reported_mutation is True:
@@ -424,35 +537,36 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
             ),
         )
 
-    raw_results = search.get("results")
     selection_token = str(search.get("selection_token") or "")
-    if not isinstance(raw_results, list) or not selection_token:
+    if not isinstance(search.get("results"), list) or not selection_token:
         raise CartAgentError("Быстрый поиск вернул неполный ответ.")
-    by_index = {}
-    for result in raw_results:
-        if not isinstance(result, dict) or not isinstance(result.get("index"), int):
-            continue
-        candidates = result.get("candidates")
-        by_index.setdefault(
-            result["index"],
-            candidates if isinstance(candidates, list) else [],
-        )
-    ingredients = run.ingredient_snapshot
-    if len(by_index) != len(ingredients) or any(
-        index not in by_index for index in range(len(ingredients))
-    ):
-        raise CartAgentError("Быстрый поиск пропустил часть ингредиентов.")
-
-    matches = enforce_aggregate_stock(
-        [
-            choose_product(ingredient, by_index[index])
-            for index, ingredient in enumerate(ingredients)
-        ]
+    return _apply_with_adapter(
+        run,
+        store,
+        selection_token=selection_token,
+        matches=match_search_results(run, search),
+        cart_url=str(search.get("cart_url") or ""),
+        search_elapsed_ms=search.get("elapsed_ms"),
+        allow_partial=allow_partial,
     )
+
+
+def _apply_with_adapter(
+    run,
+    store: str,
+    *,
+    selection_token: str,
+    matches: list[dict[str, Any]],
+    cart_url: str,
+    search_elapsed_ms: Any = None,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    if not selection_token or len(matches) != len(run.ingredient_snapshot):
+        raise CartAgentError("Результат поиска неполон; проверьте магазины заново.")
     missing_count = sum(match["quality"] == "missing" for match in matches)
     cleanup_threshold = max(2, math.ceil(len(matches) * 0.25))
     selected = [match for match in matches if match["quality"] != "missing"]
-    if not selected or missing_count >= cleanup_threshold:
+    if not selected or (not allow_partial and missing_count >= cleanup_threshold):
         summary = (
             f"Не найдено позиций: {missing_count} из {len(matches)}. "
             "Корзина не изменялась."
@@ -565,11 +679,11 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
     result = _adapter_status_result(
         status,
         summary,
-        cart_url=str(apply_result.get("cart_url") or search.get("cart_url") or ""),
+        cart_url=str(apply_result.get("cart_url") or cart_url or ""),
         items=matches,
     )
     result["timings_ms"] = {
-        "search": search.get("elapsed_ms"),
+        "search": search_elapsed_ms,
         "apply": apply_result.get("elapsed_ms"),
     }
     cleanup_token = str(apply_result.get("cleanup_token") or "").strip()
@@ -584,7 +698,11 @@ def _assemble_with_adapter(run, store: str) -> dict[str, Any]:
     return result
 
 
-def assemble_store_cart(run, store: str) -> dict[str, Any]:
+def assemble_store_cart(
+    run,
+    store: str,
+    prepared: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     ingredients = run.ingredient_snapshot
     if not isinstance(ingredients, list) or not ingredients:
         return {
@@ -595,6 +713,10 @@ def assemble_store_cart(run, store: str) -> dict[str, Any]:
             "items": [],
         }
 
+    if prepared:
+        # A comparison token is only valid for the adapter that signed it;
+        # never hand the chosen products to the browser agent.
+        return _assemble_with_adapter(run, store, prepared)
     if not settings.CART_ADAPTER_BASE_URL:
         if store in ADAPTER_ONLY_STORES:
             raise CartAgentError(
