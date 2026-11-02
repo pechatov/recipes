@@ -11,6 +11,8 @@ process.env.CART_ADAPTER_QUARANTINE_FILE = `/tmp/recipes-cart-quarantine-${proce
 
 const {
   boundedOperationTimeout,
+  edaAuthExpression,
+  validateCompareRequest,
   cartPinVerdict,
   cartPlaceExpression,
   chooseLavkaAddress,
@@ -743,3 +745,66 @@ await removeOperationRecord("scope:lavka-conflict");
 assert.equal(await readOperationRecord("scope:lavka-conflict"), null);
 await removeOperationRecord("scope:lavka-conflict");
 assert.equal(await readOperationRecord("scope:lavka-conflict"), null);
+
+// Чижик resolves through its brand storefront /retail/cizik.
+assert.deepEqual(
+  classifyStorefrontUrl("chizhik", "https://eda.yandex.ru/retail/cizik", "chizhik_58bp7"),
+  {
+    url: "https://eda.yandex.ru/retail/cizik?placeSlug=chizhik_58bp7",
+    placeSlug: "chizhik_58bp7",
+    pathGroupSlug: "cizik",
+  },
+);
+assert.equal(storeSite("chizhik"), "eda");
+
+const compareOperationIds = {
+  lavka: "cart-run-7-20261102130000000000-lavka",
+  chizhik: "cart-run-7-20261102130000000000-chizhik",
+};
+const compareRequest = validateCompareRequest({
+  scope: "recipes-cart-user-1",
+  stores: ["lavka", "chizhik"],
+  operation_ids: compareOperationIds,
+  budget_ms: 999_999,
+});
+assert.deepEqual(compareRequest.operations, [
+  { store: "lavka", operationId: compareOperationIds.lavka },
+  { store: "chizhik", operationId: compareOperationIds.chizhik },
+]);
+assert.equal(compareRequest.budgetMs, 240_000, "the comparison budget is capped");
+assert.equal(
+  validateCompareRequest({
+    scope: "recipes-cart-user-1",
+    stores: ["lavka"],
+    operation_ids: compareOperationIds,
+    budget_ms: 1,
+  }).budgetMs,
+  30_000,
+  "the comparison budget has a floor",
+);
+for (const broken of [
+  { scope: "recipes-cart-user-1", stores: [], operation_ids: compareOperationIds },
+  { scope: "recipes-cart-user-1", stores: ["lavka", "lavka"], operation_ids: compareOperationIds },
+  { scope: "recipes-cart-user-1", stores: ["spar"], operation_ids: compareOperationIds },
+  { scope: "recipes-cart-user-1", stores: ["lavka"], operation_ids: {} },
+  // An operation id signed for one store must not be reused for another.
+  { scope: "recipes-cart-user-1", stores: ["lavka"], operation_ids: { lavka: compareOperationIds.chizhik } },
+  { scope: "someone-else", stores: ["lavka"], operation_ids: compareOperationIds },
+]) {
+  assert.throws(
+    () => validateCompareRequest(broken),
+    (error) => error.code === "invalid_request",
+    JSON.stringify(broken),
+  );
+}
+
+// The login probe reports a 401 from the address book as-is.
+{
+  const context = vm.createContext({
+    fetch: async () => ({ status: 401 }),
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await vm.runInContext(edaAuthExpression, context))),
+    { status: 401 },
+  );
+}
