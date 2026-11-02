@@ -442,6 +442,55 @@ class CartComparisonTests(TestCase):
         best = [row["store"] for row in rows if row["best"]]
         self.assertEqual(best, ["lavka"])
 
+    @patch("recipes.carting.client._run_adapter_task")
+    def test_only_one_of_two_choosing_runs_can_be_queued(self, adapter_task):
+        adapter_task.return_value = self.compare_response()
+        first = self.make_run()
+        process_cart_run(first)
+        second = self.make_run()
+        process_cart_run(second)
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-choose", args=[first.pk]), {"store": "auchan"})
+        response = self.client.post(
+            reverse("cart-choose", args=[second.pk]), {"store": "auchan"}
+        )
+
+        self.assertRedirects(response, reverse("cart-detail", args=[first.pk]))
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.status, CartRun.Status.PENDING)
+        self.assertEqual(second.status, CartRun.Status.CHOOSING)
+
+    @patch("recipes.views._lock_cart_queue")
+    def test_queueing_paths_take_the_user_lock(self, lock):
+        run = self.make_run(status=CartRun.Status.CHOOSING)
+        self.client.force_login(self.user)
+
+        self.client.post(reverse("cart-compare-again", args=[run.pk]))
+        self.client.post(reverse("cart-choose", args=[run.pk]), {"store": "auchan"})
+
+        self.assertEqual(lock.call_count, 1)
+        lock.reset_mock()
+        new_run = CartRun.objects.exclude(pk=run.pk).get()
+        CartRun.objects.filter(pk=new_run.pk).update(status=CartRun.Status.CHOOSING)
+        attempt = CartAttempt.objects.create(
+            run=new_run,
+            store="auchan",
+            status=CartAttempt.Status.EXACT,
+            comparison={
+                "selection_token": "token",
+                "searched_at": timezone.now().isoformat(),
+                "matches": [
+                    {"quality": "exact", "product_id": PASTA_ID},
+                    {"quality": "missing"},
+                ],
+            },
+        )
+        self.client.post(reverse("cart-choose", args=[new_run.pk]), {"store": "auchan"})
+        self.assertEqual(lock.call_count, 1)
+        self.assertEqual(attempt.run_id, new_run.pk)
+
     def test_choosing_run_can_be_cancelled(self):
         run = self.make_run(status=CartRun.Status.CHOOSING)
         self.client.force_login(self.user)

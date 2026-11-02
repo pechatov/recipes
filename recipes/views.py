@@ -1071,11 +1071,6 @@ def cart_start(request, slug):
         messages.error(request, "Выберите хотя бы один ингредиент.")
         return redirect(f"{reverse('shopping-list', args=[recipe.slug])}?servings={servings}")
 
-    active = _active_cart_run(request.user)
-    if active:
-        messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
-        return redirect("cart-detail", pk=active.pk)
-
     requested_store = request.POST.get("store", "")
     if requested_store:
         # The selector only chooses where «Найти в …» links lead.
@@ -1096,9 +1091,25 @@ def cart_start(request, slug):
         }
         for item in items
     ]
-    run = _start_store_comparison(recipe, request.user, servings, snapshot)
+    with transaction.atomic():
+        _lock_cart_queue(request.user)
+        active = _active_cart_run(request.user)
+        if active:
+            messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+            return redirect("cart-detail", pk=active.pk)
+        run = _start_store_comparison(recipe, request.user, servings, snapshot)
     messages.success(request, "Проверяем наличие и цены во всех магазинах.")
     return redirect("cart-detail", pk=run.pk)
+
+
+def _lock_cart_queue(user):
+    """Serialize queueing cart work for one user.
+
+    The check that no other run is active and the transition that makes a run
+    active must not interleave: two runs queued at once would both assemble
+    into the same store cart.
+    """
+    get_user_model().objects.select_for_update().only("pk").get(pk=user.pk)
 
 
 def _start_store_comparison(recipe, user, servings, snapshot):
@@ -1150,13 +1161,13 @@ def cart_choose(request, pk):
             "Проверьте магазины заново.",
         )
         return redirect("cart-detail", pk=run.pk)
-    active = _active_cart_run(request.user)
-    if active and active.pk != run.pk:
-        messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
-        return redirect("cart-detail", pk=active.pk)
     with transaction.atomic():
-        # The conditional update is the only transition out of CHOOSING;
-        # cart_compare_again takes the same row lock before cancelling it.
+        _lock_cart_queue(request.user)
+        active = _active_cart_run(request.user)
+        if active and active.pk != run.pk:
+            messages.info(request, "Сначала дождитесь уже запущенной сборки корзины.")
+            return redirect("cart-detail", pk=active.pk)
+        # The conditional update is the only transition out of CHOOSING.
         updated = CartRun.objects.filter(
             pk=run.pk,
             status=CartRun.Status.CHOOSING,
@@ -1183,8 +1194,10 @@ def cart_choose(request, pk):
 @require_POST
 def cart_compare_again(request, pk):
     with transaction.atomic():
-        # Lock the row so a concurrent cart_choose either commits first (the
-        # run is then active and blocks a new comparison) or sees it cancelled.
+        # Under the user's queue lock a concurrent cart_choose either commits
+        # first (the run is then active and blocks a new comparison) or sees
+        # the run cancelled.
+        _lock_cart_queue(request.user)
         run = get_object_or_404(
             CartRun.objects.select_for_update().select_related("recipe"),
             pk=pk,
