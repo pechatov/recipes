@@ -79,6 +79,7 @@
         <h2>Сборка корзин</h2>
         <span>{{ cart_runs|length }}</span>
       </div>
+      <p class="shopping-note">Сборки старше суток автоматически скрываются из текущих задач. Последняя сборка доступна из списка покупок рецепта.</p>
       {% if cart_runs %}
         <div class="task-list">
           {% for run in cart_runs %}
@@ -93,7 +94,7 @@
           {% endfor %}
         </div>
       {% else %}
-        <p class="task-empty">Корзины ещё не собирались.</p>
+        <p class="task-empty">За последние сутки сборок не было.</p>
       {% endif %}
     </section>
   </div>

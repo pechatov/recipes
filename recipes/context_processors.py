@@ -19,7 +19,7 @@ def active_tasks(request):
         ],
     ).count()
     cart_count = (
-        CartRun.objects.filter(requested_by=request.user)
+        CartRun.objects.visible_tasks().filter(requested_by=request.user)
         .filter(
             Q(
                 status__in=[

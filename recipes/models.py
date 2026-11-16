@@ -1,6 +1,7 @@
 import hashlib
 import re
 import unicodedata
+from datetime import timedelta
 from decimal import Decimal
 
 from django.conf import settings
@@ -8,6 +9,7 @@ from django.contrib.postgres.indexes import GinIndex
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.urls import reverse
+from django.utils import timezone
 
 from .categories import MAIN_PROTEIN_TAXONOMY
 from django.utils.text import slugify
@@ -564,7 +566,15 @@ class StorePreference(models.Model):
         return f"{self.user}: {self.get_store_display()}"
 
 
+class CartRunQuerySet(models.QuerySet):
+    def visible_tasks(self):
+        """Show cart runs created within the last 24 hours."""
+        return self.filter(created_at__gte=timezone.now() - timedelta(days=1))
+
+
 class CartRun(models.Model):
+    objects = CartRunQuerySet.as_manager()
+
     class Status(models.TextChoices):
         PENDING = "pending", "В очереди"
         PROCESSING = "processing", "Собирается"
