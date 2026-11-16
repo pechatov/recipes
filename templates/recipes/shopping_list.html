@@ -45,7 +45,7 @@
       </label>
     {% endif %}
     <div class="shopping-toolbar">
-      <p><strong>{{ items|length }}</strong> позиций</p>
+      <p aria-live="polite" aria-atomic="true"><strong data-selected-item-count>{{ selected_item_count }}</strong> позиций</p>
       <div class="action-row">
         <button class="button button-secondary" type="button" data-copy-list>Скопировать список</button>
         <button class="button" type="submit">Сравнить магазины</button>

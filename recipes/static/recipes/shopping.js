@@ -3,12 +3,22 @@
   if (!container) return;
 
   const rows = [...container.querySelectorAll("[data-shopping-item]")];
+  const selectedItemCount = container.querySelector("[data-selected-item-count]");
+  const updateSelectedItemCount = () => {
+    selectedItemCount.textContent = rows.filter(
+      row => row.querySelector("[data-item-checkbox]").checked
+    ).length;
+  };
   rows.forEach(row => {
     const checkbox = row.querySelector("[data-item-checkbox]");
     const update = () => row.classList.toggle("is-checked-off", !checkbox.checked);
-    checkbox.addEventListener("change", update);
+    checkbox.addEventListener("change", () => {
+      update();
+      updateSelectedItemCount();
+    });
     update();
   });
+  updateSelectedItemCount();
 
   const pantryToggle = container.querySelector("[data-pantry-toggle]");
   const pantryCheckboxes = [...container.querySelectorAll("[data-pantry-checkbox]")];

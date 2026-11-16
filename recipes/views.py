@@ -901,9 +901,11 @@ def task_list(request):
         .select_related("recipe")
         .prefetch_related("recipes")[:50]
     )
-    cart_runs = CartRun.objects.filter(requested_by=request.user).select_related(
-        "recipe", "selected_attempt"
-    )[:50]
+    cart_runs = (
+        CartRun.objects.visible_tasks()
+        .filter(requested_by=request.user)
+        .select_related("recipe", "selected_attempt")[:50]
+    )
     refinements = RecipeRefinement.objects.filter(
         requested_by=request.user
     ).select_related("recipe").order_by("-created_at")[:50]
@@ -967,6 +969,10 @@ def shopping_list(request, slug):
             "recipe": recipe,
             "servings": servings,
             "items": items,
+            "selected_item_count": sum(
+                not item.ingredient.is_pantry and not item.ingredient.is_water
+                for item in items
+            ),
             "has_pantry_items": any(item.ingredient.is_pantry for item in items),
             "store_options": store_options,
             "selected_store": selected_store,

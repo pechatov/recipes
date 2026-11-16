@@ -1,10 +1,11 @@
-from datetime import datetime, timezone as datetime_timezone
+from datetime import datetime, timedelta, timezone as datetime_timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from recipes.forms import IngredientForm, RecipeForm
 from recipes.models import (
@@ -560,6 +561,43 @@ class RecipeViewTests(TestCase):
         response = self.client.get(reverse("recipe-list"), {"q": "сливки"})
         self.assertContains(response, "Семейная паста")
 
+    def test_shopping_count_excludes_unselected_pantry_items_and_water(self):
+        self.recipe.ingredients.all().delete()
+        for name, is_pantry in [
+            ("Молоко", False),
+            ("Семена чиа", False),
+            ("Кленовый сироп", True),
+            ("Экстракт ванили", True),
+            ("Вода", False),
+        ]:
+            RecipeIngredient.objects.create(
+                recipe=self.recipe, name=name, is_pantry=is_pantry
+            )
+        self.client.force_login(self.user)
+
+        response = self.client.get(reverse("shopping-list", args=[self.recipe.slug]))
+
+        self.assertContains(response, '<strong data-selected-item-count>2</strong>')
+        self.assertEqual(response.content.count(b"data-item-checkbox"), 4)
+
+    def test_shopping_count_is_zero_when_only_pantry_items_remain(self):
+        self.recipe.ingredients.all().delete()
+        pantry = RecipeIngredient.objects.create(
+            recipe=self.recipe, name="Соль", is_pantry=True
+        )
+        self.client.force_login(self.user)
+
+        for empty in [False, True]:
+            with self.subTest(empty=empty):
+                if empty:
+                    pantry.delete()
+                response = self.client.get(
+                    reverse("shopping-list", args=[self.recipe.slug])
+                )
+                self.assertContains(
+                    response, '<strong data-selected-item-count>0</strong>'
+                )
+
     def test_fuzzy_query_keeps_candidates_for_client_side_filtering(self):
         self.client.force_login(self.user)
 
@@ -865,6 +903,78 @@ class RecipeViewTests(TestCase):
 
         self.assertContains(response, reverse("import-detail", args=[own_job.pk]))
         self.assertNotContains(response, "https://example.com/other")
+
+    def test_cart_tasks_older_than_24_hours_are_hidden_in_every_status(self):
+        now = timezone.now()
+        old_runs = []
+        for status in CartRun.Status:
+            old_runs.append(CartRun.objects.create(
+                recipe=self.recipe,
+                requested_by=self.user,
+                servings=2,
+                status=status,
+                cleanup_requested_at=now,
+                started_at=now,
+            ))
+        CartRun.objects.filter(pk__in=[run.pk for run in old_runs]).update(
+            created_at=now - timedelta(days=1, microseconds=1)
+        )
+        self.client.force_login(self.user)
+
+        with patch("recipes.models.timezone.now", return_value=now):
+            response = self.client.get(reverse("task-list"))
+            listing = self.client.get(reverse("recipe-list"))
+
+        self.assertEqual(list(response.context["cart_runs"]), [])
+        self.assertEqual(response.context["active_task_count"], 0)
+        self.assertEqual(listing.context["active_task_count"], 0)
+        for status, run in zip(CartRun.Status, old_runs):
+            run.refresh_from_db()
+            self.assertEqual(run.status, status)
+            self.assertEqual(run.cleanup_requested_at, now)
+            self.assertIsNone(run.cancellation_requested_at)
+            self.assertNotContains(response, reverse("cart-detail", args=[run.pk]))
+        detail = self.client.get(reverse("cart-detail", args=[old_runs[0].pk]))
+        self.assertEqual(detail.status_code, 200)
+        shopping = self.client.get(reverse("shopping-list", args=[self.recipe.slug]))
+        self.assertIsNotNone(shopping.context["latest_cart_run"])
+
+    def test_cart_task_retention_boundary_and_user_isolation(self):
+        now = timezone.now()
+        boundary = CartRun.objects.create(
+            recipe=self.recipe, requested_by=self.user, servings=2
+        )
+        CartRun.objects.filter(pk=boundary.pk).update(
+            created_at=now - timedelta(days=1)
+        )
+        cleanup = CartRun.objects.create(
+            recipe=self.recipe,
+            requested_by=self.user,
+            servings=2,
+            status=CartRun.Status.FAILED,
+            cleanup_requested_at=now,
+        )
+        other = get_user_model().objects.create_user(username="other-cook")
+        other_run = CartRun.objects.create(
+            recipe=self.recipe, requested_by=other, servings=2
+        )
+        job = ImportJob.objects.create(
+            source_url="https://example.com/old-import",
+            source_type=ImportJob.SourceType.WEBSITE,
+            requested_by=self.user,
+        )
+        ImportJob.objects.filter(pk=job.pk).update(
+            created_at=now - timedelta(days=2)
+        )
+        self.client.force_login(self.user)
+
+        with patch("recipes.models.timezone.now", return_value=now):
+            response = self.client.get(reverse("task-list"))
+
+        self.assertCountEqual(response.context["cart_runs"], [boundary, cleanup])
+        self.assertEqual(response.context["active_task_count"], 3)
+        self.assertNotContains(response, reverse("cart-detail", args=[other_run.pk]))
+        self.assertContains(response, reverse("import-detail", args=[job.pk]))
 
     def test_task_list_shows_source_title_instead_of_raw_url(self):
         job = ImportJob.objects.create(
